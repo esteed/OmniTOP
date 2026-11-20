@@ -85,9 +85,13 @@
   <header class="bar">
     <div class="stats">
       <div class="stat"><span class="k">Memory in use</span><span id="ms-ram" class="v">–</span></div>
+      <div class="stat"><span class="k">Committed</span><span id="ms-commit" class="v">–</span></div>
       <div class="stat"><span class="k">GPU memory</span><span id="ms-vram" class="v">–</span></div>
       <div class="stat"><span class="k">GPU 3D</span><span id="ms-3d" class="v">–</span></div>
       <div class="stat"><span class="k">CPU</span><span id="ms-cpu" class="v">–</span></div>
+    </div>
+    <div class="controls">
+      <button type="button" id="mctl-zoom" title="Back to the starting zoom and position">Reset view</button>
     </div>
   </header>
   <main>
@@ -101,6 +105,7 @@
         </span>
         <span class="item"><span class="sw hole"></span>No RAM at that address</span>
         <span class="item muted">GPU memory fills in order: Windows doesn't report where in it data is stored</span>
+        <span class="item muted">Scroll to zoom · drag to move · hover for details</span>
       </div>
     </div>
     <aside>
@@ -112,6 +117,16 @@
       <div class="chart-key">
         <span><i class="ln g3d"></i>GPU 3D <b id="key-3d">–</b></span>
         <span><i class="ln cpu"></i>CPU <b id="key-cpu">–</b></span>
+      </div>
+      <h2 title="Memory Windows has promised to programs, kept in RAM or the page file. When it reaches the limit, programs can't get more until something closes or the page file grows.">Committed memory <span class="muted">· last 60 s</span></h2>
+      <div class="chart">
+        <canvas id="ccv" role="img" aria-label="Line chart of committed memory and memory in use over the last 60 seconds, with the commit limit as a dashed line"></canvas>
+        <div id="ctip" class="tip" hidden></div>
+      </div>
+      <div class="chart-key">
+        <span><i class="ln commit"></i>Committed <b id="key-commit">–</b></span>
+        <span><i class="ln ram"></i>In use <b id="key-ramuse">–</b></span>
+        <span><i class="ln limit"></i>Limit <b id="key-limit">–</b></span>
       </div>
       <h2 id="engines-title">GPU engines</h2>
       <ol id="engines" class="meters"><li class="empty">Waiting for data…</li></ol>

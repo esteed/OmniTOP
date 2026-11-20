@@ -14,14 +14,18 @@ const MEM_USES = ['Process memory', 'Mapped files', 'Shared memory', 'Page table
   'Locked by drivers', 'Kernel stacks'];
 
 const mstage = $('mstage'), mcv = $('mcv'), mctx = mcv.getContext('2d'), mtip = $('mtip');
-const ucv = $('ucv'), uctx = ucv.getContext('2d'), utip = $('utip');
 const mem = {
   last: null,            // latest sample from the server
   ram: [], gpu: [],      // per GB: { h, target, d }, or null where there's no RAM
-  hist: [],              // [{ g3d, cpu }] once a second, oldest first
-  panels: [], hover: null, mouse: null, uhover: null,
+  hist: [],              // [{ g3d, cpu, commit, ram }] once a second, oldest first
+  commitLimit: 0,        // bytes that can be committed: RAM plus page file
+  panels: [], hover: null, mouse: null,
 };
 let mK = 1, mdpr = 1, mW = 0, mH = 0, UC = {};
+// Zoom and pan on top of the fitted layout: screen = layout * z + (x, y)
+const mview = { z: 1, x: 0, y: 0 };
+const MAX_MZOOM = 12, MIN_MZOOM = 0.5;
+const vx = sx => sx * mview.z + mview.x, vy = sy => sy * mview.z + mview.y;
 
 function fmtGB(b) {
   const g = b / GiB;
@@ -48,8 +52,10 @@ function onSys(m) {
   mem.last = m;
   const ram = m.ram, gpu = m.gpu;
   const g3d = gpu ? (gpu.engines.find(e => e[0] === '3D') || [])[1] : undefined;
-  mem.hist.push({ g3d: g3d ?? null, cpu: m.cpu ?? null });
+  mem.hist.push({ g3d: g3d ?? null, cpu: m.cpu ?? null,
+                  commit: m.commit ? m.commit.used : null, ram: ram ? ram.total - ram.avail : null });
   if (mem.hist.length > HISTORY) mem.hist.shift();
+  mem.commitLimit = m.commit ? m.commit.limit : 0;
 
   const ramList = !ram ? [] : ram.cells ? ram.cells.map(c => c && { ...c, v: Math.min(1, c.u + c.m) })
     : fillOrder(ram.total - ram.avail, ram.installed);
@@ -61,7 +67,7 @@ function onSys(m) {
   renderMemStats();
   renderMeters();
   renderMemMsg();
-  drawChart();
+  drawCharts();
   if (mem.hover && mem.mouse) showMemTip();
 }
 sysListeners.push(onSys);
@@ -106,7 +112,7 @@ function mlayout() {
   }
 }
 
-const mproj = (g, x, y, z = 0) => [g.ox + (x - y) * C * mK, g.oy + ((x + y) * S - z) * mK];
+const mproj = (g, x, y, z = 0) => [vx(g.ox + (x - y) * C * mK), vy(g.oy + ((x + y) * S - z) * mK)];
 function mpath(g, pts) {
   mctx.beginPath();
   pts.forEach(([x, y, z], i) => {
@@ -173,17 +179,18 @@ function drawPanel(g) {
     mctx.stroke();
   }
   // Label every row, or every few rows when they're drawn too close together
-  const every = Math.max(1, Math.ceil(15 / (MP * S * mK))), n = g.cells.length;
+  const every = Math.max(1, Math.ceil(15 / (MP * S * mK * mview.z))), n = g.cells.length;
   for (let r = 0; r < g.rows; r += every) {   // each row's range, just past its right end
     const [a, b] = mproj(g, g.cols * MP, r * MP + MP / 2);
     mtext(`${r * g.cols}–${Math.min(n, (r + 1) * g.cols)} GB`, a + 8, b, 11, T.muted);
   }
   const [title, sub] = panelTitle(g);
-  const tw = mtext(title, g.left + 4, 24, 13, T.ink, 'left', 600);
-  const room = mW - (g.left + 4 + tw + 8) - 8;
+  const tx = vx(g.left + 4), ty = vy(24);   // titles move with the grids
+  const tw = mtext(title, tx, ty, 13, T.ink, 'left', 600);
+  const room = mW - (tx + tw + 8) - 8;
   mctx.font = `400 12px ${T.font}`;
-  if (mctx.measureText(sub).width <= room) mtext(sub, g.left + 4 + tw + 8, 24, 12, T.muted);
-  else mtext(sub.split(' · ').pop(), g.left + 4 + tw + 8, 24, 12, T.muted);   // just the size
+  if (mctx.measureText(sub).width <= room) mtext(sub, tx + tw + 8, ty, 12, T.muted);
+  else mtext(sub.split(' · ').pop(), tx + tw + 8, ty, 12, T.muted);   // just the size
 }
 
 function mdraw() {
@@ -222,7 +229,8 @@ function memAt(mx, my) {
       if (mx >= x0 && mx <= x1 && my >= y0 && my <= y1 && (!best || x + y > best.d)) best = { g, i, d: x + y };
     });
     if (best) return best;
-    const a = (mx - g.ox) / (C * mK), b = (my - g.oy) / (S * mK);
+    const sx = (mx - mview.x) / mview.z, sy = (my - mview.y) / mview.z;   // undo zoom and pan
+    const a = (sx - g.ox) / (C * mK), b = (sy - g.oy) / (S * mK);
     const col = Math.floor((a + b) / 2 / MP), row = Math.floor((b - a) / 2 / MP);
     const i = row * g.cols + col;
     if (col >= 0 && col < g.cols && row >= 0 && i < g.cells.length) return { g, i };
@@ -268,10 +276,57 @@ function showMemTip() {
 mcv.addEventListener('mousemove', ev => {
   const r = mcv.getBoundingClientRect();
   mem.mouse = [ev.clientX, ev.clientY];
-  mem.hover = memAt(ev.clientX - r.left, ev.clientY - r.top);
+  mem.hover = mdrag ? null : memAt(ev.clientX - r.left, ev.clientY - r.top);
   showMemTip();
 });
 mcv.addEventListener('mouseleave', () => { mem.hover = null; mem.mouse = null; mtip.hidden = true; });
+
+// ---------------------------------------------------------------------------
+// Zoom with the mouse wheel, move by dragging, like the Network ports tab
+// ---------------------------------------------------------------------------
+function clampMemView() {   // keep at least a corner of the grids on screen
+  const m = 60;
+  mview.x = Math.min(mW - m, Math.max(m - mW * mview.z, mview.x));
+  mview.y = Math.min(mH - m, Math.max(m - mH * mview.z, mview.y));
+}
+
+function resetMemView() {
+  mview.z = 1;
+  mview.x = mview.y = 0;
+}
+
+let mdrag = null;
+mcv.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const r = mcv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  const dy = ev.deltaMode === 1 ? ev.deltaY * 33 : ev.deltaMode === 2 ? ev.deltaY * mH : ev.deltaY;
+  const z = Math.min(MAX_MZOOM, Math.max(MIN_MZOOM, mview.z * Math.pow(1.2, -dy / 100)));   // 1.2x per notch
+  mview.x = mx - (mx - mview.x) * z / mview.z;   // keep the point under the mouse where it is
+  mview.y = my - (my - mview.y) * z / mview.z;
+  mview.z = z;
+  clampMemView();
+  if (mem.mouse) { mem.hover = memAt(mx, my); showMemTip(); }
+}, { passive: false });
+mcv.addEventListener('mousedown', ev => {
+  if (ev.button !== 0) return;
+  ev.preventDefault();
+  mdrag = { x: ev.clientX, y: ev.clientY, ox: mview.x, oy: mview.y };
+  mcv.classList.add('dragging');
+  mem.hover = null;
+  mtip.hidden = true;
+});
+window.addEventListener('mousemove', ev => {
+  if (!mdrag) return;
+  mview.x = mdrag.ox + ev.clientX - mdrag.x;
+  mview.y = mdrag.oy + ev.clientY - mdrag.y;
+  clampMemView();
+});
+window.addEventListener('mouseup', () => {
+  if (!mdrag) return;
+  mdrag = null;
+  mcv.classList.remove('dragging');
+});
+$('mctl-zoom').addEventListener('click', resetMemView);
 
 // ---------------------------------------------------------------------------
 // Header numbers, side lists, notices
@@ -283,6 +338,12 @@ function renderMemStats() {
   const g3d = h.g3d != null ? pct(h.g3d / 100) : '–', cpu = h.cpu != null ? pct(h.cpu / 100) : '–';
   $('ms-3d').textContent = $('key-3d').textContent = g3d;
   $('ms-cpu').textContent = $('key-cpu').textContent = cpu;
+  const c = m.commit;
+  $('ms-commit').textContent = c ? `${fmtGB(c.used)} / ${capacity(c.limit)} GB` : '–';
+  $('key-commit').textContent = c ? `${fmtGB(c.used)} GB` : '–';
+  $('key-ramuse').textContent = m.ram ? `${fmtGB(m.ram.total - m.ram.avail)} GB` : '–';
+  $('key-limit').textContent = c ? `${capacity(c.limit)} GB` : '–';
+  $('ms-commit').parentElement.title = c ? `Peak since Windows started: ${fmtGB(c.peak)} GB` : '';
 }
 
 function meterRow(name, value, t) {
@@ -313,113 +374,170 @@ function renderMemMsg() {
 }
 
 // ---------------------------------------------------------------------------
-// Utilization chart: GPU 3D and CPU over the last 60 seconds
+// Line charts over the last 60 seconds: utilization, and committed memory
 // ---------------------------------------------------------------------------
-const CH = { l: 34, r: 6, t: 8, b: 18 };
+const CH = { l: 44, r: 6, t: 8, b: 18 };   // plot margins, px
 
 function readChartColors() {
   const cs = getComputedStyle(document.documentElement);
-  UC = { g3d: cs.getPropertyValue('--c-3d').trim(), cpu: cs.getPropertyValue('--c-cpu').trim() };
+  const v = n => cs.getPropertyValue(n).trim();
+  UC = { g3d: v('--c-3d'), cpu: v('--c-cpu'), commit: v('--c-commit'), ram: v('--text-2') };
   $('mswatches').innerHTML = [0.1, 0.3, 0.5, 0.7, 0.9].map(t => `<span style="background:${rgb(ramp(t))}"></span>`).join('');
 }
 
-function chartGeom() {
-  const r = ucv.getBoundingClientRect();
-  const pw = r.width - CH.l - CH.r, ph = r.height - CH.t - CH.b;
-  return { r, pw, ph, X: i => CH.l + pw * i / (HISTORY - 1), Y: v => CH.t + ph * (1 - v / 100) };
-}
+// cfg: series [{ key, label, cls }] (drawn in order, so the main one goes last),
+// max() top of the scale, ticks() gridline values, axis(v) and fmt(v) labels,
+// and optionally ref() -> { value, label } for a dashed reference line.
+class LineChart {
+  constructor(canvasId, tipId, cfg) {
+    this.cv = $(canvasId);
+    this.g = this.cv.getContext('2d');
+    this.tip = $(tipId);
+    this.cfg = cfg;
+    this.hover = null;
+    this.cv.addEventListener('mousemove', ev => this.onMove(ev));
+    this.cv.addEventListener('mouseleave', () => { this.hover = null; this.tip.hidden = true; this.draw(); });
+    new ResizeObserver(() => this.draw()).observe(this.cv);
+  }
 
-function drawChart() {
-  const { r, pw, X, Y } = chartGeom();
-  if (!r.width || !r.height) return;
-  const dpr = window.devicePixelRatio || 1;
-  if (ucv.width !== Math.round(r.width * dpr) || ucv.height !== Math.round(r.height * dpr)) {
-    ucv.width = Math.round(r.width * dpr);
-    ucv.height = Math.round(r.height * dpr);
+  geom() {
+    const r = this.cv.getBoundingClientRect(), max = this.cfg.max() || 1;
+    const pw = r.width - CH.l - CH.r, ph = r.height - CH.t - CH.b;
+    return { r, pw, X: i => CH.l + pw * i / (HISTORY - 1), Y: v => CH.t + ph * (1 - Math.min(v, max) / max) };
   }
-  const g = uctx;
-  g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  g.clearRect(0, 0, r.width, r.height);
-  g.font = `10px ${T.font}`;
-  g.textBaseline = 'middle';
-  for (const v of [0, 50, 100]) {   // recessive grid
-    g.beginPath();
-    g.moveTo(CH.l, Y(v));
-    g.lineTo(CH.l + pw, Y(v));
-    g.strokeStyle = T.grid;
-    g.lineWidth = 1;
-    g.stroke();
-    g.fillStyle = T.muted;
-    g.textAlign = 'right';
-    g.fillText(`${v}%`, CH.l - 6, Y(v));
-  }
-  g.textAlign = 'left';
-  g.fillText('60 s ago', CH.l, r.height - 6);
-  g.textAlign = 'right';
-  g.fillText('now', CH.l + pw, r.height - 6);
 
-  const n = mem.hist.length, start = HISTORY - n;
-  for (const key of ['cpu', 'g3d']) {
-    g.beginPath();
-    let pen = false;
-    mem.hist.forEach((h, i) => {
-      if (h[key] == null) { pen = false; return; }
-      const x = X(start + i), y = Y(Math.min(100, h[key]));
-      if (pen) g.lineTo(x, y); else g.moveTo(x, y);
-      pen = true;
-    });
-    g.strokeStyle = UC[key];
-    g.lineWidth = 2;
-    g.lineJoin = 'round';
-    g.stroke();
-  }
-  const i = mem.uhover;
-  if (i != null && i < n) {   // crosshair and markers at the hovered second
-    const x = X(start + i);
-    g.beginPath();
-    g.moveTo(x, CH.t);
-    g.lineTo(x, Y(0));
-    g.strokeStyle = T.lead;
-    g.lineWidth = 1;
-    g.stroke();
-    for (const key of ['cpu', 'g3d']) {
-      const v = mem.hist[i][key];
-      if (v == null) continue;
+  draw() {
+    const { r, pw, X, Y } = this.geom(), g = this.g, cfg = this.cfg;
+    if (!r.width || !r.height) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (this.cv.width !== Math.round(r.width * dpr) || this.cv.height !== Math.round(r.height * dpr)) {
+      this.cv.width = Math.round(r.width * dpr);
+      this.cv.height = Math.round(r.height * dpr);
+    }
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, r.width, r.height);
+    g.font = `10px ${T.font}`;
+    g.textBaseline = 'middle';
+    for (const v of cfg.ticks()) {   // recessive grid
       g.beginPath();
-      g.arc(x, Y(Math.min(100, v)), 4, 0, Math.PI * 2);
-      g.fillStyle = UC[key];
-      g.fill();
-      g.strokeStyle = T.bg;
+      g.moveTo(CH.l, Y(v));
+      g.lineTo(CH.l + pw, Y(v));
+      g.strokeStyle = T.grid;
+      g.lineWidth = 1;
+      g.stroke();
+      g.fillStyle = T.muted;
+      g.textAlign = 'right';
+      g.fillText(cfg.axis(v), CH.l - 6, Y(v));
+    }
+    g.textAlign = 'left';
+    g.fillText('60 s ago', CH.l, r.height - 6);
+    g.textAlign = 'right';
+    g.fillText('now', CH.l + pw, r.height - 6);
+
+    const ref = cfg.ref && cfg.ref();
+    if (ref) {
+      g.beginPath();
+      g.setLineDash([4, 3]);
+      g.moveTo(CH.l, Y(ref.value));
+      g.lineTo(CH.l + pw, Y(ref.value));
+      g.strokeStyle = T.muted;
+      g.lineWidth = 1.5;
+      g.stroke();
+      g.setLineDash([]);
+    }
+
+    const n = mem.hist.length, start = HISTORY - n;
+    for (const s of cfg.series) {
+      g.beginPath();
+      let pen = false;
+      mem.hist.forEach((h, i) => {
+        if (h[s.key] == null) { pen = false; return; }
+        const x = X(start + i), y = Y(h[s.key]);
+        if (pen) g.lineTo(x, y); else g.moveTo(x, y);
+        pen = true;
+      });
+      g.strokeStyle = UC[s.key];
       g.lineWidth = 2;
+      g.lineJoin = 'round';
       g.stroke();
     }
+    const i = this.hover;
+    if (i != null && i < n) {   // crosshair and markers at the hovered second
+      const x = X(start + i);
+      g.beginPath();
+      g.moveTo(x, CH.t);
+      g.lineTo(x, Y(0));
+      g.strokeStyle = T.lead;
+      g.lineWidth = 1;
+      g.stroke();
+      for (const s of cfg.series) {
+        const v = mem.hist[i][s.key];
+        if (v == null) continue;
+        g.beginPath();
+        g.arc(x, Y(v), 4, 0, Math.PI * 2);
+        g.fillStyle = UC[s.key];
+        g.fill();
+        g.strokeStyle = T.bg;
+        g.lineWidth = 2;
+        g.stroke();
+      }
+    }
+  }
+
+  onMove(ev) {
+    const n = mem.hist.length;
+    if (!n) return;
+    const { r, pw } = this.geom(), cfg = this.cfg;
+    const slot = Math.round((ev.clientX - r.left - CH.l) / pw * (HISTORY - 1));
+    const i = Math.max(0, Math.min(n - 1, slot - (HISTORY - n)));
+    this.hover = i;
+    this.draw();
+    const h = mem.hist[i], ago = n - 1 - i;
+    const rows = [...cfg.series].reverse().map(s =>
+      `<div><i class="ln ${s.cls}"></i> ${s.label} ${h[s.key] == null ? '–' : cfg.fmt(h[s.key])}</div>`);
+    const ref = cfg.ref && cfg.ref();
+    this.tip.innerHTML = `<div class="head">${ago ? `${ago} s ago` : 'Now'}</div>${rows.join('')}` +
+      (ref ? `<div class="faint">${ref.label}</div>` : '');
+    this.tip.hidden = false;
+    const x = ev.clientX - r.left;
+    this.tip.style.left = (x > r.width / 2 ? x - this.tip.offsetWidth - 12 : x + 12) + 'px';
+    this.tip.style.top = '4px';
   }
 }
 
-ucv.addEventListener('mousemove', ev => {
-  const n = mem.hist.length;
-  if (!n) return;
-  const { r, pw } = chartGeom();
-  const slot = Math.round((ev.clientX - r.left - CH.l) / pw * (HISTORY - 1));
-  const i = Math.max(0, Math.min(n - 1, slot - (HISTORY - n)));
-  mem.uhover = i;
-  drawChart();
-  const h = mem.hist[i], ago = n - 1 - i;
-  const val = v => (v == null ? '–' : pct(v / 100));
-  utip.innerHTML = `<div class="head">${ago ? `${ago} s ago` : 'Now'}</div>` +
-    `<div><i class="ln g3d"></i> GPU 3D ${val(h.g3d)}</div><div><i class="ln cpu"></i> CPU ${val(h.cpu)}</div>`;
-  utip.hidden = false;
-  const x = ev.clientX - r.left;
-  utip.style.left = (x > r.width / 2 ? x - utip.offsetWidth - 12 : x + 12) + 'px';
-  utip.style.top = '4px';
+const utilChart = new LineChart('ucv', 'utip', {
+  series: [{ key: 'cpu', label: 'CPU', cls: 'cpu' }, { key: 'g3d', label: 'GPU 3D', cls: 'g3d' }],
+  max: () => 100,
+  ticks: () => [0, 50, 100],
+  axis: v => `${v}%`,
+  fmt: v => `${Math.round(v)}%`,
 });
-ucv.addEventListener('mouseleave', () => { mem.uhover = null; utip.hidden = true; drawChart(); });
+
+// Committed memory: what programs have been promised, backed by RAM or the
+// page file, against the limit (RAM plus page file). In use (RAM) for scale.
+function commitScale() {
+  const top = Math.max(mem.commitLimit || 0, ...mem.hist.map(h => Math.max(h.commit || 0, h.ram || 0)));
+  const step = top > 64 * GiB ? 32 * GiB : 8 * GiB;
+  return Math.max(step, Math.ceil(top * 1.02 / step) * step);
+}
+const commitChart = new LineChart('ccv', 'ctip', {
+  series: [{ key: 'ram', label: 'In use (RAM)', cls: 'ram' }, { key: 'commit', label: 'Committed', cls: 'commit' }],
+  max: commitScale,
+  ticks: () => { const m = commitScale(); return [0, m / 2, m]; },
+  axis: v => `${Math.round(v / GiB)} GB`,
+  fmt: v => `${fmtGB(v)} GB`,
+  ref: () => (mem.commitLimit ? { value: mem.commitLimit, label: `Limit ${capacity(mem.commitLimit)} GB` } : null),
+});
+
+function drawCharts() {
+  utilChart.draw();
+  commitChart.draw();
+}
 
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
 readChartColors();
-darkQuery.addEventListener('change', () => { readChartColors(); drawChart(); });
+darkQuery.addEventListener('change', () => { readChartColors(); drawCharts(); });
 new ResizeObserver(mlayout).observe(mstage);
-new ResizeObserver(drawChart).observe(ucv);
 requestAnimationFrame(mframe);

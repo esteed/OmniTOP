@@ -37,10 +37,18 @@ tab you had open.
 - **GPU memory**: one bar per GB of the graphics card's own memory. Windows reports
   how much is in use but not where on the card it's stored, so these fill in
   order rather than by address.
-- **Utilization**: GPU 3D and CPU over the last 60 seconds, like Task Manager. Below
-  it are the GPU's other engines (copy, compute, video decode and encode), and the
-  apps using the most GPU memory. "Not owned by one app" is the driver's memory and
-  memory that apps share with each other.
+- Scroll to zoom and drag to move around, the same as on the Network ports tab.
+  **Reset view** goes back to the start.
+- **Utilization**: GPU 3D and CPU over the last 60 seconds, like Task Manager.
+- **Committed memory**: over the last 60 seconds. This is the memory Windows has
+  promised to programs, kept in RAM or the page file. It's drawn against memory in
+  use and, as a dashed line, the commit limit (RAM plus page file). When committed
+  memory reaches the limit, programs can't get more memory until something closes
+  or the page file grows. Hover the **Committed** number in the header for the peak
+  since Windows started.
+- Below the charts are the GPU's other engines (copy, compute, video decode and
+  encode), and the apps using the most GPU memory. "Not owned by one app" is the
+  driver's memory and memory that apps share with each other.
 - These update once a second. The per-GB system memory map needs administrator
   rights, which live mode already has. Without them, the grid shows how much
   memory is in use, filled in order.
@@ -105,6 +113,7 @@ on the same stream.
   the performance counters Task Manager reads (`GPU Engine`, `GPU Adapter Memory`,
   `GPU Process Memory`).
 - **CPU**: from `GetSystemTimes`.
+- **Committed memory**: total, limit and peak come from `GetPerformanceInfo`.
 
 The server only listens on 127.0.0.1 and refuses requests whose `Host` header
 isn't its own address.

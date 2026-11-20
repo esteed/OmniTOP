@@ -85,6 +85,28 @@ _k32.GetPhysicallyInstalledSystemMemory.argtypes = [ctypes.POINTER(ctypes.c_uint
 _k32.GetSystemTimes.argtypes = [ctypes.POINTER(wintypes.FILETIME)] * 3
 
 
+class PERFORMANCE_INFORMATION(ctypes.Structure):
+    _fields_ = [("cb", DWORD), ("CommitTotal", ctypes.c_size_t), ("CommitLimit", ctypes.c_size_t),
+                ("CommitPeak", ctypes.c_size_t), ("PhysicalTotal", ctypes.c_size_t),
+                ("PhysicalAvailable", ctypes.c_size_t), ("SystemCache", ctypes.c_size_t),
+                ("KernelTotal", ctypes.c_size_t), ("KernelPaged", ctypes.c_size_t),
+                ("KernelNonpaged", ctypes.c_size_t), ("PageSize", ctypes.c_size_t),
+                ("HandleCount", DWORD), ("ProcessCount", DWORD), ("ThreadCount", DWORD)]
+
+
+_k32.K32GetPerformanceInfo.argtypes = [ctypes.POINTER(PERFORMANCE_INFORMATION), DWORD]
+
+
+def commit_status() -> dict | None:
+    """Committed memory (promised to programs, backed by RAM or the page file) and its limit."""
+    pi = PERFORMANCE_INFORMATION()
+    pi.cb = ctypes.sizeof(pi)
+    if not _k32.K32GetPerformanceInfo(ctypes.byref(pi), pi.cb):
+        return None
+    page = pi.PageSize
+    return {"used": pi.CommitTotal * page, "limit": pi.CommitLimit * page, "peak": pi.CommitPeak * page}
+
+
 def memory_status() -> tuple[int, int, int]:
     """(installed, usable by Windows, available) bytes."""
     ms = MEMORYSTATUSEX()
@@ -476,7 +498,7 @@ class LiveSystem:
                 ram["cells"] = self.ram.sample()
             except OSError as exc:
                 ram["err"] = str(exc)
-        out = {"ram": ram, "cpu": self.cpu.sample(), "gpu": None, "gpuErr": self.gpu_err}
+        out = {"ram": ram, "commit": commit_status(), "cpu": self.cpu.sample(), "gpu": None, "gpuErr": self.gpu_err}
         if self.gpu:
             try:
                 out["gpu"] = self.gpu.sample()
@@ -497,6 +519,8 @@ class DemoSystem:
                       for g in range(len(self.ram_frac))]
         self.vram_used = 7.5 * GB
         self.cpu = 15.0
+        self.commit_extra = 6 * GB    # committed but not (yet) using RAM
+        self.commit_peak = 0
 
     def sample(self) -> dict:
         rng, t = self.rng, time.monotonic() - self.t0
@@ -518,8 +542,12 @@ class DemoSystem:
         g3d = min(100.0, max(0.0, 30 + 55 * burst + rng.gauss(0, 6)))
         self.cpu = min(100.0, max(2.0, self.cpu + rng.gauss(0, 4) + (18 - self.cpu) * 0.1))
         game = self.vram_used * 0.7
+        self.commit_extra = min(14 * GB, max(2 * GB, self.commit_extra + rng.gauss(0, 0.25) * GB))
+        committed = int(used * 0.8 + self.commit_extra)
+        self.commit_peak = max(self.commit_peak, committed, int(26 * GB))
         return {
             "ram": {"installed": 32 * GB, "total": total, "avail": int(max(0, total - used)), "cells": cells, "err": None},
+            "commit": {"used": committed, "limit": total + 12 * GB, "peak": self.commit_peak},
             "cpu": round(self.cpu, 1),
             "gpu": {"name": "Simulated GPU", "vram": 24 * GB, "used": int(self.vram_used), "shared": int(0.4 * GB),
                     "engines": [["3D", round(g3d, 1)], ["Copy", round(max(0, rng.gauss(4, 2)), 1)],
