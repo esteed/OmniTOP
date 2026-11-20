@@ -1,6 +1,11 @@
 # Port traffic
 
-A live isometric view of network traffic on this Windows machine, one bar per port.
+A live isometric view of this Windows machine's network traffic, one bar per port,
+and of its memory and GPU, one bar per gigabyte. The two views are tabs along the
+top of the window: **Network ports** and **Memory & GPU**. The app remembers which
+tab you had open.
+
+## Network ports
 
 - Ports 1–1024 are a 32 × 32 block of 5 px bars in front.
 - Ports 1025–65535 are a 256 × 252 field of 2 px bars behind it, 256 ports per row.
@@ -19,6 +24,26 @@ A live isometric view of network traffic on this Windows machine, one bar per po
 - Scroll the mouse wheel over the grid to zoom in and out around the pointer, and
   drag with the left button to move around. **Reset view** goes back to the start.
 - The sample rate and the Hide own traffic setting are remembered between runs.
+
+## Memory & GPU
+
+- **System memory**: one bar per GB of physical address space, in address order
+  (8 or 16 GB per row). Bar height and color show how much of that GB is in use,
+  from blue (little) to red (all of it). Hover a bar for the split between in use,
+  cached and free, and what the in-use memory is (process memory, file mappings,
+  kernel pools...). A dashed outline marks a GB with no RAM at all, and the
+  tooltip says when a GB is only partly RAM: devices such as the graphics card
+  are mapped into part of the address space, usually just below 4 GB.
+- **GPU memory**: one bar per GB of the graphics card's own memory. Windows reports
+  how much is in use but not where on the card it's stored, so these fill in
+  order rather than by address.
+- **Utilization**: GPU 3D and CPU over the last 60 seconds, like Task Manager. Below
+  it are the GPU's other engines (copy, compute, video decode and encode), and the
+  apps using the most GPU memory. "Not owned by one app" is the driver's memory and
+  memory that apps share with each other.
+- These update once a second. The per-GB system memory map needs administrator
+  rights, which live mode already has. Without them, the grid shows how much
+  memory is in use, filled in order.
 
 ## Run it
 
@@ -42,8 +67,8 @@ If you decline the administrator prompt, the window offers **Try again** or
 Run `build.cmd`. It needs 64-bit Python 3.10 or later and, the first time, an
 internet connection: it sets up pywebview, PyInstaller and Pillow in
 `%LOCALAPPDATA%\PortTrafficViz\build` (outside Google Drive) and writes
-`dist\PortTraffic.exe`. Rebuild after editing anything in `web\`, `server.py` or
-`desktop.py`.
+`dist\PortTraffic.exe`. Rebuild after editing anything in `web\`, `server.py`,
+`sysmon.py` or `desktop.py`.
 
 ## How it works
 
@@ -66,6 +91,20 @@ process instead.
 Each connection has two ports. A browser fetching a web page uses a dynamic local
 port (say 52814) and remote port 443. The **Both ends** filter counts those bytes
 at both ports, **Local** only at 52814, and **Remote** only at 443.
+
+`sysmon.py` samples memory, the GPU and the CPU once a second and sends the result
+on the same stream.
+
+- **System memory map**: it reads a sample of about 65,000 entries from Windows'
+  page database, around 1,000 per GB. This uses the same undocumented interface
+  as Sysinternals RAMMap (`NtQuerySystemInformation` with
+  `SystemSuperfetchInformation`). Each entry says which list a page is on (in use,
+  modified, standby, free) and what it's used for. A sample takes about 40 ms on a
+  128 GB machine.
+- **GPU**: its memory size comes from D3DKMT. Use and engine utilization come from
+  the performance counters Task Manager reads (`GPU Engine`, `GPU Adapter Memory`,
+  `GPU Process Memory`).
+- **CPU**: from `GetSystemTimes`.
 
 The server only listens on 127.0.0.1 and refuses requests whose `Host` header
 isn't its own address.

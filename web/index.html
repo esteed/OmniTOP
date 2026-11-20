@@ -7,69 +7,120 @@
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<header class="bar">
-  <div class="brand">
-    <h1>Port traffic</h1>
-    <span id="status" class="pill">Connecting…</span>
-  </div>
-  <div class="stats">
-    <div class="stat"><span class="k">In</span><span id="st-in" class="v">–</span></div>
-    <div class="stat"><span class="k">Out</span><span id="st-out" class="v">–</span></div>
-    <div class="stat"><span class="k">Active ports</span><span id="st-act" class="v">–</span></div>
-  </div>
-  <div class="controls">
-    <div class="seg" id="ctl-side" role="group" aria-label="Which end of each connection to count">
-      <button type="button" data-v="both" class="on" title="Count bytes at both the local and the remote port">Both ends</button>
-      <button type="button" data-v="local" title="Only this machine's port for each connection">Local</button>
-      <button type="button" data-v="remote" title="Only the peer's port, such as 443 for websites">Remote</button>
+<nav class="tabs" role="tablist" aria-label="Views">
+  <button type="button" role="tab" id="tabbtn-net" class="tab" data-tab="net" aria-controls="tab-net">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="3" cy="8" r="1.8"/><circle cx="13" cy="3.5" r="1.8"/><circle cx="13" cy="12.5" r="1.8"/><path d="M4.6 7.2 11.4 4.3M4.6 8.8l6.8 2.9"/></svg>
+    Network ports
+  </button>
+  <button type="button" role="tab" id="tabbtn-mem" class="tab" data-tab="mem" aria-controls="tab-mem">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="1.2"/><path d="M6 1.5v2M10 1.5v2M6 12.5v2M10 12.5v2M1.5 6h2M1.5 10h2M12.5 6h2M12.5 10h2"/></svg>
+    Memory &amp; GPU
+  </button>
+  <span class="tabs-end"><span id="status" class="pill">Connecting…</span></span>
+</nav>
+
+<section id="tab-net" class="page" role="tabpanel" aria-labelledby="tabbtn-net">
+  <header class="bar">
+    <div class="stats">
+      <div class="stat"><span class="k">In</span><span id="st-in" class="v">–</span></div>
+      <div class="stat"><span class="k">Out</span><span id="st-out" class="v">–</span></div>
+      <div class="stat"><span class="k">Active ports</span><span id="st-act" class="v">–</span></div>
     </div>
-    <div class="seg" id="ctl-proto" role="group" aria-label="Protocol">
-      <button type="button" data-v="all" class="on">All</button>
-      <button type="button" data-v="tcp">TCP</button>
-      <button type="button" data-v="udp">UDP</button>
+    <div class="controls">
+      <div class="seg" id="ctl-side" role="group" aria-label="Which end of each connection to count">
+        <button type="button" data-v="both" class="on" title="Count bytes at both the local and the remote port">Both ends</button>
+        <button type="button" data-v="local" title="Only this machine's port for each connection">Local</button>
+        <button type="button" data-v="remote" title="Only the peer's port, such as 443 for websites">Remote</button>
+      </div>
+      <div class="seg" id="ctl-proto" role="group" aria-label="Protocol">
+        <button type="button" data-v="all" class="on">All</button>
+        <button type="button" data-v="tcp">TCP</button>
+        <button type="button" data-v="udp">UDP</button>
+      </div>
+      <label class="sel">Scale
+        <select id="ctl-scale">
+          <option value="1e7">10 Mb/s</option>
+          <option value="1e8">100 Mb/s</option>
+          <option value="1e9" selected>1 Gb/s</option>
+          <option value="1e10">10 Gb/s</option>
+        </select>
+      </label>
+      <label class="sel" title="How many times a second traffic is sampled and the bars move">Samples
+        <select id="ctl-rate">
+          <option value="20" selected>20/s</option>
+          <option value="10">10/s</option>
+          <option value="5">5/s</option>
+          <option value="2">2/s</option>
+          <option value="1">1/s</option>
+        </select>
+      </label>
+      <label class="chk" title="Leave out traffic this app causes itself: the stream from its capture process to this window, and its browser engine's own requests">
+        <input type="checkbox" id="ctl-own">Hide own traffic
+      </label>
+      <button type="button" id="ctl-zoom" title="Back to the starting zoom and position">Reset view</button>
+      <button type="button" id="ctl-pause">Pause</button>
     </div>
-    <label class="sel">Scale
-      <select id="ctl-scale">
-        <option value="1e7">10 Mb/s</option>
-        <option value="1e8">100 Mb/s</option>
-        <option value="1e9" selected>1 Gb/s</option>
-        <option value="1e10">10 Gb/s</option>
-      </select>
-    </label>
-    <label class="sel" title="How many times a second traffic is sampled and the bars move">Samples
-      <select id="ctl-rate">
-        <option value="20" selected>20/s</option>
-        <option value="10">10/s</option>
-        <option value="5">5/s</option>
-        <option value="2">2/s</option>
-        <option value="1">1/s</option>
-      </select>
-    </label>
-    <label class="chk" title="Leave out traffic this app causes itself: the stream from its capture process to this window, and its browser engine's own requests">
-      <input type="checkbox" id="ctl-own">Hide own traffic
-    </label>
-    <button type="button" id="ctl-zoom" title="Back to the starting zoom and position">Reset view</button>
-    <button type="button" id="ctl-pause">Pause</button>
-  </div>
-</header>
-<main>
-  <div id="stage">
-    <canvas id="cv" role="img" aria-label="Isometric bar grid of traffic per network port. Scroll to zoom, drag to move. The busiest ports are listed alongside."></canvas>
-    <div id="tip" class="tip" hidden></div>
-    <div class="legend">
-      <span class="item">Traffic per port, log scale
-        <span class="muted">100 b/s</span><span id="swatches" class="swatches"></span><span id="scale-max" class="muted">1 Gb/s</span>
-      </span>
-      <span class="item"><span class="sw own"></span><span id="own-text">This app's own traffic</span></span>
-      <span class="item muted">Scroll to zoom · drag to move · hover for details</span>
+  </header>
+  <main>
+    <div id="stage" class="stage">
+      <canvas id="cv" role="img" aria-label="Isometric bar grid of traffic per network port. Scroll to zoom, drag to move. The busiest ports are listed alongside."></canvas>
+      <div id="tip" class="tip" hidden></div>
+      <div class="legend">
+        <span class="item">Traffic per port, log scale
+          <span class="muted">100 b/s</span><span id="swatches" class="swatches"></span><span id="scale-max" class="muted">1 Gb/s</span>
+        </span>
+        <span class="item"><span class="sw own"></span><span id="own-text">This app's own traffic</span></span>
+        <span class="item muted">Scroll to zoom · drag to move · hover for details</span>
+      </div>
     </div>
-  </div>
-  <aside>
-    <h2>Busiest ports</h2>
-    <p class="hint">Click a port to pin it to the top and highlight it. Click again to unpin.</p>
-    <ol id="top"><li class="empty">Waiting for traffic…</li></ol>
-  </aside>
-</main>
+    <aside>
+      <h2>Busiest ports</h2>
+      <p class="hint">Click a port to pin it to the top and highlight it. Click again to unpin.</p>
+      <ol id="top"><li class="empty">Waiting for traffic…</li></ol>
+    </aside>
+  </main>
+</section>
+
+<section id="tab-mem" class="page" role="tabpanel" aria-labelledby="tabbtn-mem" hidden>
+  <header class="bar">
+    <div class="stats">
+      <div class="stat"><span class="k">Memory in use</span><span id="ms-ram" class="v">–</span></div>
+      <div class="stat"><span class="k">GPU memory</span><span id="ms-vram" class="v">–</span></div>
+      <div class="stat"><span class="k">GPU 3D</span><span id="ms-3d" class="v">–</span></div>
+      <div class="stat"><span class="k">CPU</span><span id="ms-cpu" class="v">–</span></div>
+    </div>
+  </header>
+  <main>
+    <div id="mstage" class="stage">
+      <canvas id="mcv" role="img" aria-label="Isometric grids with one bar per gigabyte: system memory by physical address, and GPU memory. Bar height is the share of that gigabyte in use."></canvas>
+      <div id="mtip" class="tip" hidden></div>
+      <div id="mmsg" class="msg" hidden></div>
+      <div class="legend">
+        <span class="item">Share of each GB in use
+          <span class="muted">0%</span><span id="mswatches" class="swatches"></span><span class="muted">100%</span>
+        </span>
+        <span class="item"><span class="sw hole"></span>No RAM at that address</span>
+        <span class="item muted">GPU memory fills in order: Windows doesn't report where in it data is stored</span>
+      </div>
+    </div>
+    <aside>
+      <h2>Utilization <span class="muted">· last 60 s</span></h2>
+      <div class="chart">
+        <canvas id="ucv" role="img" aria-label="Line chart of GPU 3D and CPU utilization over the last 60 seconds"></canvas>
+        <div id="utip" class="tip" hidden></div>
+      </div>
+      <div class="chart-key">
+        <span><i class="ln g3d"></i>GPU 3D <b id="key-3d">–</b></span>
+        <span><i class="ln cpu"></i>CPU <b id="key-cpu">–</b></span>
+      </div>
+      <h2 id="engines-title">GPU engines</h2>
+      <ol id="engines" class="meters"><li class="empty">Waiting for data…</li></ol>
+      <h2>GPU memory by process</h2>
+      <ol id="gprocs" class="meters"><li class="empty">Waiting for data…</li></ol>
+    </aside>
+  </main>
+</section>
 <script src="/app.js"></script>
+<script src="/memory.js"></script>
 </body>
 </html>

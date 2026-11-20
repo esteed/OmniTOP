@@ -31,6 +31,8 @@ from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import urlopen
 
+import sysmon
+
 # In the packaged exe the web files are unpacked next to the bundled modules.
 HERE = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web")
@@ -624,12 +626,13 @@ class Hub:
         with self._lock:
             return len(self._subs)
 
-    def publish(self, msg: str) -> None:
+    def publish(self, msg: str, event: str | None = None) -> None:
+        """Send msg to every viewer, as a named server-sent event if event is given."""
         with self._lock:
             subs = list(self._subs)
         for q in subs:
             try:
-                q.put_nowait(msg)
+                q.put_nowait((event, msg))
             except queue.Full:  # slow client; it'll catch up on the next tick
                 pass
 
@@ -694,6 +697,7 @@ def fmt_bits(bps: float) -> str:
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/index.html": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/memory.js": ("memory.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
 
@@ -800,11 +804,12 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None)
                 self.wfile.flush()
                 while True:
                     try:
-                        msg = q.get(timeout=15)
+                        event, msg = q.get(timeout=15)
                     except queue.Empty:
                         self.wfile.write(b": ping\n\n")
                     else:
-                        self.wfile.write(b"data: " + msg.encode() + b"\n\n")
+                        head = b"event: " + event.encode() + b"\n" if event else b""
+                        self.wfile.write(head + b"data: " + msg.encode() + b"\n\n")
                     self.wfile.flush()
             except OSError:  # browser went away
                 pass
@@ -889,6 +894,7 @@ def relaunch_elevated(args) -> int:
     dest = os.path.join(os.environ.get("LOCALAPPDATA") or HERE, "PortTrafficViz")
     os.makedirs(dest, exist_ok=True)
     shutil.copy2(os.path.abspath(__file__), os.path.join(dest, "server.py"))
+    shutil.copy2(os.path.join(HERE, "sysmon.py"), os.path.join(dest, "sysmon.py"))
     shutil.copytree(WEB_DIR, os.path.join(dest, "web"), dirs_exist_ok=True)
 
     shell32 = ctypes.WinDLL("shell32")
@@ -960,6 +966,9 @@ class Server:
         threading.Thread(target=run_ticker,
                          args=(self.acc, self.hub, self.source.names, self.done, self.rate),
                          name="ticker", daemon=True).start()
+        # Memory, GPU and CPU for the Memory & GPU tab, once a second
+        self.sysmon = sysmon.SystemMonitor(self.hub, mode, ProcessNames().get)
+        self.sysmon.start()
 
     def _count_own_stream(self, size: int, client_port: int) -> None:
         # What a capture would see: this server's socket sending, the window's receiving.
@@ -972,6 +981,7 @@ class Server:
             self.done.set()
             self.rate.wake.set()
             self.source.stop()
+            self.sysmon.stop()
 
     def run(self) -> None:
         """Serve until shutdown() is called from another thread (or Ctrl+C)."""

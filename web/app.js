@@ -38,6 +38,8 @@ let tickNo = 0;
 
 const $ = id => document.getElementById(id);
 const stage = $('stage'), cv = $('cv'), ctx = cv.getContext('2d'), tip = $('tip');
+const sysListeners = [];              // memory.js: called with each memory/GPU sample
+let activeTab = 'net';
 
 // Settings that survive a restart. Storage can be off; then they just don't.
 const PREF = 'portTraffic.';
@@ -526,6 +528,8 @@ let lastFrame = performance.now();
 function frame(t) {
   const dt = Math.min(0.1, (t - lastFrame) / 1000);
   lastFrame = t;
+  requestAnimationFrame(frame);
+  if (activeTab !== 'net') return;   // nothing to draw while another tab is showing
   if ((window.devicePixelRatio || 1) !== dpr) layout();
   if (layersDirty) {
     layersDirty = false;
@@ -536,7 +540,6 @@ function frame(t) {
     e.hb = ease(e.hb, e.btarget, dt);
   }
   draw();
-  requestAnimationFrame(frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +753,37 @@ function renderStatus() {
 }
 
 // ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+const tabButtons = [...document.querySelectorAll('.tab')];
+
+function showTab(name) {
+  activeTab = name === 'mem' ? 'mem' : 'net';
+  for (const b of tabButtons) {
+    const on = b.dataset.tab === activeTab;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-selected', String(on));
+    b.tabIndex = on ? 0 : -1;
+  }
+  $('tab-net').hidden = activeTab !== 'net';
+  $('tab-mem').hidden = activeTab !== 'mem';
+  state.hover = null;
+  tip.hidden = true;
+  savePref('tab', activeTab);
+}
+document.querySelector('.tabs').addEventListener('click', ev => {
+  const b = ev.target.closest('.tab');
+  if (b) showTab(b.dataset.tab);
+});
+document.querySelector('.tabs').addEventListener('keydown', ev => {
+  if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+  const i = tabButtons.findIndex(b => b.dataset.tab === activeTab);
+  const next = tabButtons[(i + (ev.key === 'ArrowRight' ? 1 : tabButtons.length - 1)) % tabButtons.length];
+  showTab(next.dataset.tab);
+  next.focus();
+});
+
+// ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
 async function loadInfo() {
@@ -780,9 +814,14 @@ function connect() {
     renderStatus();
   };
   es.onmessage = ev => onTick(JSON.parse(ev.data));
+  es.addEventListener('sys', ev => {
+    const m = JSON.parse(ev.data);
+    for (const f of sysListeners) f(m);
+  });
   es.onerror = () => { state.connected = false; renderStatus(); };
 }
 
+showTab(loadPref('tab'));
 state.hideOwn = loadPref('hideOwn') === true;
 renderOwn();
 readTheme();
