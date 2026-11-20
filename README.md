@@ -1,4 +1,4 @@
-# Port traffic
+# omniTop
 
 A live isometric view of this Windows machine's network traffic, one bar per port,
 and of its memory and GPU, one bar per gigabyte, plus real-time graphs of CPU,
@@ -40,14 +40,23 @@ are tabs along the top of the window: **Network ports**, **Memory & GPU** and
   2 Mb/s and a quarter of all traffic). Flashing stops 3 seconds after the
   traffic settles. A rise that keeps going becomes the new usual level after a
   minute or two.
+- **In** and **Out** in the header are bars on the grid's log scale, up to
+  1 Gb/s, colored like the big field's bars as traffic rises.
 - **Port scans.** When one address probes 10 or more different ports of this
-  machine within 30 seconds, an alert opens at the bottom right, over every tab.
-  It shows:
-  - who is scanning, when it started, and whether it's still going
-  - every port probed, with the ones that answered (open here) called out
+  machine within 30 seconds, it's a scan:
+  - **Alert.** An alert opens at the bottom right of the grid area. It shows who
+    is scanning, when it started, whether it's still going, and every port
+    probed, with the ones that answered (open here) called out.
+  - **View.** The view zooms out so both grids fit beside the alert.
+  - **Port scan button.** The button next to All | TCP | UDP pulses bright red
+    while the scan runs. Click it to bring back the latest alert.
+  - **Grid.** Each probed port's square lights up red for a second.
+  - **Other tabs.** If another tab is open, the Network ports tab flashes red.
+    After the scan, a red dot stays on it until you open it.
 
-  While the scan runs, each probed port's square on the grid lights up red for
-  a second. Dismiss the alert with **×**; it comes back if the scan picks up again.
+  A scan is over once no probe has come for about 3 seconds, or up to 10 for a
+  slow one. If the same address starts again after that, it's a new scan with
+  its own alert. Dismiss an alert with **×**.
 - Scroll the mouse wheel over the grid to zoom in and out around the pointer, and
   drag with the left button to move around. **Reset view** goes back to the start.
 - The sample rate and the Hide own traffic setting are remembered between runs.
@@ -137,14 +146,14 @@ reconnects by itself. The app connects to the agents only while its window is op
 
 ## Run it
 
-Download `PortTraffic.exe` from the
+Download `omniTop.exe` from the
 [latest release](https://github.com/esteed/port-traffic-viz/releases/latest), or
 build it yourself (see below).
 
 | | |
 |---|---|
-| `PortTraffic.exe` | The desktop app. Windows asks for administrator rights, then the view opens in its own window. Close the window to stop. |
-| `PortTraffic.exe --demo` | Simulated traffic, with a port scan now and then, no administrator rights needed. |
+| `omniTop.exe` | The desktop app. Windows asks for administrator rights, then the view opens in its own window. Close the window to stop. |
+| `omniTop.exe --demo` | Simulated traffic, with a port scan now and then, no administrator rights needed. |
 | `start.cmd`, `start-demo.cmd` | The same view in your browser instead, run from source (needs Python). |
 
 The exe needs nothing installed. It uses the Edge WebView2 runtime that comes with Windows 11.
@@ -157,7 +166,7 @@ If you decline the administrator prompt, the window offers **Try again** or
 Run `build.cmd`. It needs 64-bit Python 3.10 or later and, the first time, an
 internet connection: it sets up pywebview, PyInstaller and Pillow in
 `%LOCALAPPDATA%\PortTrafficViz\build` (outside Google Drive) and writes
-`dist\PortTraffic.exe`. Rebuild after editing anything in `web\`, `server.py`,
+`dist\omniTop.exe`. Rebuild after editing anything in `web\`, `server.py`,
 `sysmon.py`, `perfmon.py`, `netwatch.py` or `desktop.py`.
 
 ## How it works
@@ -233,6 +242,8 @@ isn't its own address.
 
 ## Notes
 
+- omniTop was called Port traffic until version 1.5. It keeps that version's settings,
+  and still uses its folder, `%LOCALAPPDATA%\PortTrafficViz`.
 - For live capture, the program copies itself to `%LOCALAPPDATA%\PortTrafficViz`
   and runs the elevated copy from there, because elevated processes can't always
   see Google Drive or mapped network drive letters.

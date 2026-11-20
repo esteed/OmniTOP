@@ -1,4 +1,4 @@
-"""Build dist\\PortTraffic.exe. Run build.cmd, which sets up the tools first.
+"""Build dist\\omniTop.exe. Run build.cmd, which sets up the tools first.
 
 Needs pywebview, pyinstaller and pillow in the running Python.
 """
@@ -97,11 +97,11 @@ def main() -> int:
     import PyInstaller.__main__
 
     os.makedirs(WORK, exist_ok=True)
-    icon = os.path.join(WORK, "PortTraffic.ico")
+    icon = os.path.join(WORK, "omniTop.ico")
     make_icon(icon)
     PyInstaller.__main__.run([
         os.path.join(HERE, "desktop.py"),
-        "--name", "PortTraffic",
+        "--name", "omniTop",
         "--onefile", "--windowed", "--noconfirm", "--clean",
         "--icon", icon,
         "--add-data", f"{os.path.join(HERE, 'web')}{os.pathsep}web",

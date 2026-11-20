@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Port traffic</title>
+<title>omniTop</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -26,8 +26,14 @@
 <section id="tab-net" class="page" role="tabpanel" aria-labelledby="tabbtn-net">
   <header class="bar">
     <div class="stats">
-      <div class="stat"><span class="k">In</span><span id="st-in" class="v">–</span></div>
-      <div class="stat"><span class="k">Out</span><span id="st-out" class="v">–</span></div>
+      <div class="stat tput" title="Traffic in, on the grid's log scale: 100 b/s to 1 Gb/s">
+        <span class="tk"><span class="k">In</span><span id="st-in" class="v">–</span></span>
+        <span class="tbar"><i id="bar-in"></i></span>
+      </div>
+      <div class="stat tput" title="Traffic out, on the grid's log scale: 100 b/s to 1 Gb/s">
+        <span class="tk"><span class="k">Out</span><span id="st-out" class="v">–</span></span>
+        <span class="tbar"><i id="bar-out"></i></span>
+      </div>
       <div class="stat"><span class="k">Active ports</span><span id="st-act" class="v">–</span></div>
     </div>
     <div class="controls">
@@ -41,6 +47,7 @@
         <button type="button" data-v="tcp">TCP</button>
         <button type="button" data-v="udp">UDP</button>
       </div>
+      <button type="button" id="ctl-scan" class="scan-light" aria-pressed="false" title="Lights up while a port scan is under way. Click to show its alert.">Port scan</button>
       <label class="sel">Scale
         <select id="ctl-scale">
           <option value="1e7">10 Mb/s</option>
@@ -79,6 +86,7 @@
         <span class="item"><span class="sw probe"></span>Probed by a port scan</span>
         <span class="item muted">Scroll to zoom · drag to move · hover for details</span>
       </div>
+      <div id="alerts" class="alerts" aria-live="assertive"></div>
     </div>
     <aside>
       <h2>Busiest ports</h2>
@@ -183,7 +191,6 @@
     </div>
   </main>
 </section>
-<div id="alerts" class="alerts" aria-live="assertive"></div>
 <script src="/app.js"></script>
 <script src="/memory.js"></script>
 <script src="/perf.js"></script>

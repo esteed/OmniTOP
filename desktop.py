@@ -1,7 +1,7 @@
-"""Port traffic as a desktop app: the same view in its own window.
+"""omniTop as a desktop app: the same view in its own window.
 
-    PortTraffic.exe          live capture (Windows asks for administrator rights)
-    PortTraffic.exe --demo   simulated traffic
+    omniTop.exe          live capture (Windows asks for administrator rights)
+    omniTop.exe --demo   simulated traffic
 
 The window runs with your normal rights. Capture needs administrator rights,
 so it runs in a second, elevated copy of this program that has no window of
@@ -29,7 +29,9 @@ from ctypes import wintypes
 
 import server
 
-TITLE = "Port traffic"
+TITLE = "omniTop"
+# The app was called Port traffic before; its windows count as this app's too.
+TITLES = (TITLE, "Port traffic")
 FROZEN = getattr(sys, "frozen", False)
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(), "PortTrafficViz")
 ERROR_FILE = os.path.join(APP_DIR, "capture-error.txt")
@@ -114,7 +116,7 @@ def app_windows(pid: int | None = None) -> list[int]:
             user32.GetClassNameW(hwnd, cls, 256)
             owner = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-            if (title.value.startswith(TITLE) and cls.value.startswith("WindowsForms")
+            if (title.value.startswith(TITLES) and cls.value.startswith("WindowsForms")
                     and (pid is None or owner.value == pid)):
                 found.append(hwnd)
         return True
@@ -284,7 +286,7 @@ BUTTONS = ('<div class="row"><button onclick="pywebview.api.try_live()">Try agai
 
 # A starting settings.ini, in CPU Graph's format, for a PC that doesn't have one
 SETTINGS_TEMPLATE = """\
-# Read by CPU Graph and by Port traffic's CPU, disk & network tab.
+# Read by CPU Graph and by omniTop's CPU, disk & network tab.
 # Changes to adapters, drives and scales apply within a second.
 
 # Network adapters to graph, separated by ; - their connection names (or words from
@@ -404,7 +406,7 @@ class App:
                 self.window.load_url(self.srv.url)
             except Exception as exc:  # noqa: BLE001 - shown in the window
                 self.srv = None
-                self.show("Port traffic couldn't start.", describe(exc), buttons=mode == "live")
+                self.show("omniTop couldn't start.", describe(exc), buttons=mode == "live")
 
     def start_helper(self) -> None:
         if not self.busy.acquire(blocking=False):

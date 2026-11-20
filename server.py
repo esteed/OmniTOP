@@ -1,4 +1,4 @@
-"""Port traffic visualizer server.
+"""omniTop server.
 
 Counts TCP/UDP bytes per port on this machine using the
 Microsoft-Windows-Kernel-Network ETW provider (needs administrator rights)
@@ -43,7 +43,7 @@ DEFAULT_PORT = 8787
 RATES = (20, 10, 5, 2, 1)   # samples a second the view can choose from
 DEFAULT_RATE = 20
 FASTEST_TICK = 1 / max(RATES)
-SESSION_NAME = "PortTrafficViz"
+SESSION_NAME = "PortTrafficViz"   # from when the app was called Port traffic
 
 TCP, UDP = 0, 1
 
@@ -272,7 +272,7 @@ def _sockaddr(data: bytes, off: int, length: int) -> tuple[str, int]:
 def check_layouts() -> None:
     """Fail fast if this Python's struct layouts don't match the Windows SDK."""
     if struct.calcsize("P") != 8:
-        raise SystemExit("Port traffic needs 64-bit Python.")
+        raise SystemExit("omniTop needs 64-bit Python.")
     expected = {EVENT_TRACE_PROPERTIES: 120, EVENT_TRACE_LOGFILEW: 448, EVENT_RECORD: 112,
                 TRACE_LOGFILE_HEADER: 280, EVENT_HEADER: 80}
     for cls, size in expected.items():
@@ -834,7 +834,7 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
     allowed_origins = {f"http://{h}" for h in allowed_hosts}
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "PortTraffic/1.0"
+        server_version = "omniTop/1.0"
 
         def log_message(self, fmt, *args):  # keep the console for status lines
             pass
@@ -1166,7 +1166,7 @@ def serve(args, mode: str) -> int:
     srv = Server(mode, args.port, exact_port=args.elevated)
     install_close_handler(srv.stop_capture)
     label = "simulated traffic" if mode == "demo" else "live capture of this machine's TCP and UDP traffic"
-    print(f"Port traffic: {label}\nServing {srv.url}  (Ctrl+C or close this window to stop)", flush=True)
+    print(f"omniTop: {label}\nServing {srv.url}  (Ctrl+C or close this window to stop)", flush=True)
     if not args.no_browser and not args.elevated:
         threading.Timer(0.3, webbrowser.open, (srv.url,)).start()
     try:

@@ -16,7 +16,7 @@ const STATS_SECONDS = 0.25;           // the header numbers redraw 4 times a sec
 const LIST_SECONDS = 1;               // the busiest-ports list redraws once a second
 const RATES = [20, 10, 5, 2, 1];      // samples a second the server can be set to
 const MAX_ZOOM = 16;
-const LEGEND_H = 34;                  // room left under the scene for the legend
+const LEGEND_MIN = 34;                // room left under the scene for a one-line legend
 const OWN = [255, 255, 255];          // this app's own traffic is drawn white
 const PROBE_LIGHT = 1;                // seconds a scanned port's square stays lit
 // A port, or the ports of one process, whose traffic jumps well above its own
@@ -50,6 +50,7 @@ const sysListeners = [];              // memory.js: called with each memory/GPU 
 const perfListeners = { perf: [], perfmeta: [] };   // perf.js
 const listListeners = [];             // watch.js: called after the busiest-ports list redraws
 const scanListeners = [];             // watch.js: called with each port scan update
+const tabListeners = [];              // watch.js: called with the tab's name when one is opened
 const probeLit = new Map();           // port -> when (s, page clock) its scan-probe light goes out
 const procJump = new Map();           // process name -> { avg, hot, seen } for traffic jumps
 let jumpClock = 0, jumpWarm = JUMP.warm, totalAvg = 0;
@@ -492,12 +493,14 @@ function buildLayers() {
 // ---------------------------------------------------------------------------
 // View: zoom with the mouse wheel, move by dragging
 // ---------------------------------------------------------------------------
-const startScale = () => Math.min(1, viewW / W, (viewH - LEGEND_H) / H);
+// Room under the scene for the legend, which wraps onto more lines in a narrow window.
+const legendRoom = () => Math.max(LEGEND_MIN, (stage.querySelector('.legend')?.offsetHeight || 0) + 16);
+const startScale = () => Math.min(1, viewW / W, (viewH - legendRoom()) / H);
 
 function resetView() {
   K = startScale();
   offX = Math.round((viewW - W * K) / 2);
-  offY = Math.max(0, Math.round((viewH - LEGEND_H - H * K) / 2));
+  offY = Math.max(0, Math.round((viewH - legendRoom() - H * K) / 2));
   userView = false;
   layersDirty = true;
 }
@@ -518,6 +521,50 @@ function zoomAt(mx, my, f) {
   clampView();
   userView = true;
   layersDirty = true;
+}
+
+// Fit both grids into the view with boxes (in stage px, such as the scan
+// alert and the legend) kept clear: as large as the starting view allows,
+// centered if that works, else nudged up and left, else a little smaller,
+// until nothing of either grid is under a box.
+function fitAround(boxes) {
+  if (!viewW || !viewH) return false;
+  const m = 12, k0 = startScale();
+  for (let k = k0; k >= k0 * 0.3; k *= 0.95) {
+    const cx = (viewW - W * k) / 2, cy = Math.max(m, (viewH - legendRoom() - H * k) / 2);
+    for (const [ox, oy] of [[cx, cy], [cx, m], [m, cy], [m, m]]) {
+      if (!boxes.some(box => sceneUnder(box, k, ox, oy))) {
+        K = k; offX = Math.round(ox); offY = Math.round(oy);
+        userView = true;
+        layersDirty = true;
+        return true;
+      }
+    }
+  }
+  resetView();
+  return false;
+}
+
+// Would either grid (with room for its labels) be under the box at zoom k, offset (ox, oy)?
+function sceneUnder(box, k, ox, oy) {
+  const rect = [[box.x, box.y], [box.x + box.w, box.y], [box.x + box.w, box.y + box.h], [box.x, box.y + box.h]];
+  const floors = [quad(-16, -16, HI_COLS * 2 + 32, HI_ROWS * 2 + 40), quad(BX - 12, BY - 12, 160 + 44, 160 + 44)];
+  return floors.some(q => convexOverlap(q.map(([x, y]) => { const [sx, sy] = proj(x, y); return [ox + sx * k, oy + sy * k]; }), rect));
+}
+
+// Separating-axis test for two convex polygons.
+function convexOverlap(a, b) {
+  for (const poly of [a, b]) {
+    for (let i = 0; i < poly.length; i++) {
+      const [x1, y1] = poly[i], [x2, y2] = poly[(i + 1) % poly.length];
+      const nx = y2 - y1, ny = x1 - x2;
+      let amin = Infinity, amax = -Infinity, bmin = Infinity, bmax = -Infinity;
+      for (const [x, y] of a) { const d = x * nx + y * ny; amin = Math.min(amin, d); amax = Math.max(amax, d); }
+      for (const [x, y] of b) { const d = x * nx + y * ny; bmin = Math.min(bmin, d); bmax = Math.max(bmax, d); }
+      if (amax < bmin || bmax < amin) return false;
+    }
+  }
+  return true;
 }
 
 function layout() {
@@ -806,9 +853,20 @@ function renderStats() {
   }
   $('st-in').textContent = fmtRate(bin * 8 / span);
   $('st-out').textContent = fmtRate(bout * 8 / span);
+  tputBar('bar-in', bin * 8 / span);
+  tputBar('bar-out', bout * 8 / span);
   let n = 0;
   for (const e of ports.values()) if (e.rate > 0) n++;
   $('st-act').textContent = n.toLocaleString();
+}
+
+// The In and Out bars: the grid's log scale, fixed at 1 Gb/s, in the big field's colors.
+const TPUT_MAX = 1e9;
+function tputBar(id, bps) {
+  const t = bps > 0 ? Math.min(1, Math.max(0.02, Math.log10(bps / MIN_RATE) / Math.log10(TPUT_MAX / MIN_RATE))) : 0;
+  const el = $(id);
+  el.style.width = (t * 100).toFixed(1) + '%';
+  el.style.backgroundColor = rgb(ramp(t));
 }
 
 function listRow(p, e) {
@@ -945,6 +1003,7 @@ function showTab(name) {
   state.hover = null;
   tip.hidden = true;
   savePref('tab', activeTab);
+  for (const f of tabListeners) f(activeTab);
 }
 document.querySelector('.tabs').addEventListener('click', ev => {
   const b = ev.target.closest('.tab');
@@ -967,7 +1026,7 @@ async function loadInfo() {
     state.mode = info.mode;
     state.services = info.services || {};
     if (info.tick > 0) setTick(info.tick);
-    document.title = `Port traffic · ${info.host}`;
+    document.title = `omniTop · ${info.host}`;
     // Put back the sample rate chosen last time.
     const want = loadPref('rate');
     if (!rateRestored && RATES.includes(want) && Math.round(1 / info.tick) !== want) {

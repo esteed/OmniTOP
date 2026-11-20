@@ -541,7 +541,10 @@ class ScanWatch:
 
     WINDOW = 30.0
     MIN_PORTS = 10
-    QUIET = 20.0         # a scan has ended after this long without new probes
+    # A scan has ended once no probe has come for 4 times its usual gap between
+    # probes, within these bounds. A scan that starts again after that is a new
+    # scan, with its own alert.
+    QUIET_MIN, QUIET_MAX = 3.0, 10.0
     KEEP = 900.0         # ended scans stay available to the view this long
     MAX_PENDING = 50000
     MAX_LISTED = 4096
@@ -557,10 +560,11 @@ class ScanWatch:
         self._lock = threading.Lock()
         self._pending: list[tuple] = []
         self._state: dict[str, dict] = {}   # remote -> {"ports": {(proto, port): rec}, "recent": deque}
-        self._scans: dict[str, dict] = {}   # remote -> its latest scan
+        self._scans: dict[str, dict] = {}   # scan id -> scan
+        self._current: dict[str, str] = {}  # remote -> id of its latest scan
         self._stop = threading.Event()
         self.dropped = 0
-        self._dirty: set[str] = set()   # scans to describe to the view
+        self._dirty: set[str] = set()   # ids of scans to describe to the view
         self._sent = 0.0
         self.known_names: dict[str, str] = {}   # names to show without a reverse lookup
 
@@ -589,9 +593,9 @@ class ScanWatch:
                     self.hub.publish(json.dumps({"h": hits}, separators=(",", ":")), "probe")
                 # Scan summaries go out at most once a second, unless one started or ended.
                 if self._dirty and (urgent or now - self._sent >= 1.0):
-                    remotes, self._dirty = self._dirty, set()
+                    ids, self._dirty = self._dirty, set()
                     self._sent = now
-                    self._publish(remotes)
+                    self._publish(ids)
             except Exception:   # keep watching whatever one bad probe did
                 pass
 
@@ -621,6 +625,7 @@ class ScanWatch:
         with self._lock:
             pending, self._pending = self._pending, []
         fresh: dict[str, set[int]] = {}
+        counts: dict[str, int] = {}
         for t, remote, lport, proto, kind, rport in pending:
             if kind != "open" and self._late(remote, lport, rport):
                 continue   # a late packet for one of this machine's own connections
@@ -636,8 +641,8 @@ class ScanWatch:
             if kind == "open":
                 rec["kind"] = "open"
             st["recent"].append((t, lport))
-
             fresh.setdefault(remote, set()).add(lport)
+            counts[remote] = counts.get(remote, 0) + 1
 
         urgent = False
         hits: set[int] = set()
@@ -646,33 +651,38 @@ class ScanWatch:
                 rq = st["recent"]
                 while rq and rq[0][0] < now - self.WINDOW:
                     rq.popleft()
-                scan = self._scans.get(remote)
+                scan = self._scans.get(self._current.get(remote, ""))
                 live = scan is not None and not scan["ended"]
                 if not live and len({p for _, p in rq}) >= self.MIN_PORTS:
                     recs = {k: r for k, r in st["ports"].items() if r["last"] >= now - self.WINDOW}
                     first = min(r["first"] for r in recs.values())
-                    scan = {"id": f"{remote}@{int(first)}", "remote": remote,
-                            "name": self.known_names.get(remote, ""),
-                            "first": first, "last": first, "ended": False, "ports": recs}
-                    self._scans[remote] = scan
+                    sid = f"{remote}@{first:.3f}"
+                    scan = {"id": sid, "remote": remote, "name": self.known_names.get(remote, ""),
+                            "first": first, "last": first, "ended": False, "ports": recs,
+                            "n": sum(r["n"] for r in recs.values())}
+                    self._scans[sid] = scan
+                    self._current[remote] = sid
                     live = urgent = True
-                    self._dirty.add(remote)
+                    self._dirty.add(sid)
                     hits.update(p for _, p in recs)
                     if not scan["name"]:
                         threading.Thread(target=self._resolve, args=(scan,), daemon=True).start()
                 elif live and remote in fresh:
                     hits.update(fresh[remote])
+                    scan["n"] += counts[remote]
                 if live:
                     for k, r in st["ports"].items():
                         if r["last"] >= scan["first"] and len(scan["ports"]) < self.MAX_LISTED:
                             scan["ports"][k] = r
                     scan["last"] = max(r["last"] for r in scan["ports"].values())
                     if remote in fresh:
-                        self._dirty.add(remote)
-                    if now - scan["last"] > self.QUIET:
+                        self._dirty.add(scan["id"])
+                    if now - scan["last"] > self._quiet(scan):
                         scan["ended"] = urgent = True
-                        self._dirty.add(remote)
-                        # Its probes belong to it: only new ones can start another scan.
+                        self._dirty.add(scan["id"])
+                        # The scan's probes belong to it: only new ones can start another
+                        # scan, and its records stop growing (later probes go to that one).
+                        scan["ports"] = dict(scan["ports"])
                         rq.clear()
                         st["ports"] = {}
                     else:
@@ -681,10 +691,18 @@ class ScanWatch:
                 st["ports"] = {k: r for k, r in st["ports"].items() if r["last"] >= now - self.WINDOW}
                 if not st["ports"] and not rq:
                     del self._state[remote]
-            for remote, scan in list(self._scans.items()):
+            for sid, scan in list(self._scans.items()):
                 if scan["ended"] and now - scan["last"] > self.KEEP:
-                    del self._scans[remote]
+                    del self._scans[sid]
+                    if self._current.get(scan["remote"]) == sid:
+                        del self._current[scan["remote"]]
         return urgent, sorted(hits)
+
+    def _quiet(self, scan: dict) -> float:
+        """How long without probes before this scan counts as over."""
+        gap = (scan["last"] - scan["first"]) / max(1, scan["n"] - 1)
+        return min(self.QUIET_MAX, max(self.QUIET_MIN, 4 * gap))
+
     def _resolve(self, scan: dict) -> None:
         try:
             name = socket.gethostbyaddr(scan["remote"])[0]
@@ -692,22 +710,21 @@ class ScanWatch:
             return
         with self._lock:
             scan["name"] = name
-        self._publish([scan["remote"]])
-
+        self._publish([scan["id"]])
     @staticmethod
     def _view(scan: dict) -> dict:
         ports = sorted(scan["ports"].items(), key=lambda kv: (kv[0][1], kv[0][0]))
         return {"id": scan["id"], "remote": scan["remote"], "name": scan["name"],
                 "first": round(scan["first"], 1), "last": round(scan["last"], 1), "ended": scan["ended"],
-                "probes": sum(r["n"] for _, r in ports),
+                "probes": scan["n"],
                 "ports": [[p, "TCP" if proto == TCP else "UDP", r["kind"]] for (proto, p), r in ports]}
 
-    def views(self, remotes=None) -> list[dict]:
+    def views(self, ids=None) -> list[dict]:
         with self._lock:
-            return [self._view(s) for r, s in self._scans.items() if remotes is None or r in remotes]
+            return [self._view(s) for sid, s in self._scans.items() if ids is None or sid in ids]
 
-    def _publish(self, remotes) -> None:
-        scans = self.views(set(remotes))
+    def _publish(self, ids) -> None:
+        scans = self.views(set(ids))
         if scans:
             self.hub.publish(json.dumps({"scans": scans, "now": round(time.time(), 1)},
                                         separators=(",", ":")), "scan")
