@@ -13,7 +13,9 @@ are tabs along the top of the window: **Network ports**, **Memory & GPU** and
   The darker band is the ephemeral range, 49152–65535: the short-lived local ports
   Windows assigns to outgoing connections.
 - Bar height shows traffic on a log scale, from 100 b/s up to the scale you pick.
-  Color runs from blue for light traffic through violet to red for heavy traffic.
+  On the big field, color runs from blue for light traffic through violet to red
+  for heavy traffic. Ports 1–1024 run from amber to red instead.
+- Each grid's title runs along one of its edges.
 - White is traffic the app causes itself, stacked on top of everything else on that
   port. **Hide own traffic** leaves it out of the bars, the totals and the list.
 - Traffic is sampled 20 times a second by default. **Samples** changes that to 10, 5,
@@ -22,6 +24,30 @@ are tabs along the top of the window: **Network ports**, **Memory & GPU** and
 - The **Busiest ports** list updates once a second. Click a port there to pin it:
   pinned ports stay at the top of the list and are outlined on the grid until you
   click them again. You can pin as many as you like.
+- Rest the pointer on a pinned port for 2 seconds to open a bubble about the
+  processes using it:
+  - each process's name, description, path, PID, user, memory and start time
+  - the process that started it, and the services a svchost runs
+  - its connections on that port
+  - who's listening on the port
+
+  A bubble stays open until you close it with **×**, and refreshes every few
+  seconds. Up to four can be open side by side; trying a fifth says so.
+- **Traffic jumps flash.** A port whose traffic suddenly rises well above its
+  usual level gets a pulsing cyan patch on the grid and an ↑ in the list. So do
+  the ports of a process whose traffic rises that way together. The rise has to
+  be at least 4 times its usual level, and big next to everything else (at least
+  2 Mb/s and a quarter of all traffic). Flashing stops 3 seconds after the
+  traffic settles. A rise that keeps going becomes the new usual level after a
+  minute or two.
+- **Port scans.** When one address probes 10 or more different ports of this
+  machine within 30 seconds, an alert opens at the bottom right, over every tab.
+  It shows:
+  - who is scanning, when it started, and whether it's still going
+  - every port probed, with the ones that answered (open here) called out
+
+  While the scan runs, each probed port's square on the grid lights up red for
+  a second. Dismiss the alert with **×**; it comes back if the scan picks up again.
 - Scroll the mouse wheel over the grid to zoom in and out around the pointer, and
   drag with the left button to move around. **Reset view** goes back to the start.
 - The sample rate and the Hide own traffic setting are remembered between runs.
@@ -118,7 +144,7 @@ build it yourself (see below).
 | | |
 |---|---|
 | `PortTraffic.exe` | The desktop app. Windows asks for administrator rights, then the view opens in its own window. Close the window to stop. |
-| `PortTraffic.exe --demo` | Simulated traffic, no administrator rights needed. |
+| `PortTraffic.exe --demo` | Simulated traffic, with a port scan now and then, no administrator rights needed. |
 | `start.cmd`, `start-demo.cmd` | The same view in your browser instead, run from source (needs Python). |
 
 The exe needs nothing installed. It uses the Edge WebView2 runtime that comes with Windows 11.
@@ -132,7 +158,7 @@ Run `build.cmd`. It needs 64-bit Python 3.10 or later and, the first time, an
 internet connection: it sets up pywebview, PyInstaller and Pillow in
 `%LOCALAPPDATA%\PortTrafficViz\build` (outside Google Drive) and writes
 `dist\PortTraffic.exe`. Rebuild after editing anything in `web\`, `server.py`,
-`sysmon.py`, `perfmon.py` or `desktop.py`.
+`sysmon.py`, `perfmon.py`, `netwatch.py` or `desktop.py`.
 
 ## How it works
 
@@ -155,6 +181,27 @@ process instead.
 Each connection has two ports. A browser fetching a web page uses a dynamic local
 port (say 52814) and remote port 443. The **Both ends** filter counts those bytes
 at both ports, **Local** only at 52814, and **Remote** only at 443.
+
+`netwatch.py` is behind the bubbles and the scan alerts.
+
+- **Bubbles**: the port's connections and listeners come from the same tables as
+  `netstat -ano`. The processes on it come from those, plus the ones capture saw
+  moving data on it in the last two minutes. Process details come from the
+  process itself, its file's version information, and the service manager.
+  Everything shown is what Task Manager and netstat show any user. Command lines
+  are left out, so the elevated capture process doesn't pass anything more
+  private to the window.
+- **Scans**: capture also listens to the `Microsoft-Windows-TCPIP` provider, for
+  event 1214. That's a packet the transport layer dropped, such as a probe of a
+  port nothing listens on that Windows Firewall discarded. It also counts
+  accepted connections (Kernel-Network's accept events) for the ports that
+  answer. Broadcast, multicast and loopback packets don't count.
+- **Late packets**: some drops are just late, a server answering a connection
+  this machine already closed. Those are left out: packets from a server's
+  well-known port (below 1024), and packets from an address to a local port this
+  machine had a connection on with it in the last 3 minutes.
+- **Without Windows Firewall**: Windows answers probes of closed ports with a
+  reset instead of dropping them, so scans of closed ports aren't seen.
 
 `sysmon.py` samples memory, the GPU and the CPU once a second and sends the result
 on the same stream.

@@ -29,8 +29,10 @@ import uuid
 import webbrowser
 from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import urlopen
 
+import netwatch
 import perfmon
 import sysmon
 
@@ -205,6 +207,16 @@ class EVENT_RECORD(ctypes.Structure):
 EVENT_RECORD_CALLBACK = ctypes.WINFUNCTYPE(None, ctypes.c_void_p)
 
 
+class EVENT_FILTER_DESCRIPTOR(ctypes.Structure):
+    _fields_ = [("Ptr", ULONG64), ("Size", ULONG), ("Type", ULONG)]
+
+
+class ENABLE_TRACE_PARAMETERS(ctypes.Structure):
+    _fields_ = [("Version", ULONG), ("EnableProperty", ULONG), ("ControlFlags", ULONG),
+                ("SourceId", GUID), ("EnableFilterDesc", ctypes.POINTER(EVENT_FILTER_DESCRIPTOR)),
+                ("FilterDescCount", ULONG)]
+
+
 class EVENT_TRACE_LOGFILEW(ctypes.Structure):
     _fields_ = [("LogFileName", wintypes.LPWSTR), ("LoggerName", wintypes.LPWSTR),
                 ("CurrentTime", ctypes.c_int64), ("BuffersRead", ULONG),
@@ -216,6 +228,7 @@ class EVENT_TRACE_LOGFILEW(ctypes.Structure):
 
 
 OFF_EVENT_ID = EVENT_RECORD.EventHeader.offset + EVENT_HEADER.EventDescriptor.offset + EVENT_DESCRIPTOR.Id.offset
+OFF_PROVIDER = EVENT_RECORD.EventHeader.offset + EVENT_HEADER.ProviderId.offset
 OFF_USER_LEN = EVENT_RECORD.UserDataLength.offset
 OFF_USER_DATA = EVENT_RECORD.UserData.offset
 
@@ -231,7 +244,29 @@ ERROR_ALREADY_EXISTS = 183
 INVALID_PROCESSTRACE_HANDLE = 0xFFFFFFFFFFFFFFFF
 
 KERNEL_NETWORK_GUID = GUID.parse("7DD42A49-5329-4832-8DFD-43D979153A88")
+# Microsoft-Windows-TCPIP, for port scans: event 1214 is a packet the transport
+# layer dropped, such as a probe of a port nothing listens on that Windows
+# Firewall discarded.
+TCPIP_GUID = GUID.parse("2F07E2EE-15DB-40F1-90EF-9D7BA282188A")
+TCPIP_DATA1 = 0x2F07E2EE
+KW_TCPIP_DROPPED = 0x0000010000000000
+TCPIP_EVENTS = (1214,)
+EVENT_FILTER_TYPE_EVENT_ID = 0x80000200
+ENABLE_TRACE_PARAMETERS_VERSION_2 = 2
 SESSION_GUID = GUID.parse("5C3E6F0B-8A41-4F0E-9B6D-2D7A1E4C9F31")
+
+
+def _sockaddr(data: bytes, off: int, length: int) -> tuple[str, int]:
+    """(address, port) from a SOCKADDR_IN or SOCKADDR_IN6 inside an event."""
+    if length < 8 or off + length > len(data):
+        return "", 0
+    family = data[off] | (data[off + 1] << 8)
+    port = (data[off + 2] << 8) | data[off + 3]
+    if family == netwatch.AF_INET:
+        return netwatch._ip(data[off + 4:off + 8], netwatch.AF_INET), port
+    if family == netwatch.AF_INET6 and length >= 24:
+        return netwatch._ip(data[off + 8:off + 24], netwatch.AF_INET6), port
+    return "", port
 
 
 def check_layouts() -> None:
@@ -273,8 +308,15 @@ class EtwCapture:
     EVENTS = {10: (TCP, True, 4), 11: (TCP, False, 4), 26: (TCP, True, 16), 27: (TCP, False, 16),
               42: (UDP, True, 4), 43: (UDP, False, 4), 58: (UDP, True, 16), 59: (UDP, False, 16)}
 
-    def __init__(self, acc: Accumulator, own_port: int = 0, owner_pid: int | None = None) -> None:
+    # Kernel-Network's TCP accepts (IPv4, IPv6) and TCPIP's drops: the events
+    # a port scan shows up in.
+    PROBE_EVENTS = frozenset((15, 31) + TCPIP_EVENTS)
+
+    def __init__(self, acc: Accumulator, own_port: int = 0, owner_pid: int | None = None,
+                 scans: netwatch.ScanWatch | None = None) -> None:
         self.acc = acc
+        self.scans = scans
+        self.probe_log = None   # debugging: called with every probe event before filtering
         self.adv = _advapi()
         self.session: int | None = None
         self.trace: int | None = None
@@ -331,6 +373,8 @@ class EtwCapture:
         if rc:
             self.stop()
             raise OSError(rc, f"Couldn't enable the network provider: {ctypes.FormatError(rc).strip()}")
+        if self.scans is not None:
+            self._enable_tcpip()
 
         log = EVENT_TRACE_LOGFILEW()
         log.LoggerName = SESSION_NAME
@@ -345,6 +389,28 @@ class EtwCapture:
         self.trace = trace
         threading.Thread(target=self._pump, name="etw", daemon=True).start()
         threading.Thread(target=self._watch_own, name="own-pids", daemon=True).start()
+
+    def _enable_tcpip(self) -> None:
+        """Add the TCPIP provider, limited to the drop events port scans cause.
+
+        Scan detection is extra: if the provider can't be added, capture carries on without it.
+        """
+        ids = TCPIP_EVENTS
+        raw = struct.pack(f"<BBH{len(ids)}H", 1, 0, len(ids), *ids)   # EVENT_FILTER_EVENT_ID, FilterIn
+        self._filter_data = ctypes.create_string_buffer(raw, len(raw))
+        desc = EVENT_FILTER_DESCRIPTOR(ctypes.addressof(self._filter_data), len(raw),
+                                       EVENT_FILTER_TYPE_EVENT_ID)
+        params = ENABLE_TRACE_PARAMETERS(Version=ENABLE_TRACE_PARAMETERS_VERSION_2,
+                                         EnableFilterDesc=ctypes.pointer(desc), FilterDescCount=1)
+        rc = self.adv.EnableTraceEx2(self.session, ctypes.byref(TCPIP_GUID),
+                                     EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE,
+                                     KW_TCPIP_DROPPED, 0, 0, ctypes.byref(params))
+        if rc:   # no event ID filtering here: all the drops, sorted out in the callback
+            rc = self.adv.EnableTraceEx2(self.session, ctypes.byref(TCPIP_GUID),
+                                         EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE,
+                                         KW_TCPIP_DROPPED, 0, 0, None)
+        if rc:
+            print(f"Port scan detection is off: {ctypes.FormatError(rc).strip()}", flush=True)
 
     def _watch_own(self) -> None:
         """Keep the set of this app's processes current (the browser engine starts its own)."""
@@ -364,8 +430,11 @@ class EtwCapture:
 
     def _on_event(self, rec: int) -> None:
         try:
-            spec = self.EVENTS.get(ctypes.c_uint16.from_address(rec + OFF_EVENT_ID).value)
+            eid = ctypes.c_uint16.from_address(rec + OFF_EVENT_ID).value
+            spec = self.EVENTS.get(eid)
             if spec is None:
+                if eid in self.PROBE_EVENTS and self.scans is not None:
+                    self._on_probe(rec, eid)
                 return
             proto, outbound, alen = spec
             need = 12 + 2 * alen
@@ -381,6 +450,38 @@ class EtwCapture:
             self.acc.add(sport, dport, size, proto, outbound, pid, own)
         except Exception:  # never let an exception escape into ETW's thread
             pass
+
+    def _on_probe(self, rec: int, eid: int) -> None:
+        """Pass what may be one probe of a port scan to the scan watcher."""
+        n = ctypes.c_uint16.from_address(rec + OFF_USER_LEN).value
+        data = ctypes.string_at(ctypes.c_void_p.from_address(rec + OFF_USER_DATA).value, n)
+        if eid in (15, 31):
+            # Kernel-Network accept: same layout as the data events above
+            alen = 4 if eid == 15 else 16
+            if n < 12 + 2 * alen:
+                return
+            remote = netwatch._ip(data[8:8 + alen], netwatch.AF_INET if alen == 4 else netwatch.AF_INET6)
+            dport, sport = struct.unpack_from(">HH", data, 8 + 2 * alen)
+            if self.probe_log:
+                self.probe_log(eid, 6, "", sport, remote, dport, 0)
+            if not netwatch.ignorable(remote):
+                self.scans.probe(remote, sport, TCP, "open", dport)
+            return
+        if ctypes.c_uint32.from_address(rec + OFF_PROVIDER).value != TCPIP_DATA1:
+            return
+        # 1214: proto, family, local len, local sockaddr, remote len, remote sockaddr, reason, count
+        proto, _family, llen = struct.unpack_from("<III", data, 0)
+        lo = 12
+        local, lport = _sockaddr(data, lo, llen)
+        rlen, = struct.unpack_from("<I", data, lo + llen)
+        ro = lo + llen + 4
+        remote, rport = _sockaddr(data, ro, rlen)
+        reason, = struct.unpack_from("<I", data, ro + rlen)
+        if self.probe_log:
+            self.probe_log(eid, proto, local, lport, remote, rport, reason)
+        if proto not in (6, 17) or netwatch.ignorable(remote, local):
+            return
+        self.scans.probe(remote, lport, TCP if proto == 6 else UDP, "closed", rport, (eid, reason))
 
     def stop(self) -> None:
         self._stopping = True
@@ -657,7 +758,8 @@ class TickRate:
             self.wake.set()
 
 
-def run_ticker(acc: Accumulator, hub: Hub, names, stop: threading.Event, rate: TickRate) -> None:
+def run_ticker(acc: Accumulator, hub: Hub, names, stop: threading.Event, rate: TickRate,
+               seen: netwatch.PortSeen | None = None) -> None:
     last = time.perf_counter()
     next_t = last + rate.seconds
     report_t, report = last, [0, 0, 0, 0.0]
@@ -671,6 +773,8 @@ def run_ticker(acc: Accumulator, hub: Hub, names, stop: threading.Event, rate: T
         dt, last = now - last, now
         next_t = max(next_t + rate.seconds, now)
         ports, own, (b_in, b_out, own_in, own_out, events) = acc.drain()
+        if seen is not None:
+            seen.note(ports, time.monotonic())
         rows = [[p, e[0], e[1], e[2], e[3], names(e[4])] for p, e in ports.items()]
         own_rows = [[p, e[0], e[1], e[2], e[3]] for p, e in own.items()]
         hub.publish(json.dumps({"dt": round(dt, 4), "t": rate.seconds, "in": b_in, "out": b_out,
@@ -700,6 +804,7 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/memory.js": ("memory.js", "text/javascript; charset=utf-8"),
           "/perf.js": ("perf.js", "text/javascript; charset=utf-8"),
+          "/watch.js": ("watch.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
 
@@ -718,8 +823,13 @@ class CountingWriter:
         return getattr(self._raw, name)
 
 
-def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None, perf=None):
-    """on_write(bytes, client_port) is called for everything sent, when no capture sees it."""
+def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None, perf=None,
+                 details=None, scans=None):
+    """on_write(bytes, client_port) is called for everything sent, when no capture sees it.
+
+    details(port) describes the processes on a port (GET /api/port?p=N); scans
+    lists the port scans seen recently (GET /api/scans).
+    """
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     allowed_origins = {f"http://{h}" for h in allowed_hosts}
 
@@ -749,6 +859,25 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
             path = self.path.split("?", 1)[0]
             if path == "/events":
                 self._events()
+            elif path == "/api/port" and details is not None:
+                try:
+                    p = int(parse_qs(urlsplit(self.path).query).get("p", ["0"])[0])
+                    if not 1 <= p <= 65535:
+                        raise ValueError(p)
+                except ValueError:
+                    self.send_error(400)
+                    return
+                try:
+                    body = json.dumps(details(p), separators=(",", ":")).encode()
+                except Exception:
+                    traceback.print_exc()
+                    self.send_error(500)
+                    return
+                self._send(200, "application/json", body)
+            elif path == "/api/scans" and scans is not None:
+                body = json.dumps({"scans": scans.views(), "now": round(time.time(), 1)},
+                                  separators=(",", ":")).encode()
+                self._send(200, "application/json", body)
             elif path == "/api/info":
                 body = json.dumps({**info, "tick": rate.seconds}).encode()
                 self._send(200, "application/json", body)
@@ -908,7 +1037,7 @@ def relaunch_elevated(args) -> int:
     dest = os.path.join(os.environ.get("LOCALAPPDATA") or HERE, "PortTrafficViz")
     os.makedirs(dest, exist_ok=True)
     shutil.copy2(os.path.abspath(__file__), os.path.join(dest, "server.py"))
-    for module in ("sysmon.py", "perfmon.py"):
+    for module in ("sysmon.py", "perfmon.py", "netwatch.py"):
         shutil.copy2(os.path.join(HERE, module), os.path.join(dest, module))
     shutil.copytree(WEB_DIR, os.path.join(dest, "web"), dirs_exist_ok=True)
 
@@ -960,13 +1089,23 @@ class Server:
         self.acc = Accumulator()
         self.hub = Hub()
         self.rate = TickRate()
+        # Which processes use each port (for the pinned-port bubbles), and port scans
+        self.seen = netwatch.PortSeen()
+        self.scans = netwatch.ScanWatch(self.hub, live=mode != "demo")
+        self.demo_scans = None
         if mode == "demo":
             self.source = Demo(self.acc)
+            self.details = netwatch.DemoDetails(self.source, self.seen)
+            self.demo_scans = netwatch.DemoScans(self.scans)
             on_write = self._count_own_stream  # nothing captures the real stream in demo mode
         else:
-            self.source = EtwCapture(self.acc, own_port=self.port, owner_pid=owner_pid)
+            self.source = EtwCapture(self.acc, own_port=self.port, owner_pid=owner_pid, scans=self.scans)
+            self.details = netwatch.PortDetails(self.seen)
             on_write = None
         self.source.start()
+        self.scans.start()
+        if self.demo_scans:
+            self.demo_scans.start()
         self.done = threading.Event()
         # CPU, disk & network tab (CPU Graph's sampler), at its own rate
         self.perf = perfmon.PerfMonitor(self.hub, mode)
@@ -975,15 +1114,19 @@ class Server:
                     "services": load_services()}
             self.httpd = ThreadingHTTPServer(
                 ("127.0.0.1", self.port),
-                make_handler(self.hub, info, self.port, self.rate, on_write, self.perf))
+                make_handler(self.hub, info, self.port, self.rate, on_write, self.perf,
+                             self.details, self.scans))
         except BaseException:
             self.source.stop()
+            self.scans.stop()
+            if self.demo_scans:
+                self.demo_scans.stop()
             raise
         self.perf.start()
         self.httpd.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.port}/"
         threading.Thread(target=run_ticker,
-                         args=(self.acc, self.hub, self.source.names, self.done, self.rate),
+                         args=(self.acc, self.hub, self.source.names, self.done, self.rate, self.seen),
                          name="ticker", daemon=True).start()
         # Memory, GPU and CPU for the Memory & GPU tab, once a second
         self.sysmon = sysmon.SystemMonitor(self.hub, mode, ProcessNames().get)
@@ -1000,6 +1143,9 @@ class Server:
             self.done.set()
             self.rate.wake.set()
             self.source.stop()
+            self.scans.stop()
+            if self.demo_scans:
+                self.demo_scans.stop()
             self.sysmon.stop()
             self.perf.stop()
 

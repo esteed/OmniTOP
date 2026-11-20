@@ -73,15 +73,20 @@
         <span class="item">Traffic per port, log scale
           <span class="muted">100 b/s</span><span id="swatches" class="swatches"></span><span id="scale-max" class="muted">1 Gb/s</span>
         </span>
+        <span class="item">Ports 1–1024 <span id="swatches-low" class="swatches"></span></span>
         <span class="item"><span class="sw own"></span><span id="own-text">This app's own traffic</span></span>
+        <span class="item"><span class="sw jump"></span>Traffic jump</span>
+        <span class="item"><span class="sw probe"></span>Probed by a port scan</span>
         <span class="item muted">Scroll to zoom · drag to move · hover for details</span>
       </div>
     </div>
     <aside>
       <h2>Busiest ports</h2>
-      <p class="hint">Click a port to pin it to the top and highlight it. Click again to unpin.</p>
+      <p class="hint">Click a port to pin it to the top and highlight it. Click again to unpin. Rest the pointer on a pinned port for 2 seconds to see the processes using it.</p>
       <ol id="top"><li class="empty">Waiting for traffic…</li></ol>
     </aside>
+    <div id="bubbles" class="bubbles"></div>
+    <div id="bubble-note" class="bubble-note" role="status" hidden></div>
   </main>
 </section>
 
@@ -178,8 +183,10 @@
     </div>
   </main>
 </section>
+<div id="alerts" class="alerts" aria-live="assertive"></div>
 <script src="/app.js"></script>
 <script src="/memory.js"></script>
 <script src="/perf.js"></script>
+<script src="/watch.js"></script>
 </body>
 </html>

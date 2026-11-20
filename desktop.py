@@ -180,7 +180,7 @@ def helper_command(port: int) -> tuple[str, str]:
     if FROZEN:
         return local_copy(sys.executable, os.path.join(APP_DIR, os.path.basename(sys.executable))), args
     here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("desktop.py", "server.py", "sysmon.py", "perfmon.py"):
+    for name in ("desktop.py", "server.py", "sysmon.py", "perfmon.py", "netwatch.py"):
         local_copy(os.path.join(here, name), os.path.join(APP_DIR, name))
     shutil.copytree(server.WEB_DIR, os.path.join(APP_DIR, "web"), dirs_exist_ok=True)
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")

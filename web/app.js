@@ -18,6 +18,13 @@ const RATES = [20, 10, 5, 2, 1];      // samples a second the server can be set 
 const MAX_ZOOM = 16;
 const LEGEND_H = 34;                  // room left under the scene for the legend
 const OWN = [255, 255, 255];          // this app's own traffic is drawn white
+const PROBE_LIGHT = 1;                // seconds a scanned port's square stays lit
+// A port, or the ports of one process, whose traffic jumps well above its own
+// usual level and stands out against everything else flashes until 3 s after
+// it settles. Usual levels are averages over about 30 s; while a jump lasts
+// they follow ten times slower, so a jump that keeps going becomes the new
+// usual level after a minute or two.
+const JUMP = { tau: 30, tauHot: 300, ratio: 4, clear: 2.5, floor: 2e6, share: 0.25, hold: 3, warm: 15 };
 
 let tick = 0.05;                      // seconds between samples (the server says)
 let windowTicks = 10, statsEvery = 5, listEvery = 20;
@@ -27,6 +34,7 @@ let rateRestored = false;
 const state = {
   side: 'both', proto: 'all', max: 1e9, paused: false, hideOwn: false,
   mode: null, connected: false, services: {}, hover: null, pins: [], mouse: null,
+  focus: null,                        // port whose details bubble the pointer is on
 };
 // port -> { c, hist, proc, rate, base, own, target, btarget, h, hb }
 // base is traffic this app didn't cause, own is traffic it did, and rate is
@@ -40,6 +48,11 @@ const $ = id => document.getElementById(id);
 const stage = $('stage'), cv = $('cv'), ctx = cv.getContext('2d'), tip = $('tip');
 const sysListeners = [];              // memory.js: called with each memory/GPU sample
 const perfListeners = { perf: [], perfmeta: [] };   // perf.js
+const listListeners = [];             // watch.js: called after the busiest-ports list redraws
+const scanListeners = [];             // watch.js: called with each port scan update
+const probeLit = new Map();           // port -> when (s, page clock) its scan-probe light goes out
+const procJump = new Map();           // process name -> { avg, hot, seen } for traffic jumps
+let jumpClock = 0, jumpWarm = JUMP.warm, totalAvg = 0;
 let activeTab = 'net';
 
 // Settings that survive a restart. Storage can be off; then they just don't.
@@ -62,14 +75,22 @@ function readTheme() {
     // Light traffic blue, heavy traffic red, through violet (OKLCH: lightness, chroma, hue)
     stops: [[0.58, 0.17, 258], [0.56, 0.19, 285], [0.58, 0.22, 332], [0.62, 0.23, 374], [0.64, 0.23, 388]],
     shadeL: 0.22, shadeR: 0.38, lead: 'rgba(255,255,255,0.35)',
+    // Ports 1–1024: amber for light traffic, red for heavy
+    stopsLow: [[0.74, 0.15, 78], [0.70, 0.17, 62], [0.66, 0.19, 46], [0.63, 0.22, 34], [0.64, 0.23, 28]],
+    flash: [79, 216, 255], probe: [255, 92, 92],
   } : {
     floor: '#F1EFE8', gap: '#D9D7CE', check: 'rgba(0,0,0,0.035)', dyn: '#E3E1D8',
     grid: 'rgba(0,0,0,0.07)', sideL: '#D3D1C7', sideR: '#B4B2A9',
     stops: [[0.62, 0.17, 258], [0.56, 0.19, 285], [0.56, 0.22, 332], [0.57, 0.23, 374], [0.56, 0.23, 388]],
     shadeL: 0.16, shadeR: 0.3, lead: 'rgba(0,0,0,0.35)',
+    stopsLow: [[0.70, 0.15, 75], [0.66, 0.17, 60], [0.62, 0.19, 45], [0.58, 0.22, 34], [0.56, 0.23, 28]],
+    flash: [0, 132, 199], probe: [214, 40, 40],
   });
   T.lut = makeRamp(T.stops);
-  $('swatches').innerHTML = [0.1, 0.3, 0.5, 0.7, 0.9].map(t => `<span style="background:${rgb(ramp(t))}"></span>`).join('');
+  T.lutLow = makeRamp(T.stopsLow);
+  const sw = f => [0.1, 0.3, 0.5, 0.7, 0.9].map(t => `<span style="background:${rgb(f(t))}"></span>`).join('');
+  $('swatches').innerHTML = sw(ramp);
+  $('swatches-low').innerHTML = sw(rampLow);
 }
 
 // OKLCH -> sRGB 0-255, lowering chroma until the color fits in sRGB.
@@ -102,6 +123,9 @@ function makeRamp(stops) {
   return lut;
 }
 const ramp = t => T.lut[Math.max(0, Math.min(255, Math.round(t * 255)))];
+const rampLow = t => T.lutLow[Math.max(0, Math.min(255, Math.round(t * 255)))];
+const rampFor = p => p <= 1024 ? rampLow : ramp;
+const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${Math.max(0, Math.min(1, a)).toFixed(3)})`;
 const rgb = (c, k = 0) => `rgb(${Math.round(c[0] * (1 - k))},${Math.round(c[1] * (1 - k))},${Math.round(c[2] * (1 - k))})`;
 
 // ---------------------------------------------------------------------------
@@ -132,6 +156,11 @@ function pick(v) {
   return (tcp && local ? v[0] : 0) + (tcp && remote ? v[1] : 0) + (udp && local ? v[2] : 0) + (udp && remote ? v[3] : 0);
 }
 
+// Bytes where the port was this machine's end: what the process using it moved.
+function pickLocal(v) {
+  return (state.proto !== 'udp' ? v[0] : 0) + (state.proto !== 'tcp' ? v[2] : 0);
+}
+
 function norm(rate) {
   if (rate <= 0) return 0;
   const t = Math.log10(rate / MIN_RATE) / Math.log10(state.max / MIN_RATE);
@@ -159,17 +188,19 @@ function recompute() {
   const span = windowSpan();
   for (const [p, e] of ports) {
     while (e.hist.length && e.hist[0].n <= tickNo - windowTicks) e.hist.shift();
-    let base = 0, own = 0;
+    let base = 0, own = 0, loc = 0;
     for (const s of e.hist) {
       base += pick(s.v);
+      loc += pickLocal(s.v);
       if (s.o) own += pick(s.o);
     }
     e.base = base * 8 / span;
+    e.loc = loc * 8 / span;
     e.own = own * 8 / span;
     e.rate = e.base + (state.hideOwn ? 0 : e.own);
     e.target = norm(e.rate) * MAXH;
     e.btarget = norm(e.base) * MAXH;
-    if (!e.hist.length && e.h < 0.3 && !pinned(p)) ports.delete(p);
+    if (!e.hist.length && e.h < 0.3 && !pinned(p) && !flashing(e)) ports.delete(p);
   }
 }
 
@@ -177,7 +208,8 @@ function entry(p) {
   if (p < 1 || p > 65535) return null;
   let e = ports.get(p);
   if (!e) {
-    e = { c: cellOf(p), hist: [], proc: '', rate: 0, base: 0, own: 0, target: 0, btarget: 0, h: 0, hb: 0 };
+    e = { c: cellOf(p), hist: [], proc: '', rate: 0, base: 0, own: 0, loc: 0, target: 0, btarget: 0, h: 0, hb: 0,
+          avg: 0, hot: false, flashUntil: 0 };
     ports.set(p, e);
   }
   return e;
@@ -216,6 +248,7 @@ function onTick(m) {
     else e.hist.push({ n: tickNo, v: [0, 0, 0, 0], o: [tl, tr, ul, ur] });
   }
   recompute();
+  detectJumps(m.dt);
   // Bars follow every sample; text redraws less often so it stays readable.
   if (--statsIn <= 0) {
     statsIn = statsEvery;
@@ -226,6 +259,78 @@ function onTick(m) {
     listIn = listEvery;
     renderTop();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Traffic jumps and scan probes
+// ---------------------------------------------------------------------------
+const flashing = e => e.flashUntil > jumpClock;
+
+// Each sample: compare every port, and every process's ports together, with
+// their usual level. Ports and processes seen for the first time have no
+// usual level yet, so a big new flow counts as a jump. This app's own traffic
+// never does. The first seconds after starting, or after a filter changes,
+// only learn the levels.
+function detectJumps(dt) {
+  if (!(dt > 0)) return;
+  jumpClock += dt;
+  const warm = jumpWarm > 0;
+  if (warm) jumpWarm -= dt;
+  const fast = 1 - Math.exp(-dt / (warm ? 1 : JUMP.tau));
+  const slow = 1 - Math.exp(-dt / JUMP.tauHot);
+  let total = 0;
+  const groups = new Map();
+  for (const e of ports.values()) {
+    total += e.base;
+    if (e.proc && e.loc > 0) {
+      let g = groups.get(e.proc);
+      if (!g) groups.set(e.proc, g = { sum: 0, members: [] });
+      g.sum += e.loc;
+      g.members.push(e);
+    }
+  }
+  // While something is jumping, the level of everything else follows slowly too,
+  // so the jump itself doesn't raise the bar for others straight away.
+  let anyHot = false;
+  for (const e of ports.values()) if (e.hot) { anyHot = true; break; }
+  for (const o of procJump.values()) if (o.hot) { anyHot = true; break; }
+  totalAvg += (total - totalAvg) * (anyHot ? slow : fast);
+  const thr = Math.max(JUMP.floor, JUMP.share * totalAvg);   // big next to everything else
+  const judge = (o, r) => {
+    if (!warm) {
+      const d = r - o.avg;
+      o.hot = o.hot ? !(r < JUMP.clear * o.avg || d < 0.6 * thr) : r >= JUMP.ratio * o.avg && d >= thr;
+    }
+    o.avg += (r - o.avg) * (o.hot ? slow : fast);
+    return o.hot;
+  };
+  for (const e of ports.values()) {
+    if (judge(e, e.base)) e.flashUntil = jumpClock + JUMP.hold;
+  }
+  for (const [name, g] of groups) {
+    let o = procJump.get(name);
+    if (!o) procJump.set(name, o = { avg: 0, hot: false, seen: 0 });
+    o.seen = jumpClock;
+    if (judge(o, g.sum)) {
+      // Of the process's ports, the ones that rose too (at least double their
+      // usual level): its steady connections aren't part of the jump.
+      for (const e of g.members) if (e.loc >= 0.05 * g.sum && e.base >= 2 * e.avg) e.flashUntil = jumpClock + JUMP.hold;
+    }
+  }
+  for (const [name, o] of procJump) if (jumpClock - o.seen > 120) procJump.delete(name);
+}
+
+// Filters change every rate at once, which isn't a jump: learn the new levels.
+function resetJumps() {
+  jumpWarm = 5;
+  for (const e of ports.values()) { e.hot = false; e.flashUntil = 0; }
+  procJump.clear();
+}
+
+// A scanning address probed these ports: light their squares for a second.
+function onProbe(m) {
+  const until = performance.now() / 1000 + PROBE_LIGHT;
+  for (const p of m.h || []) if (p >= 1 && p <= 65535) probeLit.set(p, until);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +369,7 @@ function box(g, x, y, s, h, col, z0 = 0) {
 // Other traffic in color at the bottom, this app's own stacked on top in white.
 function drawBar(g, e) {
   const c = e.c, hb = Math.min(e.hb, e.h);
-  if (hb > 0.3) box(g, c.x, c.y, c.s, hb, ramp(hb / MAXH));
+  if (hb > 0.3) box(g, c.x, c.y, c.s, hb, (c.low ? rampLow : ramp)(hb / MAXH));
   if (e.h - hb > 0.3) box(g, c.x, c.y, c.s, e.h, OWN, hb > 0.3 ? hb : 0);
 }
 
@@ -334,6 +439,19 @@ function ephemeralNote(g) {
   g.restore();
 }
 
+// Grid titles run along an edge of each floor, like the ephemeral note: the
+// big field's along its back-left edge (outside the row numbers), reading up
+// toward port 1025, and the small block's along its front-right edge.
+function edgeTitle(g, x, y, str, dy) {
+  const size = 13 * Math.min(1, K);
+  const [sx, sy] = proj(x, y);
+  g.save();
+  g.translate(sx, sy);
+  g.rotate(-Math.atan2(S, C));   // the world y axis, going toward smaller y, runs 30° above horizontal
+  text(g, str, 0, dy(size), size, T.ink, 'left', 600);
+  g.restore();
+}
+
 // Floors are static, so they're drawn into two layers whenever the view
 // changes: the big field (behind everything) and the small block (in front of
 // the big field's bars).
@@ -355,7 +473,7 @@ function buildLayers() {
     const [a, b] = proj(0, dyn ? 376 : r * 2 + 1);
     text(g, dyn ? '49152' : String(1025 + 256 * r), a - 8 / K, b, 11, dyn ? T.ink2 : T.muted, 'right', dyn ? 600 : 400);
   }
-  text(g, 'Ports 1025–65535', 24, 34, 13, T.ink, 'left', 600);
+  edgeTitle(g, 0, HI_ROWS * 2 - 40, 'Ports 1025–65535', size => -(38 / K + size * 0.6 / K));
   ephemeralNote(g);
 
   [layerSmall, g] = makeLayer();
@@ -368,7 +486,7 @@ function buildLayers() {
   text(g, '1', a - 8 / K, b, 11, T.muted, 'right');
   [a, b] = proj(BX + 160, BY + 160);
   text(g, '1024', a, b + 5 + 12 / K, 11, T.muted, 'center');
-  text(g, 'Ports 1–1024', OX + 190, OY + 618, 13, T.ink, 'left', 600);
+  edgeTitle(g, BX + 160, BY + 160 - 24, 'Ports 1–1024', size => 5 / C + size * 0.85 / K);
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +574,7 @@ cv.addEventListener('wheel', ev => {
 // Frame
 // ---------------------------------------------------------------------------
 function label(g, p, e, x, y, align) {
-  const head = `${p} ${svcName(p)}`.trim(), tail = `  ${fmtRate(e.rate)}`;
+  const head = `${p} ${svcName(p)}`.trim(), tail = `  ${flashing(e) ? '↑ ' : ''}${fmtRate(e.rate)}`;
   font(g, 12, 600);
   const w1 = g.measureText(head).width;
   font(g, 12);
@@ -469,6 +587,9 @@ function label(g, p, e, x, y, align) {
 
 function drawLabels(g, bars) {
   const chosen = bars.filter(b => b.e.h > 6).sort((a, b) => b.e.rate - a.e.rate).slice(0, 3);
+  for (const b of bars.filter(b => flashing(b.e)).sort((a, b) => b.e.rate - a.e.rate).slice(0, 3)) {
+    if (!chosen.some(c => c.p === b.p)) chosen.push(b);
+  }
   for (const p of state.pins) {
     const e = ports.get(p);
     if (e && !chosen.some(b => b.p === p)) chosen.push({ p, e });
@@ -478,7 +599,7 @@ function drawLabels(g, bars) {
     const c = b.e.c;
     const [tx, ty] = proj(c.x + c.s / 2, c.y + c.s / 2, b.e.h);
     font(g, 12, 600);
-    const w = g.measureText(`${b.p} ${svcName(b.p)}  ${fmtRate(b.e.rate)}`).width + 8 / K;
+    const w = g.measureText(`${b.p} ${svcName(b.p)}  ${flashing(b.e) ? '↑ ' : ''}${fmtRate(b.e.rate)}`).width + 8 / K;
     const x0 = tx - w / 2;
     let y = ty - 12 / K;
     while (placed.some(r => x0 < r[0] + r[2] && x0 + w > r[0] && y - hh / 2 < r[1] + r[3] && y + hh / 2 > r[1])) y -= hh;
@@ -498,6 +619,46 @@ function drawHighlight(g, p, strong) {
   if (e && e.h > 0.5) outline(g, quad(c.x, c.y, c.s, c.s, e.h), T.hl, w);
 }
 
+// Ports in a traffic jump: a pulsing patch of floor around each group of
+// nearby ones, under their bars.
+function drawFlashes(g, low, pulse) {
+  const near = low ? 15 : 14, clusters = [];
+  for (const e of ports.values()) {
+    if (e.c.low !== low || !flashing(e)) continue;
+    const c = e.c;
+    let k = clusters.find(k => c.x < k.x1 + near && c.x + c.s > k.x0 - near && c.y < k.y1 + near && c.y + c.s > k.y0 - near);
+    if (!k) clusters.push(k = { x0: c.x, y0: c.y, x1: c.x + c.s, y1: c.y + c.s });
+    k.x0 = Math.min(k.x0, c.x); k.y0 = Math.min(k.y0, c.y);
+    k.x1 = Math.max(k.x1, c.x + c.s); k.y1 = Math.max(k.y1, c.y + c.s);
+  }
+  if (!clusters.length) return;
+  const pad = Math.max(low ? 4 : 5, 7 / K);
+  const [gx0, gy0, gx1, gy1] = low ? [BX, BY, BX + 160, BY + 160] : [0, 0, HI_COLS * 2, HI_ROWS * 2];
+  for (const k of clusters) {
+    const x0 = Math.max(gx0, k.x0 - pad), y0 = Math.max(gy0, k.y0 - pad);
+    const x1 = Math.min(gx1, k.x1 + pad), y1 = Math.min(gy1, k.y1 + pad);
+    const q = quad(x0, y0, x1 - x0, y1 - y0);
+    poly(g, q, rgba(T.flash, 0.10 + 0.28 * pulse));
+    outline(g, q, rgba(T.flash, 0.45 + 0.55 * pulse), 2);
+  }
+}
+
+// Ports a scanning address just probed: their squares lit for a second,
+// fading at the end. A 2 px square is tiny, so the big field's get a ring too.
+function drawProbes(g, low, now) {
+  for (const [p, until] of probeLit) {
+    if (until <= now) { probeLit.delete(p); continue; }
+    const c = cellOf(p);
+    if (c.low !== low) continue;
+    const a = Math.min(1, (until - now) / 0.35);
+    poly(g, quad(c.x, c.y, c.s, c.s), rgba(T.probe, 0.95 * a));
+    if (!low) {
+      const r = Math.max(1.5, 3 / K);
+      outline(g, quad(c.x - r, c.y - r, c.s + 2 * r, c.s + 2 * r), rgba(T.probe, 0.75 * a), 1.5);
+    }
+  }
+}
+
 function draw() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, cv.width, cv.height);
@@ -505,16 +666,26 @@ function draw() {
   const bars = [];
   for (const [p, e] of ports) if (e.h > 0.3) bars.push({ p, e, d: e.c.x + e.c.y });
   bars.sort((a, b) => a.d - b.d);   // back to front
+  const now = performance.now() / 1000;
+  const pulse = 0.5 + 0.5 * Math.sin(now * Math.PI * 3);   // 1.5 flashes a second
 
   ctx.drawImage(layerBig, 0, 0);
   setScene(ctx);
+  drawFlashes(ctx, false, pulse);
+  drawProbes(ctx, false, now);
   for (const b of bars) if (!b.e.c.low) drawBar(ctx, b.e);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.drawImage(layerSmall, 0, 0);
   setScene(ctx);
+  drawFlashes(ctx, true, pulse);
+  drawProbes(ctx, true, now);
   for (const b of bars) if (b.e.c.low) drawBar(ctx, b.e);
 
+  for (const b of bars) {   // the tops of bars in a jump pulse too, for tall bars hiding the floor
+    if (flashing(b.e)) { const c = b.e.c; outline(ctx, quad(c.x, c.y, c.s, c.s, b.e.h), rgba(T.flash, 0.4 + 0.6 * pulse), 2); }
+  }
   for (const p of state.pins) drawHighlight(ctx, p, true);
+  if (state.focus != null && !pinned(state.focus)) drawHighlight(ctx, state.focus, true);
   if (state.hover != null && !pinned(state.hover)) drawHighlight(ctx, state.hover, false);
   drawLabels(ctx, bars);
 }
@@ -645,11 +816,12 @@ function listRow(p, e) {
   const t = norm(rate), tb = e && e.base > 0 ? Math.min(t, norm(e.base)) : 0;
   const who = e && e.proc ? e.proc : e && e.base <= 0 && e.own > 0 ? 'this app' : '';
   const ownBar = t - tb > 0.001 ? `<i class="own" style="width:${((t - tb) * 100).toFixed(1)}%"></i>` : '';
-  return `<li data-port="${p}" class="${pinned(p) ? 'pin' : ''}">` +
+  const cls = [pinned(p) ? 'pin' : '', e && flashing(e) ? 'jump' : ''].join(' ').trim();
+  return `<li data-port="${p}" class="${cls}">` +
     `<span class="p">${p}</span>` +
     `<span class="n">${esc(svcName(p) || '—')}${who ? `<small>${esc(who)}</small>` : ''}</span>` +
     `<span class="r">${rate > 0 ? fmtRate(rate) : 'idle'}</span>` +
-    `<span class="m"><i style="width:${(tb * 100).toFixed(1)}%;background:${rgb(ramp(tb))}"></i>${ownBar}</span></li>`;
+    `<span class="m"><i style="width:${(tb * 100).toFixed(1)}%;background:${rgb(rampFor(p)(tb))}"></i>${ownBar}</span></li>`;
 }
 
 // Pinned ports first, in the order they were pinned, then the busiest others.
@@ -659,6 +831,7 @@ function renderTop() {
   const rows = state.pins.map(p => listRow(p, ports.get(p))).concat(rest.map(([p, e]) => listRow(p, e)));
   $('top').innerHTML = rows.length ? rows.join('')
     : `<li class="empty">${state.connected ? 'No traffic yet' : 'Waiting for the server…'}</li>`;
+  for (const f of listListeners) f();
 }
 
 function togglePin(p) {
@@ -692,6 +865,7 @@ function segmented(id, key) {
     state[key] = b.dataset.v;
     for (const x of el.querySelectorAll('button')) x.classList.toggle('on', x === b);
     refresh();
+    resetJumps();
   });
 }
 segmented('ctl-side', 'side');
@@ -731,6 +905,7 @@ $('ctl-own').addEventListener('change', ev => {
   savePref('hideOwn', state.hideOwn);
   renderOwn();
   refresh();
+  resetJumps();
 });
 
 $('ctl-zoom').addEventListener('click', resetView);
@@ -814,6 +989,11 @@ function connect() {
     renderStatus();
   };
   es.onmessage = ev => onTick(JSON.parse(ev.data));
+  es.addEventListener('probe', ev => onProbe(JSON.parse(ev.data)));
+  es.addEventListener('scan', ev => {
+    const m = JSON.parse(ev.data);
+    for (const f of scanListeners) f(m);
+  });
   es.addEventListener('sys', ev => {
     const m = JSON.parse(ev.data);
     for (const f of sysListeners) f(m);
