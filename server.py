@@ -31,6 +31,7 @@ from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import urlopen
 
+import perfmon
 import sysmon
 
 # In the packaged exe the web files are unpacked next to the bundled modules.
@@ -611,7 +612,7 @@ class Hub:
         self.last_change = time.monotonic()  # when a viewer last connected or left
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=40)  # 2 s of ticks at the fastest rate
+        q: queue.Queue = queue.Queue(maxsize=160)  # ~3 s of port ticks and CPU samples at the fastest rates
         with self._lock:
             self._subs.add(q)
             self.last_change = time.monotonic()
@@ -698,6 +699,7 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/index.html": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/memory.js": ("memory.js", "text/javascript; charset=utf-8"),
+          "/perf.js": ("perf.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
 
@@ -716,7 +718,7 @@ class CountingWriter:
         return getattr(self._raw, name)
 
 
-def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None):
+def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None, perf=None):
     """on_write(bytes, client_port) is called for everything sent, when no capture sees it."""
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     allowed_origins = {f"http://{h}" for h in allowed_hosts}
@@ -765,9 +767,12 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None)
             # Requiring a JSON body and our own Origin keeps other web pages
             # from changing it: they can't send JSON here without a CORS
             # preflight, which this server doesn't answer.
+            # POST /api/perf {"interval": 250} or {"source": "utility"} does the
+            # same for the CPU, disk & network tab.
             if not self._ours():
                 return
-            if self.path.split("?", 1)[0] != "/api/rate":
+            path = self.path.split("?", 1)[0]
+            if path not in ("/api/rate", "/api/perf") or (path == "/api/perf" and perf is None):
                 self.send_error(404)
                 return
             origin = self.headers.get("Origin")
@@ -779,11 +784,20 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None)
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 256:
                     raise ValueError("bad length")
-                rate.set(int(json.loads(self.rfile.read(length))["hz"]))
+                body = json.loads(self.rfile.read(length))
+                if path == "/api/rate":
+                    rate.set(int(body["hz"]))
+                    reply = {"tick": rate.seconds}
+                else:
+                    if not isinstance(body, dict) or not ({"interval", "source"} & body.keys()):
+                        raise ValueError("nothing to set")
+                    perf.set(interval=int(body["interval"]) if "interval" in body else None,
+                             source=str(body["source"]) if "source" in body else None)
+                    reply = {"interval": perf.interval, "source": perf.source}
             except (ValueError, KeyError, TypeError):
                 self.send_error(400)
                 return
-            self._send(200, "application/json", json.dumps({"tick": rate.seconds}).encode())
+            self._send(200, "application/json", json.dumps(reply).encode())
 
         def _send(self, code: int, ctype: str, body: bytes) -> None:
             self.send_response(code)
@@ -894,7 +908,8 @@ def relaunch_elevated(args) -> int:
     dest = os.path.join(os.environ.get("LOCALAPPDATA") or HERE, "PortTrafficViz")
     os.makedirs(dest, exist_ok=True)
     shutil.copy2(os.path.abspath(__file__), os.path.join(dest, "server.py"))
-    shutil.copy2(os.path.join(HERE, "sysmon.py"), os.path.join(dest, "sysmon.py"))
+    for module in ("sysmon.py", "perfmon.py"):
+        shutil.copy2(os.path.join(HERE, module), os.path.join(dest, module))
     shutil.copytree(WEB_DIR, os.path.join(dest, "web"), dirs_exist_ok=True)
 
     shell32 = ctypes.WinDLL("shell32")
@@ -953,14 +968,18 @@ class Server:
             on_write = None
         self.source.start()
         self.done = threading.Event()
+        # CPU, disk & network tab (CPU Graph's sampler), at its own rate
+        self.perf = perfmon.PerfMonitor(self.hub, mode)
         try:
             info = {"mode": mode, "rates": list(RATES), "host": socket.gethostname(),
                     "services": load_services()}
             self.httpd = ThreadingHTTPServer(
-                ("127.0.0.1", self.port), make_handler(self.hub, info, self.port, self.rate, on_write))
+                ("127.0.0.1", self.port),
+                make_handler(self.hub, info, self.port, self.rate, on_write, self.perf))
         except BaseException:
             self.source.stop()
             raise
+        self.perf.start()
         self.httpd.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.port}/"
         threading.Thread(target=run_ticker,
@@ -982,6 +1001,7 @@ class Server:
             self.rate.wake.set()
             self.source.stop()
             self.sysmon.stop()
+            self.perf.stop()
 
     def run(self) -> None:
         """Serve until shutdown() is called from another thread (or Ctrl+C)."""

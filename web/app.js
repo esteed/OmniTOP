@@ -39,6 +39,7 @@ let tickNo = 0;
 const $ = id => document.getElementById(id);
 const stage = $('stage'), cv = $('cv'), ctx = cv.getContext('2d'), tip = $('tip');
 const sysListeners = [];              // memory.js: called with each memory/GPU sample
+const perfListeners = { perf: [], perfmeta: [] };   // perf.js
 let activeTab = 'net';
 
 // Settings that survive a restart. Storage can be off; then they just don't.
@@ -758,15 +759,14 @@ function renderStatus() {
 const tabButtons = [...document.querySelectorAll('.tab')];
 
 function showTab(name) {
-  activeTab = name === 'mem' ? 'mem' : 'net';
+  activeTab = ['net', 'mem', 'perf'].includes(name) ? name : 'net';
   for (const b of tabButtons) {
     const on = b.dataset.tab === activeTab;
     b.classList.toggle('on', on);
     b.setAttribute('aria-selected', String(on));
     b.tabIndex = on ? 0 : -1;
   }
-  $('tab-net').hidden = activeTab !== 'net';
-  $('tab-mem').hidden = activeTab !== 'mem';
+  for (const t of ['net', 'mem', 'perf']) $('tab-' + t).hidden = activeTab !== t;
   state.hover = null;
   tip.hidden = true;
   savePref('tab', activeTab);
@@ -818,6 +818,13 @@ function connect() {
     const m = JSON.parse(ev.data);
     for (const f of sysListeners) f(m);
   });
+  // perf.js: CPU, disk & network samples and the description of what's sampled
+  for (const kind of ['perf', 'perfmeta']) {
+    es.addEventListener(kind, ev => {
+      const m = JSON.parse(ev.data);
+      for (const f of perfListeners[kind]) f(m);
+    });
+  }
   es.onerror = () => { state.connected = false; renderStatus(); };
 }
 

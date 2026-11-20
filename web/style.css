@@ -16,6 +16,13 @@
   --c-3d: #c25e0a;
   --c-cpu: #0f858c;
   --c-commit: #7046c8;
+  /* CPU, disk & network tab: CPU Graph's series colors, darkened for a light page */
+  --p-line: #0a78bd;
+  --p-avg: #c26f00;
+  --p-rx: #0b8f66;
+  --p-tx: #d24b37;
+  --p-read: #7348cf;
+  --p-write: #c4357a;
   --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
 }
@@ -37,6 +44,12 @@
     --c-3d: #f2a65a;
     --c-cpu: #5cc8d0;
     --c-commit: #b996ff;
+    --p-line: #4cc2ff;
+    --p-avg: #ffb547;
+    --p-rx: #48d8a8;
+    --p-tx: #ff806e;
+    --p-read: #ba94ff;
+    --p-write: #ff79b0;
   }
 }
 
@@ -145,6 +158,11 @@ select {
 main { display: flex; min-height: 0; }
 .stage { position: relative; flex: 1; min-width: 0; overflow: hidden; }
 #cv, #mcv { display: block; position: absolute; inset: 0; }
+/* CPU, disk & network: the canvas grows with the rows, and the area scrolls if needed */
+#pstage { overflow-x: hidden; overflow-y: auto; }
+#pcv { display: block; position: absolute; left: 0; top: 0; }
+.perf-controls { margin-left: 0; }
+#pctl-top.on { background: var(--sel); font-weight: 600; }
 #cv, #mcv { cursor: grab; }
 #cv.dragging, #mcv.dragging { cursor: grabbing; }
 aside {

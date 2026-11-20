@@ -17,6 +17,7 @@ import ctypes
 import html
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -179,7 +180,7 @@ def helper_command(port: int) -> tuple[str, str]:
     if FROZEN:
         return local_copy(sys.executable, os.path.join(APP_DIR, os.path.basename(sys.executable))), args
     here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("desktop.py", "server.py", "sysmon.py"):
+    for name in ("desktop.py", "server.py", "sysmon.py", "perfmon.py"):
         local_copy(os.path.join(here, name), os.path.join(APP_DIR, name))
     shutil.copytree(server.WEB_DIR, os.path.join(APP_DIR, "web"), dirs_exist_ok=True)
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
@@ -281,6 +282,26 @@ button:first-child {{ font-weight: 600 }}
 BUTTONS = ('<div class="row"><button onclick="pywebview.api.try_live()">Try again</button>'
            '<button onclick="pywebview.api.show_demo()">Show simulated traffic</button></div>')
 
+# A starting settings.ini, in CPU Graph's format, for a PC that doesn't have one
+SETTINGS_TEMPLATE = """\
+# Read by CPU Graph and by Port traffic's CPU, disk & network tab.
+# Changes to adapters, drives and scales apply within a second.
+
+# Network adapters to graph, separated by ; - their connection names (or words from
+# their description) - or auto for the connected network cards, or none. Up to 6.
+networks=auto
+# Axis per adapter: scale.<adapter>=link (its link speed), auto (fit to the traffic),
+# or a fixed rate such as 100M, 2.5G or 125MB/s.
+
+# Drives to graph: letters such as C:,D:, or auto for every fixed drive, or none. Up to 6.
+disks=auto
+
+# Linux machines running cpugraph-agent, up to 6, separated by ; - host names or IP
+# addresses, each optionally with :port (default 7820). A [section] named like the
+# machine can choose its networks= and disks= (by their Linux names).
+remotes=
+"""
+
 
 class App:
     def __init__(self, demo: bool) -> None:
@@ -296,7 +317,7 @@ class App:
         self.window = webview.create_window(
             TITLE, html=self.page("Starting…"), width=1380, height=900, min_size=(760, 560),
             background_color="#1a1a19" if self.dark else "#fcfcfb")
-        self.window.expose(self.try_live, self.show_demo)
+        self.window.expose(self.try_live, self.show_demo, self.set_on_top, self.edit_perf_settings)
         self.window.events.shown += lambda: dark_title_bar(self.dark)
         # Not private mode, so the page's settings (sample rate, hiding own
         # traffic) are still there next time.
@@ -331,6 +352,46 @@ class App:
 
     def show_demo(self) -> None:
         threading.Thread(target=self.start_here, args=("demo",), daemon=True).start()
+
+    # The CPU, disk & network tab's T and E keys.
+    def set_on_top(self, on) -> None:
+        """Keep the window above others. Called from the page on a pywebview worker thread.
+
+        pywebview's own `window.on_top` sets the form's TopMost property straight from
+        this thread. That property call keeps Python's lock while Windows waits on the
+        window's thread, which needs the lock for pywebview's event handlers: a deadlock
+        that freezes the window. Invoke runs the change on the window's thread instead,
+        and releases the lock while it waits.
+        """
+        on = bool(on)
+        try:
+            from System import Func, Type
+            from webview.platforms.winforms import BrowserView
+            form = BrowserView.instances.get(self.window.uid)
+        except Exception:
+            form = None
+        if form is None:
+            return
+
+        def apply():
+            form.TopMost = on
+
+        if form.InvokeRequired:
+            form.Invoke(Func[Type](apply))
+        else:
+            apply()
+
+    def edit_perf_settings(self) -> None:
+        """Open CPU Graph's settings.ini (which that tab reads) in Notepad."""
+        path = server.perfmon.SETTINGS_PATH
+        try:
+            if not os.path.exists(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(SETTINGS_TEMPLATE)
+            subprocess.Popen(["notepad.exe", path])
+        except OSError:
+            pass
 
     def start_here(self, mode: str) -> None:
         with self.busy:

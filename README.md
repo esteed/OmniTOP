@@ -1,9 +1,10 @@
 # Port traffic
 
 A live isometric view of this Windows machine's network traffic, one bar per port,
-and of its memory and GPU, one bar per gigabyte. The two views are tabs along the
-top of the window: **Network ports** and **Memory & GPU**. The app remembers which
-tab you had open.
+and of its memory and GPU, one bar per gigabyte, plus real-time graphs of CPU,
+network and disk activity for this PC and Linux machines on your network. The views
+are tabs along the top of the window: **Network ports**, **Memory & GPU** and
+**CPU, disk & network**. The app remembers which tab you had open.
 
 ## Network ports
 
@@ -53,6 +54,61 @@ tab you had open.
   rights, which live mode already has. Without them, the grid shows how much
   memory is in use, filled in order.
 
+## CPU, disk & network
+
+This tab is [CPU Graph 2.0](https://github.com/esteed/CpuGraph) brought into the app.
+It has one row per machine: **This PC** first, then each Linux machine running
+`cpugraph-agent`. Each row has three columns:
+
+- **CPU threads**: one small graph per logical processor. The row title shows the
+  machine's name, thread count and total CPU use.
+- **Network adapters**: one strip per adapter. Green is received (↓) and coral is
+  sent (↑), in bits per second. The axis runs to the adapter's link speed, or fits
+  the traffic for adapters that don't report a speed.
+- **Disk devices**: one strip per disk. Violet is read (R) and pink is written (W),
+  in bytes per second, with how busy the disk was. The axis fits the larger of the
+  two, in 1-2-5 steps from 1 MB/s.
+
+All graphs share one time axis, sampled 20 times a second by default. Every number
+is a 3-second average; the lines show the samples. The amber line is the 3-second
+average. Hover a graph to read its value at that moment. At 20 samples/s the graphs
+show a third of the chosen time span, so individual samples stay distinguishable.
+
+The header has the same controls as CPU Graph, and so do its keys, which work while
+the tab is open:
+
+| Key | Action |
+|---|---|
+| Space | Pause / resume the graphs (sampling continues) |
+| Up / Down | Faster / slower sampling: 20, 10, 4, 2, 1 per second |
+| Left / Right | Shorter / longer time span |
+| R / N / D | Show / hide the Linux machines, the network column, the disk column |
+| M | This PC's total: CPU time ↔ Processor utility (matches Task Manager) |
+| C | A graph per CPU thread ↔ one graph of all threads per machine |
+| A | Show / hide the 3-second average line |
+| T | Always on top (desktop app) |
+| E | Open settings.ini in Notepad (desktop app) |
+
+**Choosing adapters, drives and Linux machines.** The tab reads CPU Graph's own
+settings file, `%LOCALAPPDATA%\CpuGraph\settings.ini`, so both apps show the same
+things. It never writes to that file, apart from creating a starting one if you press
+E on a PC that doesn't have one. The file's lines are explained in
+[CPU Graph's README](https://github.com/esteed/CpuGraph#settings-choosing-machines-adapters-and-disks):
+
+- `networks=`, `disks=` and `scale.<adapter>=` choose this PC's adapters, drives and
+  network scales.
+- `remotes=` lists Linux machines (up to six).
+- A machine's `[section]` picks its adapters and disks.
+
+Changes apply within a couple of seconds. Without the file, the tab shows the
+connected network cards, every fixed drive, and no Linux machines.
+
+**Linux machines** run `cpugraph-agent` from the CPU Graph repository; its README
+explains how to build and install it. Agents 2.0 and later send every CPU thread,
+the chosen adapters and the chosen disks. Older agents send only the total CPU, and
+their row says so. A machine that can't be reached says why across its row and
+reconnects by itself. The app connects to the agents only while its window is open.
+
 ## Run it
 
 Download `PortTraffic.exe` from the
@@ -76,7 +132,7 @@ Run `build.cmd`. It needs 64-bit Python 3.10 or later and, the first time, an
 internet connection: it sets up pywebview, PyInstaller and Pillow in
 `%LOCALAPPDATA%\PortTrafficViz\build` (outside Google Drive) and writes
 `dist\PortTraffic.exe`. Rebuild after editing anything in `web\`, `server.py`,
-`sysmon.py` or `desktop.py`.
+`sysmon.py`, `perfmon.py` or `desktop.py`.
 
 ## How it works
 
@@ -114,6 +170,16 @@ on the same stream.
   `GPU Process Memory`).
 - **CPU**: from `GetSystemTimes`.
 - **Committed memory**: total, limit and peak come from `GetPerformanceInfo`.
+
+`perfmon.py` is CPU Graph's sampler, ported to Python. It reads everything for This
+PC each tick, on its own clock, at the rate chosen in the CPU, disk & network tab.
+- **CPU threads**: all of them come from one `NtQuerySystemInformation` call.
+- **Network**: each adapter's counters and link speed come from one `GetIfEntry2` call.
+- **Disks**: from the `LogicalDisk` performance counters.
+
+Each Linux machine has its own thread, which connects to its agent, reads samples
+and reconnects every 5 s after a failure. Agent timestamps are mapped onto the app's
+clock using the fastest network trip seen so far, so all rows line up.
 
 The server only listens on 127.0.0.1 and refuses requests whose `Host` header
 isn't its own address.

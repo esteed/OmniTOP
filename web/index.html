@@ -16,6 +16,10 @@
     <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="1.2"/><path d="M6 1.5v2M10 1.5v2M6 12.5v2M10 12.5v2M1.5 6h2M1.5 10h2M12.5 6h2M12.5 10h2"/></svg>
     Memory &amp; GPU
   </button>
+  <button type="button" role="tab" id="tabbtn-perf" class="tab" data-tab="perf" aria-controls="tab-perf">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 9h3l2-5 3 9 2-4h3"/></svg>
+    CPU, disk &amp; network
+  </button>
   <span class="tabs-end"><span id="status" class="pill">Connecting…</span></span>
 </nav>
 
@@ -135,7 +139,47 @@
     </aside>
   </main>
 </section>
+<section id="tab-perf" class="page" role="tabpanel" aria-labelledby="tabbtn-perf" hidden>
+  <header class="bar">
+    <div class="controls perf-controls">
+      <label class="sel" title="Faster or slower sampling (Up / Down)">Samples
+        <select id="pctl-rate">
+          <option value="50" selected>20/s</option>
+          <option value="100">10/s</option>
+          <option value="250">4/s</option>
+          <option value="500">2/s</option>
+          <option value="1000">1/s</option>
+        </select>
+      </label>
+      <label class="sel" title="How much time the graphs show (Left / Right)">Show
+        <select id="pctl-span"></select>
+      </label>
+      <div class="seg" id="pctl-source" role="group" aria-label="How This PC's total CPU is measured (M)">
+        <button type="button" data-v="cputime" class="on" title="Busy time ÷ total time: the lowest-overhead measure">CPU time</button>
+        <button type="button" data-v="utility" title="The frequency-aware counter Task Manager shows">Processor utility</button>
+      </div>
+      <div class="seg" id="pctl-threads" role="group" aria-label="CPU graphs (C)">
+        <button type="button" data-v="1" class="on" title="One small graph per CPU thread">Each thread</button>
+        <button type="button" data-v="0" title="One graph per machine: the average of all its threads">All threads</button>
+      </div>
+      <label class="chk" title="The amber 3-second average line (A)"><input type="checkbox" id="pctl-avg" checked>Average</label>
+      <label class="chk" title="The Linux machines' rows (R)"><input type="checkbox" id="pctl-remotes" checked>Linux machines</label>
+      <label class="chk" title="The network adapters column (N)"><input type="checkbox" id="pctl-net" checked>Network</label>
+      <label class="chk" title="The disk devices column (D)"><input type="checkbox" id="pctl-disk" checked>Disks</label>
+      <button type="button" id="pctl-pause" title="Freeze the graphs; sampling carries on (Space)">Pause</button>
+      <button type="button" id="pctl-top" title="Keep this window above others (T)" hidden>Always on top</button>
+      <button type="button" id="pctl-edit" title="Choose adapters, drives and Linux machines in settings.ini (E)" hidden>Settings…</button>
+    </div>
+  </header>
+  <main>
+    <div id="pstage" class="stage">
+      <canvas id="pcv" role="img" aria-label="Line graphs of CPU use per thread, network throughput per adapter and disk activity per drive, for this PC and each Linux machine"></canvas>
+      <div id="ptip" class="tip" hidden></div>
+    </div>
+  </main>
+</section>
 <script src="/app.js"></script>
 <script src="/memory.js"></script>
+<script src="/perf.js"></script>
 </body>
 </html>
