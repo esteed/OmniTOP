@@ -200,38 +200,79 @@ class RamMap:
                 pfns.append(segs[seg_i][0] + pos - seg_start)
                 cell_of.append(g)
         self.cell_of = cell_of
-        n = len(pfns)
-        entries = array("Q", bytes(8 * 3 * n))
-        entries[1::3] = pfns
-        self._size = PFN_REQUEST_HEADER + PFN_ENTRY * n
-        self._template = struct.pack("<IIQ", 1, 1, n) + bytes(PFN_REQUEST_HEADER - 16) + entries.tobytes()
-        self._buf = ctypes.create_string_buffer(self._size)
-        self.sampled = n
+        self._pfns = pfns
+        self.sampled = len(pfns)
+        self._k = 0
+        self.set_parts(1)
 
-    def sample(self) -> list:
-        """Per GB: None where there's no RAM, else fractions of its RAM by state."""
-        ctypes.memmove(self._buf, self._template, self._size)
-        st, _ = self._query(SuperfetchPfnQuery, self._buf, self._size)
+    def set_parts(self, k: int) -> None:
+        """Read the sampled pages in k interleaved parts, one part per sample.
+
+        Every part covers every GB, so each sample updates the whole map from
+        1/k of its pages, and k samples (a second, at any rate) read them all:
+        sampling faster costs no more than once a second. The totals are kept
+        per part and swapped as each part is read again.
+        """
+        k = max(1, min(int(k), self.sampled // 256 or 1))
+        if k == self._k:
+            return
+        self._k = k
+        self._parts = []
+        for j in range(k):
+            pfns, cells = self._pfns[j::k], self.cell_of[j::k]
+            n = len(pfns)
+            entries = array("Q", bytes(8 * 3 * n))
+            entries[1::3] = pfns
+            size = PFN_REQUEST_HEADER + PFN_ENTRY * n
+            self._parts.append({
+                "cells": cells, "size": size, "buf": ctypes.create_string_buffer(size),
+                "template": struct.pack("<IIQ", 1, 1, n) + bytes(PFN_REQUEST_HEADER - 16) + entries.tobytes(),
+                "b": None, "u": None})
+        self._tb = [0] * (5 * self.cells)    # totals over all parts: page list per GB
+        self._tu = [0] * (16 * self.cells)   # and what in-use pages are used for
+        self._next = 0
+        self._full = False
+
+    def _read(self, part: dict) -> None:
+        ctypes.memmove(part["buf"], part["template"], part["size"])
+        st, _ = self._query(SuperfetchPfnQuery, part["buf"], part["size"])
         if st:
             raise OSError(f"Couldn't read the memory map: {_nt_error(st)}")
         out = array("Q")
-        out.frombytes(self._buf.raw[PFN_REQUEST_HEADER:])
-        u1 = out[0::3]
-        buckets = [[0] * 5 for _ in range(self.cells)]
-        uses = [[0] * 16 for _ in range(self.cells)]
-        for g, v in zip(self.cell_of, u1):
-            b = LIST_BUCKET[(v >> 4) & 7]
-            buckets[g][b] += 1
-            if b == 3:
-                uses[g][v & 15] += 1
+        out.frombytes(part["buf"].raw[PFN_REQUEST_HEADER:part["size"]])
+        b, u = [0] * (5 * self.cells), [0] * (16 * self.cells)
+        for g, v in zip(part["cells"], out[0::3]):
+            k = LIST_BUCKET[(v >> 4) & 7]
+            b[g * 5 + k] += 1
+            if k == 3:
+                u[g * 16 + (v & 15)] += 1
+        if part["b"] is None:
+            self._tb = [t + n for t, n in zip(self._tb, b)]
+            self._tu = [t + n for t, n in zip(self._tu, u)]
+        else:
+            self._tb = [t - o + n for t, o, n in zip(self._tb, part["b"], b)]
+            self._tu = [t - o + n for t, o, n in zip(self._tu, part["u"], u)]
+        part["b"], part["u"] = b, u
+
+    def sample(self) -> list:
+        """Per GB: None where there's no RAM, else fractions of its RAM by state."""
+        if not self._full:   # the first sample reads every part, so the map starts complete
+            for part in self._parts:
+                self._read(part)
+            self._full = True
+        else:
+            self._read(self._parts[self._next])
+            self._next = (self._next + 1) % len(self._parts)
         cells = []
         for g in range(self.cells):
-            n = sum(buckets[g])
+            bk = self._tb[g * 5:g * 5 + 5]
+            n = sum(bk)
             if not self.ram_pages[g] or not n:
                 cells.append(None)
                 continue
-            free, cached, modified, inuse, _bad = buckets[g]
-            top = sorted(((c, i) for i, c in enumerate(uses[g]) if c and i < len(USES)), reverse=True)[:3]
+            free, cached, modified, inuse, _bad = bk
+            use = self._tu[g * 16:g * 16 + 16]
+            top = sorted(((c, i) for i, c in enumerate(use) if c and i < len(USES)), reverse=True)[:3]
             cells.append({"r": round(self.ram_pages[g] / PAGES_PER_GB, 3),
                           "u": round(inuse / n, 3), "m": round(modified / n, 3),
                           "c": round(cached / n, 3), "f": round(free / n, 3),
@@ -471,6 +512,7 @@ class CpuMonitor:
 class LiveSystem:
     def __init__(self, names) -> None:
         self.names = names
+        self.parts = 1   # memory-map parts: samples a second
         self.ram = self.gpu = None
         self.ram_err = self.gpu_err = None
         self._ram_retry = self._gpu_retry = 0.0
@@ -481,6 +523,7 @@ class LiveSystem:
         if self.ram is None and now >= self._ram_retry:
             try:
                 self.ram, self.ram_err = RamMap(), None
+                self.ram.set_parts(self.parts)
             except OSError as exc:
                 self.ram_err, self._ram_retry = str(exc), now + 60
         if self.gpu is None and now >= self._gpu_retry:
@@ -489,7 +532,12 @@ class LiveSystem:
             except OSError as exc:
                 self.gpu_err, self._gpu_retry = str(exc), now + 60
 
-    def sample(self) -> dict:
+    def set_rate(self, per_second: int) -> None:
+        self.parts = per_second
+        if self.ram:
+            self.ram.set_parts(per_second)
+
+    def sample(self, dt: float = 1.0) -> dict:
         self._ensure()
         installed, usable, avail = memory_status()
         ram = {"installed": installed, "total": usable, "avail": avail, "cells": None, "err": self.ram_err}
@@ -522,11 +570,15 @@ class DemoSystem:
         self.commit_extra = 6 * GB    # committed but not (yet) using RAM
         self.commit_peak = 0
 
-    def sample(self) -> dict:
-        rng, t = self.rng, time.monotonic() - self.t0
+    def set_rate(self, per_second: int) -> None:
+        pass
+
+    def sample(self, dt: float = 1.0) -> dict:
+        # Random walks step by sqrt(dt), so they wander as fast at any sample rate.
+        rng, t, w = self.rng, time.monotonic() - self.t0, math.sqrt(max(0.01, min(1.0, dt)))
         cells = []
         for g, r in enumerate(self.ram_frac):
-            lvl = self.level[g] = min(0.98, max(0.03, self.level[g] + rng.gauss(0, 0.012)))
+            lvl = self.level[g] = min(0.98, max(0.03, self.level[g] + rng.gauss(0, 0.012) * w))
             mod = min(1 - lvl, 0.02 + rng.random() * 0.02)
             cached = (1 - lvl - mod) * (0.85 if g < 24 else 0.4)
             free = max(0.0, 1 - lvl - mod - cached)
@@ -537,12 +589,12 @@ class DemoSystem:
                           "f": round(free, 3), "t": top})
         total = int(31.8 * GB)
         used = sum((c["u"] + c["m"]) * c["r"] for c in cells) * GB
-        self.vram_used = min(23 * GB, max(3 * GB, self.vram_used + rng.gauss(0, 0.15) * GB))
+        self.vram_used = min(23 * GB, max(3 * GB, self.vram_used + rng.gauss(0, 0.15) * w * GB))
         burst = 0.5 + 0.5 * math.sin(t / 7)
         g3d = min(100.0, max(0.0, 30 + 55 * burst + rng.gauss(0, 6)))
-        self.cpu = min(100.0, max(2.0, self.cpu + rng.gauss(0, 4) + (18 - self.cpu) * 0.1))
+        self.cpu = min(100.0, max(2.0, self.cpu + rng.gauss(0, 4) * w + (18 - self.cpu) * 0.1 * dt))
         game = self.vram_used * 0.7
-        self.commit_extra = min(14 * GB, max(2 * GB, self.commit_extra + rng.gauss(0, 0.25) * GB))
+        self.commit_extra = min(14 * GB, max(2 * GB, self.commit_extra + rng.gauss(0, 0.25) * w * GB))
         committed = int(used * 0.8 + self.commit_extra)
         self.commit_peak = max(self.commit_peak, committed, int(26 * GB))
         return {
@@ -562,33 +614,66 @@ class DemoSystem:
         }
 
 
+INTERVALS = (50, 100, 250, 500, 1000)   # ms between samples: 20, 10, 4, 2 or 1 a second
+
+
 class SystemMonitor:
-    """Publishes a sample about once a second while anyone is watching."""
+    """Publishes a sample at the chosen rate while anyone is watching.
+
+    Each message carries "t" (seconds, this process's monotonic clock) and
+    "iv" (the interval in ms), so the view can place samples in time and show
+    the rate in use.
+    """
 
     def __init__(self, hub, mode: str, names) -> None:
         self.hub, self.mode, self.names = hub, mode, names
+        self.interval = 1000
         self._stop = threading.Event()
+        self._wake = threading.Event()   # set when the interval changes
+        self._source = None
 
     def start(self) -> None:
         threading.Thread(target=self._run, name="sysmon", daemon=True).start()
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
+
+    def set(self, interval: int) -> None:
+        if interval not in INTERVALS:
+            raise ValueError(f"interval must be one of {INTERVALS}")
+        if interval != self.interval:
+            self.interval = interval
+            self._wake.set()
 
     def _run(self) -> None:
         try:
             source = DemoSystem() if self.mode == "demo" else LiveSystem(self.names)
         except Exception as exc:  # noqa: BLE001 - reported to the view
             source, err = None, str(exc)
+        applied = None
+        last = time.monotonic()
+        deadline = last
         while not self._stop.is_set():
-            start = time.perf_counter()
+            iv = self.interval
+            if source and iv != applied:
+                source.set_rate(round(1000 / iv))
+                applied = iv
+            now = time.monotonic()
+            dt, last = now - last, now
             if self.hub.viewers():
                 try:
-                    msg = source.sample() if source else {"err": err}
+                    msg = source.sample(dt) if source else {"err": err}
                 except Exception as exc:  # noqa: BLE001
                     msg = {"err": f"{type(exc).__name__}: {exc}"}
+                msg["t"] = round(now, 3)
+                msg["iv"] = iv
                 self.hub.publish(json.dumps(msg, separators=(",", ":")), "sys")
-            self._stop.wait(max(0.2, 1.0 - (time.perf_counter() - start)))
+            # Absolute deadlines keep the rate steady; after a stall, start afresh.
+            deadline = max(deadline + iv / 1000, time.monotonic())
+            if self._wake.wait(max(0.0, deadline - time.monotonic())):
+                self._wake.clear()
+                deadline = time.monotonic()
 
 
 if __name__ == "__main__":

@@ -75,6 +75,11 @@ are tabs along the top of the window: **Network ports**, **Memory & GPU** and
   order rather than by address.
 - Scroll to zoom and drag to move around, the same as on the Network ports tab.
   **Reset view** goes back to the start.
+- **Samples** sets how often everything on this tab updates, with the same choices
+  as the CPU, disk & network tab: 20, 10, 4, 2 or 1 a second. **Up** and **Down**
+  change it too. It's remembered between runs. The bars and charts follow every
+  sample; the numbers and lists redraw at most 4 times a second, so they stay
+  readable.
 - **Utilization**: GPU 3D and CPU over the last 60 seconds, like Task Manager.
 - **Committed memory**: over the last 60 seconds. This is the memory Windows has
   promised to programs, kept in RAM or the page file. It's drawn against memory in
@@ -85,9 +90,9 @@ are tabs along the top of the window: **Network ports**, **Memory & GPU** and
 - Below the charts are the GPU's other engines (copy, compute, video decode and
   encode), and the apps using the most GPU memory. "Not owned by one app" is the
   driver's memory and memory that apps share with each other.
-- These update once a second. The per-GB system memory map needs administrator
-  rights, which live mode already has. Without them, the grid shows how much
-  memory is in use, filled in order.
+- The per-GB system memory map needs administrator rights, which live mode
+  already has. Without them, the grid shows how much memory is in use, filled in
+  order.
 
 ## CPU, disk & network
 
@@ -212,15 +217,18 @@ at both ports, **Local** only at 52814, and **Remote** only at 443.
 - **Without Windows Firewall**: Windows answers probes of closed ports with a
   reset instead of dropping them, so scans of closed ports aren't seen.
 
-`sysmon.py` samples memory, the GPU and the CPU once a second and sends the result
-on the same stream.
+`sysmon.py` samples memory, the GPU and the CPU at the rate chosen in the Memory &
+GPU tab and sends the result on the same stream.
 
 - **System memory map**: it reads a sample of about 65,000 entries from Windows'
   page database, around 1,000 per GB. This uses the same undocumented interface
   as Sysinternals RAMMap (`NtQuerySystemInformation` with
   `SystemSuperfetchInformation`). Each entry says which list a page is on (in use,
-  modified, standby, free) and what it's used for. A sample takes about 40 ms on a
-  128 GB machine.
+  modified, standby, free) and what it's used for. Reading them all takes about
+  30 ms on a 128 GB machine. At faster rates it reads an interleaved part of
+  them each time (a twentieth at 20 a second), so every GB updates with each
+  sample and the whole set is read once a second. That costs about the same per
+  second at any rate.
 - **GPU**: its memory size comes from D3DKMT. Use and engine utilization come from
   the performance counters Task Manager reads (`GPU Engine`, `GPU Adapter Memory`,
   `GPU Process Memory`).

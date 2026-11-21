@@ -824,7 +824,7 @@ class CountingWriter:
 
 
 def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None, perf=None,
-                 details=None, scans=None):
+                 details=None, scans=None, system=None):
     """on_write(bytes, client_port) is called for everything sent, when no capture sees it.
 
     details(port) describes the processes on a port (GET /api/port?p=N); scans
@@ -897,11 +897,13 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
             # from changing it: they can't send JSON here without a CORS
             # preflight, which this server doesn't answer.
             # POST /api/perf {"interval": 250} or {"source": "utility"} does the
-            # same for the CPU, disk & network tab.
+            # same for the CPU, disk & network tab, and POST /api/sys
+            # {"interval": 250} for the Memory & GPU tab.
             if not self._ours():
                 return
             path = self.path.split("?", 1)[0]
-            if path not in ("/api/rate", "/api/perf") or (path == "/api/perf" and perf is None):
+            if (path not in ("/api/rate", "/api/perf", "/api/sys") or (path == "/api/perf" and perf is None)
+                    or (path == "/api/sys" and system is None)):
                 self.send_error(404)
                 return
             origin = self.headers.get("Origin")
@@ -917,6 +919,9 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
                 if path == "/api/rate":
                     rate.set(int(body["hz"]))
                     reply = {"tick": rate.seconds}
+                elif path == "/api/sys":
+                    system.set(int(body["interval"]))
+                    reply = {"interval": system.interval}
                 else:
                     if not isinstance(body, dict) or not ({"interval", "source"} & body.keys()):
                         raise ValueError("nothing to set")
@@ -1109,13 +1114,15 @@ class Server:
         self.done = threading.Event()
         # CPU, disk & network tab (CPU Graph's sampler), at its own rate
         self.perf = perfmon.PerfMonitor(self.hub, mode)
+        # Memory, GPU and CPU for the Memory & GPU tab, at its own rate
+        self.sysmon = sysmon.SystemMonitor(self.hub, mode, ProcessNames().get)
         try:
             info = {"mode": mode, "rates": list(RATES), "host": socket.gethostname(),
                     "services": load_services()}
             self.httpd = ThreadingHTTPServer(
                 ("127.0.0.1", self.port),
                 make_handler(self.hub, info, self.port, self.rate, on_write, self.perf,
-                             self.details, self.scans))
+                             self.details, self.scans, self.sysmon))
         except BaseException:
             self.source.stop()
             self.scans.stop()
@@ -1128,8 +1135,6 @@ class Server:
         threading.Thread(target=run_ticker,
                          args=(self.acc, self.hub, self.source.names, self.done, self.rate, self.seen),
                          name="ticker", daemon=True).start()
-        # Memory, GPU and CPU for the Memory & GPU tab, once a second
-        self.sysmon = sysmon.SystemMonitor(self.hub, mode, ProcessNames().get)
         self.sysmon.start()
 
     def _count_own_stream(self, size: int, client_port: int) -> None:

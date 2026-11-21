@@ -8,7 +8,9 @@
 const GiB = 1073741824;
 const MP = 30, MS = 24, MMAXH = 66, MSLAB = 5;    // world px: cell pitch, bar footprint, tallest bar, floor depth
 const MLABEL_W = 78, MTITLE_H = 42, MLEGEND_H = 40, MGAP = 40;
-const HISTORY = 60;                                // samples (seconds) kept for the chart
+const HISTORY_S = 60;                              // seconds of samples kept for the charts
+const M_INTERVALS = [50, 100, 250, 500, 1000];     // ms: 20, 10, 4, 2, 1 samples a second, as on the CPU tab
+const M_TEXT_MS = 250;                             // numbers and lists redraw at most 4 times a second
 const MEM_USES = ['Process memory', 'Mapped files', 'Shared memory', 'Page tables', 'Paged pool',
   'Nonpaged pool', 'System', 'Session memory', 'File system metadata', 'Locked by apps (AWE)',
   'Locked by drivers', 'Kernel stacks'];
@@ -17,7 +19,10 @@ const mstage = $('mstage'), mcv = $('mcv'), mctx = mcv.getContext('2d'), mtip = 
 const mem = {
   last: null,            // latest sample from the server
   ram: [], gpu: [],      // per GB: { h, target, d }, or null where there's no RAM
-  hist: [],              // [{ g3d, cpu, commit, ram }] once a second, oldest first
+  hist: [],              // [{ t, g3d, cpu, commit, ram }] for the last HISTORY_S seconds, oldest first
+  interval: 1000,        // ms between samples, as the server reports it
+  restored: false,       // the rate chosen last time has been put back
+  textAt: 0,             // when the numbers and lists last redrew
   commitLimit: 0,        // bytes that can be committed: RAM plus page file
   panels: [], hover: null, mouse: null,
 };
@@ -50,11 +55,15 @@ function cellsFrom(list, old) {
 
 function onSys(m) {
   mem.last = m;
+  syncRate(m.iv);
   const ram = m.ram, gpu = m.gpu;
   const g3d = gpu ? (gpu.engines.find(e => e[0] === '3D') || [])[1] : undefined;
-  mem.hist.push({ g3d: g3d ?? null, cpu: m.cpu ?? null,
+  const t = m.t ?? performance.now() / 1000;
+  const prev = mem.hist[mem.hist.length - 1];
+  if (prev && (t < prev.t || t - prev.t > HISTORY_S)) mem.hist = [];   // the server restarted, or a long gap
+  mem.hist.push({ t, g3d: g3d ?? null, cpu: m.cpu ?? null,
                   commit: m.commit ? m.commit.used : null, ram: ram ? ram.total - ram.avail : null });
-  if (mem.hist.length > HISTORY) mem.hist.shift();
+  while (mem.hist.length && mem.hist[0].t < t - HISTORY_S) mem.hist.shift();
   mem.commitLimit = m.commit ? m.commit.limit : 0;
 
   const ramList = !ram ? [] : ram.cells ? ram.cells.map(c => c && { ...c, v: Math.min(1, c.u + c.m) })
@@ -63,14 +72,61 @@ function onSys(m) {
   const relayout = ramList.length !== mem.ram.length || gpuList.length !== mem.gpu.length;
   mem.ram = cellsFrom(ramList, mem.ram);
   mem.gpu = cellsFrom(gpuList, mem.gpu);
-  if (relayout) mlayout();
-  renderMemStats();
-  renderMeters();
-  renderMemMsg();
+  // Lay out on a change in size, or if there's no layout yet (the tab was hidden at the first sample).
+  if (relayout || !mem.panels.length) mlayout();
+  // The grids draw the newest bars (each sample brings new cell objects).
+  for (const g of mem.panels) g.cells = g.kind === 'ram' ? mem.ram : mem.gpu;
+  // Bars and charts follow every sample; text redraws less often so it stays readable.
+  const now = performance.now();
+  if (relayout || now - mem.textAt >= M_TEXT_MS) {
+    mem.textAt = now;
+    renderMemStats();
+    renderMeters();
+    renderMemMsg();
+    if (mem.hover && mem.mouse) showMemTip();
+  }
   drawCharts();
-  if (mem.hover && mem.mouse) showMemTip();
 }
 sysListeners.push(onSys);
+
+// ---------------------------------------------------------------------------
+// Sample rate: the same choices as the CPU tab, kept between runs
+// ---------------------------------------------------------------------------
+function syncRate(iv) {
+  if (!M_INTERVALS.includes(iv)) return;
+  mem.interval = iv;
+  $('mctl-rate').value = String(iv);
+  if (!mem.restored) {   // put back the rate chosen last time
+    mem.restored = true;
+    const want = loadPref('mem.interval');
+    if (M_INTERVALS.includes(want) && want !== iv) setMemRate(want);
+  }
+}
+
+async function setMemRate(ms) {
+  if (!M_INTERVALS.includes(ms)) return;
+  savePref('mem.interval', ms);
+  $('mctl-rate').value = String(ms);
+  try {
+    const res = await fetch('/api/sys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ interval: ms }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  } catch {
+    $('mctl-rate').value = String(mem.interval);   // the samples that arrive say what's in use
+  }
+}
+
+$('mctl-rate').addEventListener('change', ev => setMemRate(Number(ev.target.value)));
+document.addEventListener('keydown', ev => {
+  if (activeTab !== 'mem' || ev.ctrlKey || ev.altKey || ev.metaKey) return;
+  if (ev.target.closest && ev.target.closest('input, select, textarea')) return;
+  const i = M_INTERVALS.indexOf(mem.interval);
+  if (ev.key === 'ArrowUp' && i > 0) setMemRate(M_INTERVALS[i - 1]);           // faster
+  else if (ev.key === 'ArrowDown' && i < M_INTERVALS.length - 1) setMemRate(M_INTERVALS[i + 1]);   // slower
+  else return;
+  ev.preventDefault();
+});
 
 // ---------------------------------------------------------------------------
 // Layout and drawing of the two grids
@@ -400,10 +456,24 @@ class LineChart {
     new ResizeObserver(() => this.draw()).observe(this.cv);
   }
 
+  // Samples sit by time: the newest at the right edge, HISTORY_S seconds back at the left.
   geom() {
     const r = this.cv.getBoundingClientRect(), max = this.cfg.max() || 1;
     const pw = r.width - CH.l - CH.r, ph = r.height - CH.t - CH.b;
-    return { r, pw, X: i => CH.l + pw * i / (HISTORY - 1), Y: v => CH.t + ph * (1 - Math.min(v, max) / max) };
+    const h = mem.hist, now = h.length ? h[h.length - 1].t : 0;
+    return { r, pw, now, X: t => CH.l + pw * (1 - (now - t) / HISTORY_S), Y: v => CH.t + ph * (1 - Math.min(v, max) / max) };
+  }
+
+  // The sample nearest a time, or -1.
+  nearest(t) {
+    const h = mem.hist;
+    let lo = 0, hi = h.length - 1;
+    if (hi < 0) return -1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (h[mid].t < t) lo = mid + 1; else hi = mid;
+    }
+    return lo > 0 && t - h[lo - 1].t < h[lo].t - t ? lo - 1 : lo;
   }
 
   draw() {
@@ -446,13 +516,15 @@ class LineChart {
       g.setLineDash([]);
     }
 
-    const n = mem.hist.length, start = HISTORY - n;
+    const n = mem.hist.length;
     for (const s of cfg.series) {
       g.beginPath();
-      let pen = false;
-      mem.hist.forEach((h, i) => {
-        if (h[s.key] == null) { pen = false; return; }
-        const x = X(start + i), y = Y(h[s.key]);
+      let pen = false, prevT = -Infinity;
+      mem.hist.forEach(h => {
+        if (h[s.key] == null || h.t - prevT > 5) pen = false;   // gaps stay gaps
+        prevT = h.t;
+        if (h[s.key] == null) return;
+        const x = X(h.t), y = Y(h[s.key]);
         if (pen) g.lineTo(x, y); else g.moveTo(x, y);
         pen = true;
       });
@@ -461,9 +533,9 @@ class LineChart {
       g.lineJoin = 'round';
       g.stroke();
     }
-    const i = this.hover;
-    if (i != null && i < n) {   // crosshair and markers at the hovered second
-      const x = X(start + i);
+    const i = this.hover == null ? -1 : this.nearest(this.hover);
+    if (i >= 0 && i < n) {   // crosshair and markers at the hovered sample
+      const x = X(mem.hist[i].t);
       g.beginPath();
       g.moveTo(x, CH.t);
       g.lineTo(x, Y(0));
@@ -487,16 +559,17 @@ class LineChart {
   onMove(ev) {
     const n = mem.hist.length;
     if (!n) return;
-    const { r, pw } = this.geom(), cfg = this.cfg;
-    const slot = Math.round((ev.clientX - r.left - CH.l) / pw * (HISTORY - 1));
-    const i = Math.max(0, Math.min(n - 1, slot - (HISTORY - n)));
-    this.hover = i;
+    const { r, pw, now } = this.geom(), cfg = this.cfg;
+    const frac = Math.max(0, Math.min(1, (ev.clientX - r.left - CH.l) / pw));
+    const i = this.nearest(now - (1 - frac) * HISTORY_S);
+    const h = mem.hist[i], ago = now - h.t;
+    this.hover = h.t;   // a time, so the marker stays on its sample as new ones arrive
     this.draw();
-    const h = mem.hist[i], ago = n - 1 - i;
     const rows = [...cfg.series].reverse().map(s =>
       `<div><i class="ln ${s.cls}"></i> ${s.label} ${h[s.key] == null ? '–' : cfg.fmt(h[s.key])}</div>`);
     const ref = cfg.ref && cfg.ref();
-    this.tip.innerHTML = `<div class="head">${ago ? `${ago} s ago` : 'Now'}</div>${rows.join('')}` +
+    const when = ago < mem.interval / 2000 ? 'Now' : ago < 10 ? `${ago.toFixed(1)} s ago` : `${Math.round(ago)} s ago`;
+    this.tip.innerHTML = `<div class="head">${when}</div>${rows.join('')}` +
       (ref ? `<div class="faint">${ref.label}</div>` : '');
     this.tip.hidden = false;
     const x = ev.clientX - r.left;
@@ -538,6 +611,8 @@ function drawCharts() {
 // Startup
 // ---------------------------------------------------------------------------
 readChartColors();
+// The tab may open before a resize notice arrives: lay out then too.
+tabListeners.push(name => { if (name === 'mem') { mlayout(); drawCharts(); } });
 darkQuery.addEventListener('change', () => { readChartColors(); drawCharts(); });
 new ResizeObserver(mlayout).observe(mstage);
 requestAnimationFrame(mframe);

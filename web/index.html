@@ -108,6 +108,15 @@
       <div class="stat"><span class="k">CPU</span><span id="ms-cpu" class="v">–</span></div>
     </div>
     <div class="controls">
+      <label class="sel" title="Faster or slower sampling (Up / Down)">Samples
+        <select id="mctl-rate">
+          <option value="50">20/s</option>
+          <option value="100">10/s</option>
+          <option value="250">4/s</option>
+          <option value="500">2/s</option>
+          <option value="1000" selected>1/s</option>
+        </select>
+      </label>
       <button type="button" id="mctl-zoom" title="Back to the starting zoom and position">Reset view</button>
     </div>
   </header>
