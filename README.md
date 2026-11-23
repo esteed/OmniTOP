@@ -152,7 +152,7 @@ reconnects by itself. The app connects to the agents only while its window is op
 ## Run it
 
 Download `omniTop.exe` from the
-[latest release](https://github.com/esteed/port-traffic-viz/releases/latest), or
+[latest release](https://github.com/esteed/OmniTOP/releases/latest), or
 build it yourself (see below).
 
 | | |
