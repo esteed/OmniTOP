@@ -223,8 +223,8 @@ main { display: flex; min-height: 0; }
 #pcv { display: block; position: absolute; left: 0; top: 0; }
 .perf-controls { margin-left: 0; }
 #pctl-top.on { background: var(--sel); font-weight: 600; }
-#cv, #mcv { cursor: grab; }
-#cv.dragging, #mcv.dragging { cursor: grabbing; }
+#cv { cursor: grab; }
+#cv.dragging { cursor: grabbing; }
 aside {
   width: 300px;
   flex: none;
@@ -273,6 +273,9 @@ aside .hint { font-size: 12px; color: var(--muted); margin: -4px 0 10px; }
 .tip .port { font-family: var(--mono); }
 .tip .sub { color: var(--text-2); }
 .tip .faint { color: var(--muted); }
+.tip .desc { white-space: normal; max-width: 300px; color: var(--text-2); }
+#mlegend { gap: 4px 14px; }
+#mlegend .sw { border: 0; width: 12px; }
 
 #top { list-style: none; margin: 0; padding: 0; }
 #top li {

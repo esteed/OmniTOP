@@ -1,7 +1,7 @@
 # omniTop
 
 A live isometric view of this Windows machine's network traffic, one bar per port,
-and of its memory and GPU, one bar per gigabyte, plus real-time graphs of CPU,
+a map of everything in its memory and GPU memory, plus real-time graphs of CPU,
 network and disk activity for this PC and Linux machines on your network. The views
 are tabs along the top of the window: **Network ports**, **Memory & GPU** and
 **CPU, disk & network**. The app remembers which tab you had open.
@@ -63,18 +63,31 @@ are tabs along the top of the window: **Network ports**, **Memory & GPU** and
 
 ## Memory & GPU
 
-- **System memory**: one bar per GB of physical address space, in address order
-  (8 or 16 GB per row). Bar height and color show how much of that GB is in use,
-  from blue (little) to red (all of it). Hover a bar for the split between in use,
-  cached and free, and what the in-use memory is (process memory, file mappings,
-  kernel pools...). A dashed outline marks a GB with no RAM at all, and the
-  tooltip says when a GB is only partly RAM: devices such as the graphics card
-  are mapped into part of the address space, usually just below 4 GB.
-- **GPU memory**: one bar per GB of the graphics card's own memory. Windows reports
-  how much is in use but not where on the card it's stored, so these fill in
-  order rather than by address.
-- Scroll to zoom and drag to move around, the same as on the Network ports tab.
-  **Reset view** goes back to the start.
+- **System memory**: all of RAM as one bar, from 0 on the left to the installed
+  size on the right, with a scale sized to the memory found. It's split into what
+  the memory holds, each kind in its own color:
+  - in use, in greens for programs (process memory, compressed, mapped files,
+    shared memory) and pinks for the kernel (paged pool, nonpaged pool, page
+    tables, other kernel memory)
+  - modified, standby and free
+  - hardware reserved, the memory the firmware keeps for devices, at the far right
+  Each kind is labelled with its size on a line that leaves the bar at an angle and
+  runs to where there's room. Neighbours alternate above and below the bar, so small
+  kinds next to each other spread out. A label that has no room is left off; the
+  legend and hover still name it.
+- Lines under the bar show the totals Task Manager uses: **In use**, **Available**
+  (standby plus free), **Cached** (modified plus standby) and **Committed**. Committed
+  memory can be more than RAM; then its line ends in an arrow.
+- **By physical address**: where each kind sits, from byte 0 to the end of RAM in
+  physical address space. Each column is a slice (64 MB or more, so there are at
+  most 600), split by how much of it is in use, modified, standby and free, with the
+  part in use colored by what most of it holds. Gaps are addresses with no RAM:
+  devices such as the graphics card are mapped there, usually just below 4 GB.
+- **GPU memory**: the graphics card's own memory as one bar, split by the apps using
+  it, memory not owned by one app, and free.
+- Hover anything for details: what each kind of memory is, the standby priorities,
+  how much of the paged pool is in the page file, what "other kernel memory" holds,
+  the page files, and each address slice's use.
 - **Samples** sets how often everything on this tab updates, with the same choices
   as the CPU, disk & network tab: 20, 10, 4, 2 or 1 a second. **Up** and **Down**
   change it too. It's remembered between runs. The bars and charts follow every
@@ -90,9 +103,10 @@ are tabs along the top of the window: **Network ports**, **Memory & GPU** and
 - Below the charts are the GPU's other engines (copy, compute, video decode and
   encode), and the apps using the most GPU memory. "Not owned by one app" is the
   driver's memory and memory that apps share with each other.
-- The per-GB system memory map needs administrator rights, which live mode
-  already has. Without them, the grid shows how much memory is in use, filled in
-  order.
+- The finer split of memory in use and the physical address map need
+  administrator rights, which live mode already has. Without them, the bar splits
+  memory in use into programs, compressed, file cache, the pools and drivers, and
+  the address map is left out.
 
 ## CPU, disk & network
 
@@ -220,15 +234,23 @@ at both ports, **Local** only at 52814, and **Remote** only at 443.
 `sysmon.py` samples memory, the GPU and the CPU at the rate chosen in the Memory &
 GPU tab and sends the result on the same stream.
 
+- **System memory totals**: modified, standby (by priority), free, the pools and
+  driver memory come from the `Memory` performance counters Resource Monitor reads.
+  Memory in use is what's left of the usable RAM. Compressed memory is the working
+  set of the Memory Compression process, read every 2 seconds because the
+  `Process` counters are slow to collect. The page files come from
+  `NtQuerySystemInformation` (`SystemPageFileInformation`).
 - **System memory map**: it reads a sample of about 65,000 entries from Windows'
   page database, around 1,000 per GB. This uses the same undocumented interface
   as Sysinternals RAMMap (`NtQuerySystemInformation` with
   `SystemSuperfetchInformation`). Each entry says which list a page is on (in use,
-  modified, standby, free) and what it's used for. Reading them all takes about
-  30 ms on a 128 GB machine. At faster rates it reads an interleaved part of
-  them each time (a twentieth at 20 a second), so every GB updates with each
-  sample and the whole set is read once a second. That costs about the same per
-  second at any rate.
+  modified, standby, free) and what it's used for. That splits memory in use into
+  process memory, mapped files, shared memory, page tables and other kernel memory
+  (the pools come from the counters, which are exact), and gives each address
+  slice its mix. Reading them all takes about 30 ms on a 128 GB machine. At faster
+  rates it reads an interleaved part of them each time (a twentieth at 20 a
+  second), so the whole set is read once a second at any rate. The address map
+  goes to the view at most 4 times a second.
 - **GPU**: its memory size comes from D3DKMT. Use and engine utilization come from
   the performance counters Task Manager reads (`GPU Engine`, `GPU Adapter Memory`,
   `GPU Process Memory`).

@@ -1,10 +1,12 @@
 """System memory, GPU and CPU sampling for the Memory & GPU tab.
 
-- System memory: which 1 GB slices of physical address space hold RAM, and how
-  the pages in each slice are being used. This reads a sample of the memory
-  manager's page database through the same undocumented interface Sysinternals
-  RAMMap uses (NtQuerySystemInformation, SystemSuperfetchInformation), which
-  needs administrator rights.
+- System memory: how much RAM is in use, modified, standby and free, and what
+  the memory in use holds, from the performance counters Resource Monitor
+  reads ("Memory"). For a finer breakdown, and for where in physical address
+  space each kind sits, this also reads a sample of the memory manager's page
+  database through the same undocumented interface Sysinternals RAMMap uses
+  (NtQuerySystemInformation, SystemSuperfetchInformation), which needs
+  administrator rights.
 - GPU: dedicated memory size (D3DKMT), and memory use and engine utilization
   from the performance counters Task Manager reads ("GPU Adapter Memory",
   "GPU Process Memory", "GPU Engine"). Windows doesn't report where in GPU
@@ -29,9 +31,11 @@ from ctypes import wintypes
 
 GB = 1 << 30
 PAGE = 4096
-PAGES_PER_GB = GB // PAGE
 SAMPLE_BUDGET = 65536        # page-database entries read per sample, at most
 MAX_PER_GB = 1024            # ...and at most this many per GB (one per 1 MB)
+MIN_SLICE = 64 << 20         # the address map's slices: at least 64 MB,
+MAX_SLICES = 600             # ...doubled until there are at most this many
+MAP_EVERY = 0.25             # seconds between address maps sent to the view
 
 ULONG = wintypes.ULONG
 DWORD = wintypes.DWORD
@@ -118,7 +122,7 @@ def memory_status() -> tuple[int, int, int]:
 
 
 class RamMap:
-    """Samples how each GB of physical address space is used."""
+    """Samples how each slice of physical address space is used."""
 
     def __init__(self) -> None:
         nt = ctypes.WinDLL("ntdll")
@@ -171,23 +175,32 @@ class RamMap:
         raise OSError(f"Couldn't read the physical memory layout: {_nt_error(last) if last else 'unexpected format'}")
 
     def _plan(self) -> None:
-        """Pick which pages to sample: evenly spread over the RAM in each GB."""
+        """Pick which pages to sample: evenly spread over the RAM in each slice."""
         end = max(b + n for b, n in self.ranges)
-        self.cells = math.ceil(end / PAGES_PER_GB)
-        ram = [[] for _ in range(self.cells)]          # per GB: [(first page, count)]
+        slice_bytes = MIN_SLICE
+        while end * PAGE > slice_bytes * MAX_SLICES:
+            slice_bytes *= 2
+        self.slice = slice_bytes
+        self.pps = pps = slice_bytes // PAGE            # pages per slice
+        self.cells = math.ceil(end / pps)
+        ram = [[] for _ in range(self.cells)]          # per slice: [(first page, count)]
         for base, count in self.ranges:
             p, stop = base, base + count
             while p < stop:
-                g = p // PAGES_PER_GB
-                seg_end = min(stop, (g + 1) * PAGES_PER_GB)
+                g = p // pps
+                seg_end = min(stop, (g + 1) * pps)
                 ram[g].append((p, seg_end - p))
                 p = seg_end
         self.ram_pages = [sum(n for _, n in segs) for segs in ram]
-        per_gb = max(64, min(MAX_PER_GB, SAMPLE_BUDGET // max(1, sum(1 for r in self.ram_pages if r))))
+        cap = max(16, MAX_PER_GB * slice_bytes // GB)
+        per_slice = max(16, min(cap, SAMPLE_BUDGET // max(1, sum(1 for r in self.ram_pages if r))))
         pfns, cell_of = array("Q"), array("H")
+        self.weight = [0.0] * self.cells               # pages of RAM each sampled page stands for
         for g, segs in enumerate(ram):
             total = self.ram_pages[g]
-            k = min(per_gb, total)
+            k = min(per_slice, total)
+            if k:
+                self.weight[g] = total / k
             if not k:
                 continue
             step = total / k
@@ -228,7 +241,7 @@ class RamMap:
                 "cells": cells, "size": size, "buf": ctypes.create_string_buffer(size),
                 "template": struct.pack("<IIQ", 1, 1, n) + bytes(PFN_REQUEST_HEADER - 16) + entries.tobytes(),
                 "b": None, "u": None})
-        self._tb = [0] * (5 * self.cells)    # totals over all parts: page list per GB
+        self._tb = [0] * (5 * self.cells)    # totals over all parts: page list per slice
         self._tu = [0] * (16 * self.cells)   # and what in-use pages are used for
         self._next = 0
         self._full = False
@@ -254,30 +267,46 @@ class RamMap:
             self._tu = [t - o + n for t, o, n in zip(self._tu, part["u"], u)]
         part["b"], part["u"] = b, u
 
-    def sample(self) -> list:
-        """Per GB: None where there's no RAM, else fractions of its RAM by state."""
+    def sample(self, cells: bool = True) -> dict:
+        """Estimates for all of RAM, and (if cells) how each slice's RAM is used.
+
+        "states" is pages by list (free, cached, modified, in use, bad) and
+        "uses" is pages in use by USES index, both over all RAM; they're worked
+        out with the cells and kept between (they change slowly). A cell is
+        None where the slice has no RAM, else permille ints: the share of the
+        slice that is RAM, the shares of its RAM in use, modified, cached and
+        free, then up to three (USES index, share) pairs for what most of its
+        pages in use hold.
+        """
         if not self._full:   # the first sample reads every part, so the map starts complete
             for part in self._parts:
                 self._read(part)
             self._full = True
+            cells = True
         else:
             self._read(self._parts[self._next])
             self._next = (self._next + 1) % len(self._parts)
-        cells = []
+        tb, tu, w = self._tb, self._tu, self.weight
+        if not cells:
+            return {"states": self._states, "uses": self._uses, "cells": None}
+        states = self._states = [sum(t * x for t, x in zip(tb[i::5], w)) for i in range(5)]
+        uses = self._uses = [sum(t * x for t, x in zip(tu[i::16], w)) for i in range(len(USES))]
+        out = []
         for g in range(self.cells):
-            bk = self._tb[g * 5:g * 5 + 5]
+            bk = tb[g * 5:g * 5 + 5]
             n = sum(bk)
             if not self.ram_pages[g] or not n:
-                cells.append(None)
+                out.append(None)
                 continue
             free, cached, modified, inuse, _bad = bk
-            use = self._tu[g * 16:g * 16 + 16]
-            top = sorted(((c, i) for i, c in enumerate(use) if c and i < len(USES)), reverse=True)[:3]
-            cells.append({"r": round(self.ram_pages[g] / PAGES_PER_GB, 3),
-                          "u": round(inuse / n, 3), "m": round(modified / n, 3),
-                          "c": round(cached / n, 3), "f": round(free / n, 3),
-                          "t": [[i, round(c / n, 3)] for c, i in top]})
-        return cells
+            use = tu[g * 16:g * 16 + len(USES)]
+            top = sorted(((c, i) for i, c in enumerate(use) if c), reverse=True)[:3]
+            cell = [round(1000 * self.ram_pages[g] / self.pps), round(1000 * inuse / n),
+                    round(1000 * modified / n), round(1000 * cached / n), round(1000 * free / n)]
+            for c, i in top:
+                cell += (i, round(1000 * c / n))
+            out.append(cell)
+        return {"states": states, "uses": uses, "cells": out}
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +401,7 @@ PDH_MORE_DATA = 0x800007D2
 class Counters:
     """A PDH query over wildcard counters; values() returns {instance: value}."""
 
-    def __init__(self, paths: dict[str, str]) -> None:
+    def __init__(self, paths: dict[str, str], what: str = "GPU") -> None:
         self.pdh = pdh = ctypes.WinDLL("pdh")
         pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
         pdh.PdhAddEnglishCounterW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, ctypes.c_size_t,
@@ -393,7 +422,7 @@ class Counters:
             if pdh.PdhAddEnglishCounterW(self.query, path, 0, ctypes.byref(h)) == 0:
                 self.counters[key] = h
         if not self.counters:
-            raise OSError("This version of Windows has no GPU performance counters.")
+            raise OSError(f"This version of Windows has no {what} performance counters.")
         pdh.PdhCollectQueryData(self.query)   # rates need two collections
 
     def collect(self) -> dict[str, dict[str, float]]:
@@ -506,6 +535,165 @@ class CpuMonitor:
 
 
 # ---------------------------------------------------------------------------
+# System memory totals: performance counters (no rights needed), the page
+# files, and the memory compression store
+# ---------------------------------------------------------------------------
+
+MEM_COUNTERS = {
+    "free": r"\Memory\Free & Zero Page List Bytes",
+    "modified": r"\Memory\Modified Page List Bytes",
+    "core": r"\Memory\Standby Cache Core Bytes",
+    "normal": r"\Memory\Standby Cache Normal Priority Bytes",
+    "reserve": r"\Memory\Standby Cache Reserve Bytes",
+    "paged": r"\Memory\Pool Paged Resident Bytes",
+    "pagedAll": r"\Memory\Pool Paged Bytes",
+    "nonpaged": r"\Memory\Pool Nonpaged Bytes",
+    "drivers": r"\Memory\System Driver Resident Bytes",
+    "code": r"\Memory\System Code Resident Bytes",
+    "cache": r"\Memory\System Cache Resident Bytes",
+}
+LIST_KEYS = ("free", "modified", "core", "normal", "reserve")
+# USES indexes shown together as "other kernel memory": system PTEs, session
+# memory, file system metadata, pages locked by drivers, kernel stacks
+KERNEL_USES = (6, 7, 8, 10, 11)
+
+
+class MemoryCounters:
+    """RAM by page list, and kernel memory, in bytes, from the "Memory" counters."""
+
+    def __init__(self) -> None:
+        self.counters = Counters(MEM_COUNTERS, "memory")
+        if not all(k in self.counters.counters for k in LIST_KEYS):
+            raise OSError("This version of Windows doesn't report standby memory.")
+
+    def sample(self) -> dict[str, int]:
+        values = {k: int(sum(v.values())) for k, v in self.counters.collect().items()}
+        return {k: values.get(k, 0) for k in MEM_COUNTERS}
+
+
+class UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+
+
+class SYSTEM_PAGEFILE_INFORMATION(ctypes.Structure):
+    _fields_ = [("NextEntryOffset", ULONG), ("TotalSize", ULONG), ("TotalInUse", ULONG),
+                ("PeakUsage", ULONG), ("PageFileName", UNICODE_STRING)]
+
+
+SystemPageFileInformation = 18
+_ntq = ctypes.WinDLL("ntdll").NtQuerySystemInformation
+_ntq.argtypes = [ULONG, ctypes.c_void_p, ULONG, ctypes.POINTER(ULONG)]
+_ntq.restype = ctypes.c_long
+
+
+def page_files() -> list[list]:
+    """[[path, size, in use, peak use]] for each page file, sizes in bytes."""
+    buf = ctypes.create_string_buffer(1 << 14)
+    ret = ULONG()
+    if _ntq(SystemPageFileInformation, buf, len(buf), ctypes.byref(ret)) or not ret.value:
+        return []
+    files, off = [], 0
+    while off + ctypes.sizeof(SYSTEM_PAGEFILE_INFORMATION) <= ret.value:
+        info = SYSTEM_PAGEFILE_INFORMATION.from_buffer(buf, off)
+        name = info.PageFileName
+        path = ctypes.wstring_at(name.Buffer, name.Length // 2) if name.Buffer and name.Length else ""
+        files.append([path.removeprefix("\\??\\"), info.TotalSize * PAGE, info.TotalInUse * PAGE,
+                      info.PeakUsage * PAGE])
+        if not info.NextEntryOffset:
+            break
+        off += info.NextEntryOffset
+    return files
+
+
+def breakdown(usable: int, avail: int, lists: dict | None, rm: dict | None, comp: int) -> dict:
+    """The RAM bar: what the memory in use holds, and the page lists, in bytes.
+
+    lists: MemoryCounters values (exact), or None. rm: a RamMap sample, whose
+    page-database sample splits the memory in use more finely, or None.
+    comp: bytes of RAM holding compressed pages.
+    Returns "lists" {free, modified, standby: [core, normal, reserve]} or None
+    (then only "available" is known), "uses" [[kind, bytes]] in the order
+    they're drawn, "kernel" [[USES index, bytes]] for other kernel memory,
+    and "pagedAll" (the paged pool, including what's in the page file).
+    """
+    out = {"lists": None, "uses": [], "kernel": [], "pagedAll": lists["pagedAll"] if lists else 0}
+    if lists:
+        free, modified = lists["free"], lists["modified"]
+        standby = [lists["core"], lists["normal"], lists["reserve"]]
+    elif rm:
+        st = rm["states"]
+        free, modified = int(st[0] * PAGE), int(st[2] * PAGE)
+        standby = [0, int(st[1] * PAGE), 0]   # the priorities aren't known
+    else:
+        free = modified = None
+        standby = []
+    if free is None:
+        inuse = max(0, usable - avail)
+    else:
+        inuse = max(0, usable - free - modified - sum(standby))
+        out["lists"] = {"free": free, "modified": modified, "standby": standby}
+
+    if rm and sum(rm["uses"]):
+        u = rm["uses"]
+        tot = sum(u)
+        share = {"proc": u[0] + u[9], "mapped": u[1], "shared": u[2], "paged": u[4], "nonpaged": u[5],
+                 "ptables": u[3], "kernel": sum(u[i] for i in KERNEL_USES)}
+        parts = {k: inuse * v / tot for k, v in share.items()}
+        kernel = [[i, inuse * u[i] / tot] for i in KERNEL_USES]
+        if lists:   # the counters are exact for the pools: use them, and share the rest as sampled
+            pools = min(inuse, lists["paged"] + lists["nonpaged"])
+            rest = sum(v for k, v in parts.items() if k not in ("paged", "nonpaged"))
+            scale = (inuse - pools) / rest if rest else 0
+            for k in parts:
+                parts[k] *= scale
+            kernel = [[i, b * scale] for i, b in kernel]
+            parts["paged"] = min(lists["paged"], inuse)
+            parts["nonpaged"] = pools - parts["paged"]
+        c = min(comp, parts["proc"])
+        parts["proc"] -= c
+        order = [("proc", parts["proc"]), ("comp", c), ("mapped", parts["mapped"]), ("shared", parts["shared"]),
+                 ("paged", parts["paged"]), ("nonpaged", parts["nonpaged"]), ("ptables", parts["ptables"]),
+                 ("kernel", parts["kernel"])]
+        out["kernel"] = [[i, int(b)] for i, b in kernel if b >= 1]
+    elif lists:
+        known = [("comp", comp), ("cache", lists["cache"]), ("paged", lists["paged"]),
+                 ("nonpaged", lists["nonpaged"]), ("drivers", lists["drivers"] + lists["code"])]
+        total = sum(b for _, b in known)
+        scale = min(1.0, inuse / total) if total else 0
+        known = [(k, b * scale) for k, b in known]
+        order = [("apps", inuse - sum(b for _, b in known))] + known
+    else:
+        order = [("apps", inuse)]
+    out["uses"] = [[k, int(b)] for k, b in order]
+    return out
+
+
+class CompressionStore:
+    """RAM holding compressed pages: the working set of the Memory Compression process.
+
+    Reading the Process counters takes several milliseconds, so this reads
+    them every few seconds; the store changes slowly.
+    """
+    EVERY = 2.0
+
+    def __init__(self) -> None:
+        self.counters = None
+        self.value = 0
+        self._next = 0.0
+
+    def sample(self, now: float) -> int:
+        if now >= self._next:
+            self._next = now + self.EVERY
+            try:
+                if self.counters is None:
+                    self.counters = Counters({"ws": r"\Process(Memory Compression)\Working Set"}, "process")
+                self.value = int(sum(self.counters.collect().get("ws", {}).values()))
+            except OSError:   # no compression store, or no counters: try again much later
+                self.value, self._next = 0, now + 60
+        return self.value
+
+
+# ---------------------------------------------------------------------------
 # Live and simulated sources
 # ---------------------------------------------------------------------------
 
@@ -513,19 +701,26 @@ class LiveSystem:
     def __init__(self, names) -> None:
         self.names = names
         self.parts = 1   # memory-map parts: samples a second
-        self.ram = self.gpu = None
-        self.ram_err = self.gpu_err = None
-        self._ram_retry = self._gpu_retry = 0.0
+        self.ram = self.gpu = self.memc = None
+        self.ram_err = self.gpu_err = self.memc_err = None
+        self._ram_retry = self._gpu_retry = self._memc_retry = 0.0
+        self._map_at = 0.0
+        self._files, self._files_at = [], 0.0
+        self.comp = CompressionStore()
         self.cpu = CpuMonitor()
 
-    def _ensure(self) -> None:
-        now = time.monotonic()
+    def _ensure(self, now: float) -> None:
         if self.ram is None and now >= self._ram_retry:
             try:
                 self.ram, self.ram_err = RamMap(), None
                 self.ram.set_parts(self.parts)
             except OSError as exc:
                 self.ram_err, self._ram_retry = str(exc), now + 60
+        if self.memc is None and now >= self._memc_retry:
+            try:
+                self.memc, self.memc_err = MemoryCounters(), None
+            except OSError as exc:
+                self.memc_err, self._memc_retry = str(exc), now + 60
         if self.gpu is None and now >= self._gpu_retry:
             try:
                 self.gpu, self.gpu_err = GpuMonitor(self.names), None
@@ -538,15 +733,35 @@ class LiveSystem:
             self.ram.set_parts(per_second)
 
     def sample(self, dt: float = 1.0) -> dict:
-        self._ensure()
+        now = time.monotonic()
+        self._ensure(now)
         installed, usable, avail = memory_status()
-        ram = {"installed": installed, "total": usable, "avail": avail, "cells": None, "err": self.ram_err}
-        if self.ram:
+        lists = rm = None
+        err = self.ram_err
+        if self.memc:
             try:
-                ram["cells"] = self.ram.sample()
+                lists = self.memc.sample()
+            except OSError:
+                lists = None
+        cells = False
+        if self.ram:
+            cells = now >= self._map_at   # the address map goes out a few times a second at most
+            try:
+                rm = self.ram.sample(cells)
             except OSError as exc:
-                ram["err"] = str(exc)
-        out = {"ram": ram, "commit": commit_status(), "cpu": self.cpu.sample(), "gpu": None, "gpuErr": self.gpu_err}
+                err, cells = str(exc), False
+            if cells:
+                self._map_at = now + MAP_EVERY
+        ram = {"installed": installed, "total": usable, "avail": avail, "err": err, "countersErr": self.memc_err}
+        ram.update(breakdown(usable, avail, lists, rm, self.comp.sample(now)))
+        if cells:
+            ram["map"] = {"slice": self.ram.slice, "cells": rm["cells"]}
+        commit = commit_status()
+        if commit:
+            if now >= self._files_at:
+                self._files, self._files_at = page_files(), now + 1.0
+            commit["files"] = self._files
+        out = {"ram": ram, "commit": commit, "cpu": self.cpu.sample(), "gpu": None, "gpuErr": self.gpu_err}
         if self.gpu:
             try:
                 out["gpu"] = self.gpu.sample()
@@ -558,13 +773,19 @@ class LiveSystem:
 class DemoSystem:
     """Plausible made-up numbers: 32 GB of RAM with the usual gap below 4 GB, a 24 GB GPU."""
 
+    SLICE = 128 << 20
+
     def __init__(self) -> None:
         self.rng = rng = random.Random()
         self.t0 = time.monotonic()
-        # RAM from 0 to 3.25 GB, then from 4 GB (the gap is where devices are mapped)
-        self.ram_frac = [1, 1, 1, 0.25] + [1] * 28 + [0.75]
-        self.level = [min(0.97, max(0.05, (0.9 if g < 3 else 0.55) + rng.uniform(-0.3, 0.3)))
-                      for g in range(len(self.ram_frac))]
+        # 128 MB slices of address space up to 32.75 GB. RAM from 0 to 3.25 GB,
+        # then from 4 GB: the gap is where devices are mapped.
+        per_gb = GB // self.SLICE
+        self.has_ram = [not (3.25 * per_gb <= s < 4 * per_gb) for s in range(int(32.75 * per_gb))]
+        self.level = [min(0.97, max(0.05, (0.9 if s < 3 * per_gb else 0.45) + rng.uniform(-0.3, 0.3)))
+                      for s in range(len(self.has_ram))]
+        self.mix = [0.50, 0.03, 0.20, 0.06, 0.06, 0.05, 0.02, 0.08]   # what the memory in use holds
+        self.map_at = 0.0
         self.vram_used = 7.5 * GB
         self.cpu = 15.0
         self.commit_extra = 6 * GB    # committed but not (yet) using RAM
@@ -576,19 +797,41 @@ class DemoSystem:
     def sample(self, dt: float = 1.0) -> dict:
         # Random walks step by sqrt(dt), so they wander as fast at any sample rate.
         rng, t, w = self.rng, time.monotonic() - self.t0, math.sqrt(max(0.01, min(1.0, dt)))
-        cells = []
-        for g, r in enumerate(self.ram_frac):
-            lvl = self.level[g] = min(0.98, max(0.03, self.level[g] + rng.gauss(0, 0.012) * w))
-            mod = min(1 - lvl, 0.02 + rng.random() * 0.02)
-            cached = (1 - lvl - mod) * (0.85 if g < 24 else 0.4)
-            free = max(0.0, 1 - lvl - mod - cached)
-            top = [[0, round(lvl * 0.6, 3)], [1, round(lvl * 0.25, 3)], [5, round(lvl * 0.1, 3)]]
-            if g < 2:
-                top = [[5, round(lvl * 0.45, 3)], [6, round(lvl * 0.3, 3)], [0, round(lvl * 0.2, 3)]]
-            cells.append({"r": r, "u": round(lvl, 3), "m": round(mod, 3), "c": round(cached, 3),
-                          "f": round(free, 3), "t": top})
-        total = int(31.8 * GB)
-        used = sum((c["u"] + c["m"]) * c["r"] for c in cells) * GB
+        per_gb = GB // self.SLICE
+        cells, inuse, modified, cached, free = [], 0.0, 0.0, 0.0, 0.0
+        for s, ram in enumerate(self.has_ram):
+            if not ram:
+                cells.append(None)
+                continue
+            lvl = self.level[s] = min(0.98, max(0.03, self.level[s] + rng.gauss(0, 0.012) * w))
+            mod = min(1 - lvl, 0.01 + rng.random() * 0.02)
+            cache = (1 - lvl - mod) * (0.85 if s < 24 * per_gb else 0.4)
+            fr = max(0.0, 1 - lvl - mod - cache)
+            top = [[5, 0.45], [6, 0.3], [0, 0.2]] if s < 2 * per_gb else [[0, 0.6], [1, 0.25], [2, 0.1]]
+            cell = [1000, round(lvl * 1000), round(mod * 1000), round(cache * 1000), round(fr * 1000)]
+            for i, f in top:
+                cell += (i, round(lvl * f * 1000))
+            cells.append(cell)
+            inuse, modified, cached, free = inuse + lvl, modified + mod, cached + cache, free + fr
+        usable = int(31.8 * GB)
+        k = usable / (inuse + modified + cached + free)          # slices -> bytes of usable RAM
+        inuse, modified, cached, free = inuse * k, modified * k, cached * k, free * k
+        for i in range(len(self.mix)):
+            self.mix[i] = max(0.005, self.mix[i] * (1 + rng.gauss(0, 0.01) * w))
+        mix = [m / sum(self.mix) for m in self.mix]
+        names = ("proc", "comp", "mapped", "shared", "paged", "nonpaged", "ptables", "kernel")
+        kernel = inuse * mix[7]
+        ram = {"installed": 32 * GB, "total": usable, "avail": int(cached + free), "err": None, "countersErr": None,
+               "lists": {"free": int(free), "modified": int(modified),
+                         "standby": [int(cached * 0.02), int(cached * 0.9), int(cached * 0.08)]},
+               "uses": [[n, int(inuse * f)] for n, f in zip(names, mix)],
+               "kernel": [[6, int(kernel * 0.35)], [7, int(kernel * 0.1)], [8, int(kernel * 0.2)],
+                          [10, int(kernel * 0.2)], [11, int(kernel * 0.15)]],
+               "pagedAll": int(inuse * mix[4] * 1.08)}
+        if time.monotonic() >= self.map_at:
+            self.map_at = time.monotonic() + MAP_EVERY
+            ram["map"] = {"slice": self.SLICE, "cells": cells}
+        used = inuse + modified
         self.vram_used = min(23 * GB, max(3 * GB, self.vram_used + rng.gauss(0, 0.15) * w * GB))
         burst = 0.5 + 0.5 * math.sin(t / 7)
         g3d = min(100.0, max(0.0, 30 + 55 * burst + rng.gauss(0, 6)))
@@ -597,9 +840,11 @@ class DemoSystem:
         self.commit_extra = min(14 * GB, max(2 * GB, self.commit_extra + rng.gauss(0, 0.25) * w * GB))
         committed = int(used * 0.8 + self.commit_extra)
         self.commit_peak = max(self.commit_peak, committed, int(26 * GB))
+        pagefile = 12 * GB
         return {
-            "ram": {"installed": 32 * GB, "total": total, "avail": int(max(0, total - used)), "cells": cells, "err": None},
-            "commit": {"used": committed, "limit": total + 12 * GB, "peak": self.commit_peak},
+            "ram": ram,
+            "commit": {"used": committed, "limit": usable + pagefile, "peak": self.commit_peak,
+                       "files": [["C:\\pagefile.sys", pagefile, int(0.6 * GB), int(1.4 * GB)]]},
             "cpu": round(self.cpu, 1),
             "gpu": {"name": "Simulated GPU", "vram": 24 * GB, "used": int(self.vram_used), "shared": int(0.4 * GB),
                     "engines": [["3D", round(g3d, 1)], ["Copy", round(max(0, rng.gauss(4, 2)), 1)],

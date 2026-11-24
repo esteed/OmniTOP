@@ -117,22 +117,14 @@
           <option value="1000" selected>1/s</option>
         </select>
       </label>
-      <button type="button" id="mctl-zoom" title="Back to the starting zoom and position">Reset view</button>
     </div>
   </header>
   <main>
     <div id="mstage" class="stage">
-      <canvas id="mcv" role="img" aria-label="Isometric grids with one bar per gigabyte: system memory by physical address, and GPU memory. Bar height is the share of that gigabyte in use."></canvas>
+      <canvas id="mcv" role="img" aria-label="System memory as one bar from 0 to the installed size, split into the kinds of memory in use, modified, standby, free and hardware reserved, each labelled with its size. Below it: in use, available, cached and committed totals, where in physical memory each kind sits, and GPU memory by process."></canvas>
       <div id="mtip" class="tip" hidden></div>
       <div id="mmsg" class="msg" hidden></div>
-      <div class="legend">
-        <span class="item">Share of each GB in use
-          <span class="muted">0%</span><span id="mswatches" class="swatches"></span><span class="muted">100%</span>
-        </span>
-        <span class="item"><span class="sw hole"></span>No RAM at that address</span>
-        <span class="item muted">GPU memory fills in order: Windows doesn't report where in it data is stored</span>
-        <span class="item muted">Scroll to zoom · drag to move · hover for details</span>
-      </div>
+      <div id="mlegend" class="legend"></div>
     </div>
     <aside>
       <h2>Utilization <span class="muted">· last 60 s</span></h2>
