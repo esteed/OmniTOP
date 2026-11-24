@@ -40,7 +40,7 @@ import sysmon
 
 # The app's version, shown in the tab bar. Raise it for each release; build.py
 # reads it from here and stamps it into the exe's file properties.
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 # In the packaged exe the web files are unpacked next to the bundled modules.
 HERE = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
@@ -808,6 +808,7 @@ def fmt_bits(bps: float) -> str:
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/index.html": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/dimm.js": ("dimm.js", "text/javascript; charset=utf-8"),
           "/memory.js": ("memory.js", "text/javascript; charset=utf-8"),
           "/perf.js": ("perf.js", "text/javascript; charset=utf-8"),
           "/watch.js": ("watch.js", "text/javascript; charset=utf-8"),
@@ -904,7 +905,8 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
             # preflight, which this server doesn't answer.
             # POST /api/perf {"interval": 250} or {"source": "utility"} does the
             # same for the CPU, disk & network tab, and POST /api/sys
-            # {"interval": 250} for the Memory & GPU tab.
+            # {"interval": 250} and/or {"address": n or null} (a physical
+            # address to look up) for the Memory & GPU tab.
             if not self._ours():
                 return
             path = self.path.split("?", 1)[0]
@@ -926,8 +928,13 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
                     rate.set(int(body["hz"]))
                     reply = {"tick": rate.seconds}
                 elif path == "/api/sys":
-                    system.set(int(body["interval"]))
-                    reply = {"interval": system.interval}
+                    if not isinstance(body, dict) or not ({"interval", "address"} & body.keys()):
+                        raise ValueError("nothing to set")
+                    if "interval" in body:
+                        system.set(int(body["interval"]))
+                    if "address" in body:
+                        system.set_address(body["address"])
+                    reply = {"interval": system.interval, "address": system.address}
                 else:
                     if not isinstance(body, dict) or not ({"interval", "source"} & body.keys()):
                         raise ValueError("nothing to set")

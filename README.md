@@ -91,16 +91,24 @@ assumed.
   owns (shared and system), memory not in use, and hardware reserved. Hover a
   program for its process count, working set and committed memory.
 - **Physical memory**: the memory slots as the firmware describes them, each module
-  drawn as a stick with its brand, size, type, speed, part number, rank and voltage,
-  empty slots dashed, grouped by channel. Fans run from each module to the
-  addresses it holds, and a striped band shows which module holds each address:
-  most systems interleave addresses across channels and modules, so each module
-  holds part of every range; where the firmware gives each module its own range,
-  that's drawn instead. Below that, the physical address bar shows what each
-  address holds, from byte 0 to the end of RAM: each column is a slice (64 MB or
-  more, at most 600 of them), split into in use, modified, standby and free, with
-  the part in use colored by what most of it holds. Gaps are addresses with no
-  RAM: devices such as the graphics card are mapped there, usually just below 4 GB.
+  drawn as the part it is, grouped by channel, with its brand, size, type, speed,
+  rank, voltage, part number and serial number made part of the picture: engraved
+  in a heat spreader, printed on a bare module's circuit board, or etched on
+  soldered chips. The firmware doesn't say what a module looks like, so the product
+  line in its part number picks the look. Empty slots are drawn as open sockets.
+  - **Addresses.** The physical address bar below shows what each address holds, from
+    0 to the end of RAM: each column is a slice (64 MB or more, at most 600 of them),
+    split into in use, modified, standby and free, with the part in use colored by
+    what most of it holds. These are real physical addresses, the ones a kernel
+    debugger or memory dump shows, with RAM starting and ending where Windows says
+    it does. Gaps have no RAM: devices such as the graphics card are mapped there,
+    usually just below 4 GB.
+  - **Hover the bar** for a column's address range, its page frame numbers, what it
+    holds and which parts of it are RAM. Click to copy the range's start address.
+  - **Address** at the top points out an address typed in hex, with or without `0x`,
+    as debuggers print them (``00000001`a2b3c000`` works), and says what its page
+    holds: the list it's on, what it's used for, its priority, and for process memory
+    the virtual address it's mapped at. **Esc** in the box clears it.
 - **GPU memory**: the graphics card's own memory as one bar, split by the apps using
   it, memory not owned by one app, and free.
 - Hover anything for details: what each kind of memory is, the standby priorities,
@@ -125,7 +133,7 @@ assumed.
 - The finer split of memory in use and the physical address map need
   administrator rights, which live mode already has. Without them, the bar splits
   memory in use into programs, compressed, file cache, the pools and drivers, and
-  the address map is left out.
+  the address bar shows where RAM is, without what each address holds.
 
 ## CPU, disk & network
 
@@ -274,15 +282,20 @@ GPU tab and sends the result on the same stream.
   slice its mix. Reading them all takes about 30 ms on a 128 GB machine. At faster
   rates it reads an interleaved part of them each time (a twentieth at 20 a
   second), so the whole set is read once a second at any rate. The address map
-  goes to the view at most 4 times a second.
+  goes to the view at most 4 times a second. The
+  Address box's page is one more entry from the same place.
+- **Physical addresses**: where RAM is comes from the same interface, or without
+  administrator rights from the resource map in the registry
+  (`HARDWARE\RESOURCEMAP\System Resources\Physical Memory`).
 - **Programs**: one `NtQuerySystemInformation` call (`SystemProcessInformation`) lists
   every process with its private working set, working set and commit, once a
   second; no rights needed.
 - **Memory modules**: from the firmware's SMBIOS tables (`GetSystemFirmwareTable`,
   no rights needed): memory arrays and their slots (type 16), each slot's module
-  (type 17), and where they sit in address space (types 19 and 20). The brand comes
+  (type 17), and where memory sits in address space (type 19). The brand comes
   from the part number when it's a known one, since the firmware often names the
-  DRAM maker or gives a JEDEC code instead.
+  DRAM maker or gives a JEDEC code instead. Serial numbers are shown as the firmware
+  gives them; they stay on this PC like everything else here.
 - **GPU**: its memory size comes from D3DKMT. Use and engine utilization come from
   the performance counters Task Manager reads (`GPU Engine`, `GPU Adapter Memory`,
   `GPU Process Memory`).

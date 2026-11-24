@@ -117,11 +117,14 @@
           <option value="1000" selected>1/s</option>
         </select>
       </label>
+      <label class="sel" title="Show a physical address, in hex, on the physical memory bar: 0x1A2B3C000 or 00000001`a2b3c000. Enter points it out and says what its page holds; Esc clears it.">Address
+        <input id="mctl-addr" type="text" spellcheck="false" autocomplete="off" placeholder="0x…" size="18">
+      </label>
     </div>
   </header>
   <main>
     <div id="mstage" class="stage">
-      <canvas id="mcv" role="img" aria-label="System memory as one bar from 0 to the installed size, split into the kinds of memory in use, modified, standby, free and hardware reserved, each labelled with its size. Below it: in use, available, cached and committed totals, where in physical memory each kind sits, and GPU memory by process."></canvas>
+      <canvas id="mcv" role="img" aria-label="System memory as one bar from 0 to the installed size, split into the kinds of memory in use, modified, standby, free and hardware reserved, each labelled with its size. Below it: in use, available, cached and committed totals, memory by program, the memory modules, what each physical address holds, and GPU memory by process."></canvas>
       <div id="mtip" class="tip" hidden></div>
       <div id="mmsg" class="msg" hidden></div>
       <div id="mlegend" class="legend"></div>
@@ -193,6 +196,7 @@
   </main>
 </section>
 <script src="/app.js"></script>
+<script src="/dimm.js"></script>
 <script src="/memory.js"></script>
 <script src="/perf.js"></script>
 <script src="/watch.js"></script>

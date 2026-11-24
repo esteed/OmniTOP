@@ -6,7 +6,8 @@
   space each kind sits, this also reads a sample of the memory manager's page
   database through the same undocumented interface Sysinternals RAMMap uses
   (NtQuerySystemInformation, SystemSuperfetchInformation), which needs
-  administrator rights.
+  administrator rights. Addresses are real physical addresses, so they match
+  what a kernel debugger or memory dump shows.
 - GPU: dedicated memory size (D3DKMT), and memory use and engine utilization
   from the performance counters Task Manager reads ("GPU Adapter Memory",
   "GPU Process Memory", "GPU Engine"). Windows doesn't report where in GPU
@@ -26,6 +27,7 @@ import struct
 import sys
 import threading
 import time
+import winreg
 from array import array
 from ctypes import wintypes
 
@@ -37,7 +39,7 @@ MIN_SLICE = 64 << 20         # the address map's slices: at least 64 MB,
 MAX_SLICES = 600             # ...doubled until there are at most this many
 MAP_EVERY = 0.25             # seconds between address maps (and in-use splits) sent to the view
 TOP_PROGRAMS = 30            # programs listed by memory use; the rest are added up
-DIMMS_EVERY = 2.0            # seconds between copies of the memory module list (it doesn't change)
+DIMMS_EVERY = 2.0            # seconds between copies of the memory modules and RAM ranges (they don't change)
 
 ULONG = wintypes.ULONG
 DWORD = wintypes.DWORD
@@ -121,6 +123,47 @@ def memory_status() -> tuple[int, int, int]:
     kb = ctypes.c_uint64()
     installed = kb.value * 1024 if _k32.GetPhysicallyInstalledSystemMemory(ctypes.byref(kb)) else ms.ullTotalPhys
     return installed or ms.ullTotalPhys, ms.ullTotalPhys, ms.ullAvailPhys
+
+
+def _merge(ranges) -> list[list[int]]:
+    """[[start, end]] sorted, with ranges that touch joined."""
+    out: list[list[int]] = []
+    for s, e in sorted(ranges):
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def parse_resource_list(data: bytes) -> list[list[int]]:
+    """The memory ranges, [[start, end]], in a REG_RESOURCE_LIST value (CM_RESOURCE_LIST)."""
+    ranges, off = [], 4
+    for _ in range(struct.unpack_from("<I", data, 0)[0] if len(data) >= 4 else 0):
+        if off + 16 > len(data):
+            break
+        count = struct.unpack_from("<I", data, off + 12)[0]   # after the interface type, bus, version and revision
+        off += 16
+        for _ in range(count):
+            if off + 20 > len(data):
+                break
+            typ, _share, flags, start, length = struct.unpack_from("<BBHQI", data, off)
+            if typ == 7:    # CmResourceTypeMemoryLarge: the length is scaled
+                length <<= 8 if flags & 0x200 else 16 if flags & 0x400 else 32 if flags & 0x800 else 0
+            if typ in (3, 7) and length:
+                ranges.append([start, start + length])
+            off += 20
+    return _merge(ranges)
+
+
+def physical_ranges() -> list[list[int]]:
+    """[[start, end]] of RAM in physical address space, as Windows reports it (no rights needed)."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"HARDWARE\RESOURCEMAP\System Resources\Physical Memory") as key:
+            return parse_resource_list(winreg.QueryValueEx(key, ".Translated")[0])
+    except (OSError, struct.error, TypeError):
+        return []
 
 
 class RamMap:
@@ -220,6 +263,34 @@ class RamMap:
         self._k = 0
         self.set_parts(1)
 
+    @staticmethod
+    def _request(pfns: array) -> tuple[int, bytes]:
+        """(size, contents) of the buffer that asks for these pages."""
+        n = len(pfns)
+        entries = array("Q", bytes(8 * 3 * n))
+        entries[1::3] = pfns
+        return (PFN_REQUEST_HEADER + PFN_ENTRY * n,
+                struct.pack("<IIQ", 1, 1, n) + bytes(PFN_REQUEST_HEADER - 16) + entries.tobytes())
+
+    def page(self, address: int) -> list | None:
+        """The page at a physical address, or None if it isn't RAM.
+
+        [MMPFNLIST_*, MMPFNUSE_*, priority, virtual address as hex or ""]: the
+        last is where it's mapped, for process memory.
+        """
+        pfn = address // PAGE
+        if not any(b <= pfn < b + n for b, n in self.ranges):
+            return None
+        size, template = self._request(array("Q", [pfn]))
+        buf = ctypes.create_string_buffer(template, size)
+        st, _ = self._query(SuperfetchPfnQuery, buf, size)
+        if st:
+            raise OSError(f"Couldn't read the memory map: {_nt_error(st)}")
+        v, _pfn, va = struct.unpack_from("<QQQ", buf.raw, PFN_REQUEST_HEADER)
+        use, lst = v & 15, (v >> 4) & 7
+        mapped = use == 0 and lst >= 6 and va >> 16
+        return [lst, use, (v >> 57) & 7, f"{va & ~0xFFF:X}" if mapped else ""]
+
     def set_parts(self, k: int) -> None:
         """Read the sampled pages in k interleaved parts, one part per sample.
 
@@ -235,14 +306,9 @@ class RamMap:
         self._parts = []
         for j in range(k):
             pfns, cells = self._pfns[j::k], self.cell_of[j::k]
-            n = len(pfns)
-            entries = array("Q", bytes(8 * 3 * n))
-            entries[1::3] = pfns
-            size = PFN_REQUEST_HEADER + PFN_ENTRY * n
-            self._parts.append({
-                "cells": cells, "size": size, "buf": ctypes.create_string_buffer(size),
-                "template": struct.pack("<IIQ", 1, 1, n) + bytes(PFN_REQUEST_HEADER - 16) + entries.tobytes(),
-                "b": None, "u": None})
+            size, template = self._request(pfns)
+            self._parts.append({"cells": cells, "size": size, "buf": ctypes.create_string_buffer(size),
+                                "template": template, "b": None, "u": None})
         self._tb = [0] * (5 * self.cells)    # totals over all parts: page list per slice
         self._tu = [0] * (16 * self.cells)   # and what in-use pages are used for
         self._next = 0
@@ -626,7 +692,7 @@ PART_BRANDS = [
     ("KHX", "Kingston HyperX"), ("KF", "Kingston FURY"), ("KVR", "Kingston"), ("KSM", "Kingston"),
     ("KCP", "Kingston"), ("ACR", "Kingston"), ("9905", "Kingston"),
     ("BLS", "Crucial Ballistix"), ("BLM", "Crucial Ballistix"), ("BLT", "Crucial Ballistix"),
-    ("BL", "Crucial Ballistix"), ("CT", "Crucial"), ("CP", "Crucial"), ("MTA", "Micron"), ("MTC", "Micron"),
+    ("BL", "Crucial Ballistix"), ("CT", "Crucial"), ("CP", "Crucial Pro"), ("MTA", "Micron"), ("MTC", "Micron"),
     ("M378", "Samsung"), ("M471", "Samsung"), ("M393", "Samsung"), ("M391", "Samsung"), ("M425", "Samsung"),
     ("M321", "Samsung"), ("M323", "Samsung"), ("HMA", "SK hynix"), ("HMT", "SK hynix"), ("HMC", "SK hynix"),
     ("TLZ", "TeamGroup"), ("TDZ", "TeamGroup"), ("TED", "TeamGroup"), ("TF", "TeamGroup"), ("FF", "TeamGroup"),
@@ -640,7 +706,7 @@ JEDEC = {"80CE": "Samsung", "CE00": "Samsung", "00CE": "Samsung", "80AD": "SK hy
          "859B": "Crucial", "9B85": "Crucial", "059B": "Crucial", "04EF": "TeamGroup", "EF04": "TeamGroup",
          "04CB": "ADATA", "CB04": "ADATA"}
 PLACEHOLDERS = re.compile(r"^(|0+|f+|unknown|undefined|not specified|none|no dimm|empty|to be filled by o\.e\.m\.|"
-                          r"manufacturer\s*\d*|partnum\s*\d*|modulepartnumber\s*\d*|sernum\s*\d*)$", re.I)
+                          r"manufacturer\s*\d*|partnum\s*\d*|modulepartnumber\s*\d*|n/a|sernum\s*\d*|serial\s*(number)?\s*\d*)$", re.I)
 
 
 def _firmware_smbios() -> bytes:
@@ -712,21 +778,20 @@ def _channel(bank: str, locator: str) -> str:
     return m.group(1).upper() if m else ""
 
 
-def memory_modules() -> dict | None:
+def memory_modules(tables: bytes | None = None) -> dict | None:
     """The memory slots and modules, as the firmware describes them.
 
     {"slots": slots for system memory, "max": largest supported (bytes) or
     None, "ecc": error correction in use, "arrays": [[start, end]] address
-    ranges holding RAM, "mapping": "ranges" (each module has its own address
-    range), "interleaved" (they share ranges) or "unknown" (not reported),
-    "modules": [{locator, bank, channel, socket, size (bytes; 0 = empty slot,
-    None = unknown), type, form, speed, configured (MT/s), brand, maker, part,
-    rank, volts (mV), width (data bits), ecc, ranges: [[start, end]]}]} in
-    the firmware's (slot) order, or None without SMBIOS memory information.
+    ranges holding RAM, "modules": [{locator, bank, channel, socket, size
+    (bytes; 0 = empty slot, None = unknown), type, form, speed, configured
+    (MT/s), brand, maker, part, serial, rank, volts (mV), width (data bits),
+    ecc}]} in the firmware's (slot) order, or None without SMBIOS memory
+    information.
     """
-    arrays, modules, maps = {}, [], {}
+    arrays, modules = {}, []
     ranges = []
-    for typ, handle, f, strs in _smbios_structures(_firmware_smbios()):
+    for typ, handle, f, strs in _smbios_structures(_firmware_smbios() if tables is None else tables):
         s = lambda i: strs[i - 1] if i and i <= len(strs) else ""   # noqa: E731 - string fields are 1-based
         if typ == 16:   # physical memory array
             use, ecc = _field(f, 0x05, "B"), _field(f, 0x06, "B")
@@ -758,13 +823,14 @@ def memory_modules() -> dict | None:
             rank = _field(f, 0x1B, "B")
             sock = re.search(r"\b(?:P|CPU|SOCKET|NODE)\s*[-_]?(\d)", f"{bank} {locator}", re.I)
             modules.append({
-                "handle": handle, "array": _field(f, 0x04, "<H"),
+                "array": _field(f, 0x04, "<H"),
                 "locator": locator, "bank": bank, "channel": _channel(bank, locator),
                 "socket": sock.group(1) if sock else "", "size": size,
                 "type": MEMORY_TYPES.get(_field(f, 0x12, "B"), ""),
                 "form": FORM_FACTORS.get(_field(f, 0x0E, "B"), ""),
                 "speed": speed or 0, "configured": configured or 0,
                 "brand": module_brand(maker, part), "maker": maker, "part": part,
+                "serial": _clean(s(_field(f, 0x18, "B"))),
                 "rank": (rank & 0x0F) if rank else 0, "volts": _field(f, 0x26, "<H") or 0,
                 "width": data_w if data_w not in (None, 0xFFFF) else 0,
                 "ecc": bool(total_w and data_w and total_w not in (0xFFFF,) and total_w > data_w)})
@@ -776,35 +842,17 @@ def memory_modules() -> dict | None:
                     ranges.append([_field(f, 0x0C, "<H"), start, end + 1])
             elif start is not None and end is not None:
                 ranges.append([_field(f, 0x0C, "<H"), start * 1024, (end + 1) * 1024])
-        elif typ == 20:   # where a device's memory sits
-            start, end = _field(f, 0x04, "<I"), _field(f, 0x08, "<I")
-            if start == 0xFFFFFFFF:
-                start, end = _field(f, 0x13, "<Q"), _field(f, 0x1B, "<Q")
-                span = [start, end + 1] if start is not None and end is not None else None
-            else:
-                span = [start * 1024, (end + 1) * 1024] if start is not None and end is not None else None
-            dev = _field(f, 0x0C, "<H")
-            if span and span[1] > span[0]:
-                maps.setdefault(dev, []).append(span)
     system = {h for h, a in arrays.items() if a["system"]}
     if system:
         modules = [m for m in modules if m["array"] in system]
     if not modules:
         return None
     for m in modules:
-        m["ranges"] = maps.get(m.pop("handle"), [])
         m.pop("array")
-    filled = [m for m in modules if m["size"]]
-    if filled and all(m["ranges"] for m in filled):
-        spans = [r for m in filled for r in m["ranges"]]
-        shared = any(a[0] < b[1] and b[0] < a[1] for i, a in enumerate(spans) for b in spans[i + 1:])
-        mapping = "interleaved" if shared else "ranges"
-    else:
-        mapping = "unknown"
     slots = sum(arrays[h]["slots"] for h in system) if system else 0
     caps = [arrays[h]["max"] for h in system if arrays[h]["max"]]
     return {"slots": max(slots, len(modules)), "max": sum(caps) if caps else None,
-            "ecc": any(arrays[h]["ecc"] for h in system), "mapping": mapping,
+            "ecc": any(arrays[h]["ecc"] for h in system),
             "arrays": sorted([s, e] for a, s, e in ranges if not system or a in system),
             "modules": modules}
 
@@ -985,6 +1033,7 @@ class LiveSystem:
         self.ram_err = self.gpu_err = self.memc_err = None
         self._ram_retry = self._gpu_retry = self._memc_retry = 0.0
         self._map_at = self._dimms_at = 0.0
+        self.address = self._looked = None   # the address to look up, and the one looked up last
         self._files, self._files_at = [], 0.0
         self.comp = CompressionStore()
         self.progs = Programs()
@@ -992,7 +1041,11 @@ class LiveSystem:
             self.dimms = memory_modules()
         except Exception:  # noqa: BLE001 - odd firmware tables just mean no module view
             self.dimms = None
+        self.phys = physical_ranges()
         self.cpu = CpuMonitor()
+
+    def set_address(self, address: int | None) -> None:
+        self.address = address
 
     def _ensure(self, now: float) -> None:
         if self.ram is None and now >= self._ram_retry:
@@ -1028,11 +1081,14 @@ class LiveSystem:
                 lists = self.memc.sample()
             except OSError:
                 lists = None
-        detail = False
+        detail, page, address = False, None, self.address
         if self.ram:
             detail = now >= self._map_at   # the address map goes out a few times a second at most
             try:
                 rm = self.ram.sample(detail)
+                if address is not None and (detail or address != self._looked):   # a new one goes out at once
+                    page = {"address": address, "info": self.ram.page(address)}
+                self._looked = address
             except OSError as exc:
                 err, detail = str(exc), False
             if detail:
@@ -1041,9 +1097,14 @@ class LiveSystem:
         ram.update(breakdown(usable, avail, lists, rm, self.comp.sample(now)))
         if detail and rm["cells"] is not None:
             ram["map"] = {"slice": self.ram.slice, "cells": rm["cells"]}
+        if page:
+            ram["page"] = page
         ram["progs"] = self.progs.sample(now)
-        if self.dimms and now >= self._dimms_at:
-            ram["dimms"], self._dimms_at = self.dimms, now + DIMMS_EVERY
+        if now >= self._dimms_at:
+            self._dimms_at = now + DIMMS_EVERY
+            if self.dimms:
+                ram["dimms"] = self.dimms
+            ram["phys"] = _merge([b * PAGE, (b + n) * PAGE] for b, n in self.ram.ranges) if self.ram else self.phys
         commit = commit_status()
         if commit:
             if now >= self._files_at:
@@ -1069,21 +1130,22 @@ DEMO_PROGRAMS = [   # name, share of process memory to start from, processes
     ("Memory Compression", 0, 1)]
 
 
-def _demo_module(locator: str, channel: str, size: int) -> dict:
+def _demo_module(locator: str, channel: str, size: int, serial: str = "") -> dict:
     filled = {"type": "DDR5", "form": "DIMM", "speed": 6000, "configured": 6000, "brand": "G.Skill",
-              "maker": "G.Skill", "part": "F5-6000J3038F16G", "rank": 1, "volts": 1350, "width": 64,
-              "ranges": [[0, 32 * GB]]} if size else {
+              "maker": "G.Skill", "part": "F5-6000J3038F16G", "serial": serial, "rank": 1, "volts": 1350,
+              "width": 64} if size else {
               "type": "", "form": "DIMM", "speed": 0, "configured": 0, "brand": "", "maker": "", "part": "",
-              "rank": 0, "volts": 0, "width": 0, "ranges": []}
+              "serial": "", "rank": 0, "volts": 0, "width": 0}
     return {"locator": locator, "bank": f"CHANNEL {channel}", "channel": channel, "socket": "", "size": size,
             "ecc": False, **filled}
 
 
 # Two 16 GB modules in the second slot of each channel, the first slots empty
-DEMO_DIMMS = {"slots": 4, "max": 192 * GB, "ecc": False, "mapping": "interleaved",
+DEMO_DIMMS = {"slots": 4, "max": 192 * GB, "ecc": False,
               "arrays": [[0, int(3.25 * GB)], [4 * GB, int(32.75 * GB)]],
-              "modules": [_demo_module("DIMM 0", "A", 0), _demo_module("DIMM 1", "A", 16 * GB),
-                          _demo_module("DIMM 0", "B", 0), _demo_module("DIMM 1", "B", 16 * GB)]}
+              "modules": [_demo_module("DIMM 0", "A", 0), _demo_module("DIMM 1", "A", 16 * GB, "0D3A51C7"),
+                          _demo_module("DIMM 0", "B", 0), _demo_module("DIMM 1", "B", 16 * GB, "0D3A51C8")]}
+DEMO_PHYS = [[0x1000, 0xA0000], [0x100000, int(3.25 * GB)], [4 * GB, int(32.75 * GB)]]
 
 
 class DemoSystem:
@@ -1104,6 +1166,7 @@ class DemoSystem:
         self.slice_level = [min(0.97, max(0.05, (0.9 if s < 3 * per_gb else 0.45) + rng.uniform(-0.3, 0.3)))
                             for s in range(len(self.has_ram))]
         self.map_at = self.dimms_at = 0.0
+        self.address = self.looked = None
         self.vram_used = 7.5 * GB
         self.cpu = 15.0
         self.commit_extra = 6 * GB    # committed but not (yet) using RAM
@@ -1111,6 +1174,19 @@ class DemoSystem:
 
     def set_rate(self, per_second: int) -> None:
         pass
+
+    def set_address(self, address: int | None) -> None:
+        self.address = address
+
+    def _page(self) -> dict:
+        """A made-up page like RamMap.page's, the same each time for the same address."""
+        page = self.address // PAGE
+        if not any(s <= page * PAGE < e for s, e in DEMO_PHYS):
+            return {"address": self.address, "info": None}
+        rnd = random.Random(page)
+        lst, use = rnd.choice((6, 6, 2, 2, 3, 1)), rnd.choice((0, 0, 0, 1, 2, 5))
+        va = f"{0x7FF600000000 + page * PAGE % (64 << 20):X}" if use == 0 and lst == 6 else ""
+        return {"address": self.address, "info": [lst, use, 5 if lst != 1 else 0, va]}
 
     def _cells(self, w: float) -> list:
         """The address map, like RamMap.sample's cells."""
@@ -1163,11 +1239,15 @@ class DemoSystem:
                         "other": [int(sum(r[1] for r in rest)), sum(r[2] for r in rest), len(rest)],
                         "total": int(sum(r[1] for r in rows))}
         now = time.monotonic()
-        if now >= self.map_at:
+        detail = now >= self.map_at
+        if self.address is not None and (detail or self.address != self.looked):
+            ram["page"] = self._page()
+        self.looked = self.address
+        if detail:
             self.map_at = now + MAP_EVERY
             ram["map"] = {"slice": self.SLICE, "cells": self._cells(w)}
         if now >= self.dimms_at:
-            ram["dimms"], self.dimms_at = DEMO_DIMMS, now + DIMMS_EVERY
+            ram["dimms"], ram["phys"], self.dimms_at = DEMO_DIMMS, DEMO_PHYS, now + DIMMS_EVERY
         used = inuse + modified
         self.vram_used = min(23 * GB, max(3 * GB, self.vram_used + rng.gauss(0, 0.15) * w * GB))
         burst = 0.5 + 0.5 * math.sin(t / 7)
@@ -1210,8 +1290,9 @@ class SystemMonitor:
     def __init__(self, hub, mode: str, names) -> None:
         self.hub, self.mode, self.names = hub, mode, names
         self.interval = 1000
+        self.address = None
         self._stop = threading.Event()
-        self._wake = threading.Event()   # set when the interval changes
+        self._wake = threading.Event()   # set when the interval or address changes
         self._source = None
 
     def start(self) -> None:
@@ -1228,6 +1309,16 @@ class SystemMonitor:
             self.interval = interval
             self._wake.set()
 
+    def set_address(self, address) -> None:
+        """Say what the page at a physical address holds, or stop (None)."""
+        if address is not None:
+            address = int(address)
+            if not 0 <= address < 1 << 52:
+                raise ValueError("bad address")
+        if address != self.address:
+            self.address = address
+            self._wake.set()   # the view is waiting: sample now
+
     def _run(self) -> None:
         try:
             source = DemoSystem() if self.mode == "demo" else LiveSystem(self.names)
@@ -1241,6 +1332,8 @@ class SystemMonitor:
             if source and iv != applied:
                 source.set_rate(round(1000 / iv))
                 applied = iv
+            if source:
+                source.set_address(self.address)
             now = time.monotonic()
             dt, last = now - last, now
             if self.hub.viewers():

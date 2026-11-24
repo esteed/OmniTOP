@@ -2,10 +2,11 @@
 
 // ---------------------------------------------------------------------------
 // Memory & GPU tab: all of RAM as one bar from 0 to the installed size, split
-// by what each part holds and labelled on leader lines; where in physical
-// memory each kind sits; GPU memory by process; and charts of utilization
-// and committed memory. Uses the theme and helpers from app.js
-// (T, oklch, rgb, esc, $, loadPref, savePref, activeTab, darkQuery).
+// by what each part holds and labelled on leader lines; memory by program;
+// the memory modules, and what each physical address holds; GPU memory by
+// process; and charts of utilization and committed memory. Uses the theme and
+// helpers from app.js (T, oklch, rgb, rgba, esc, $, loadPref, savePref,
+// activeTab, darkQuery) and the module pictures from dimm.js.
 // ---------------------------------------------------------------------------
 const GiB = 1073741824, MiB = 1048576;
 const HISTORY_S = 60;                              // seconds of samples kept for the charts
@@ -74,6 +75,11 @@ const mem = {
   segs: [], psegs: [], gsegs: [],   // RAM, programs and GPU bars: [{ key, bytes, shown }], left to right
   map: null,             // latest address map: { slice, cells }
   dimms: null,           // memory slots and modules, from the firmware
+  phys: null,            // where RAM is: [[start, end]] physical addresses
+  space: null,           // the address space drawn: { ranges, end }
+  pin: null,             // an address to point out
+  page: null,            // what that address's page holds: { address, info }
+  copied: null,          // the address copied last, for a moment
   hist: [],              // [{ t, g3d, cpu, commit, ram }] for the last HISTORY_S seconds, oldest first
   interval: 1000,        // ms between samples, as the server reports it
   restored: false,       // the rate chosen last time has been put back
@@ -155,14 +161,17 @@ function onSys(m) {
   mem.last = m;
   syncRate(m.iv);
   const ram = m.ram, gpu = m.gpu;
-  const shape = () => [!!mem.map, !!mem.dimms, mem.dimms ? mem.dimms.modules.length : 0, mem.psegs.length > 0,
-    mem.gsegs.length > 0].join();
+  const shape = () => [!!mem.map, !!mem.phys, !!mem.dimms, mem.dimms ? mem.dimms.modules.length : 0,
+    mem.psegs.length > 0, mem.gsegs.length > 0].join();
   const before = shape();
-  if (!ram) mem.map = mem.dimms = null;
+  if (!ram) mem.map = mem.dimms = mem.phys = mem.space = null;
   else {
     if (ram.map) mem.map = ram.map;   // a few times a second; samples between keep the last
     else if (ram.err) mem.map = null;
-    if (ram.dimms) mem.dimms = ram.dimms;   // every few seconds: it doesn't change
+    if (ram.dimms) mem.dimms = ram.dimms;   // every few seconds: these don't change
+    if (ram.phys) mem.phys = ram.phys;
+    if (ram.page && ram.page.address === mem.pin) mem.page = ram.page;   // not another window's
+    if (ram.dimms || ram.phys || ram.map && !mem.phys) mem.space = physSpace();
   }
   mem.segs = ram && ram.uses ? retarget(mem.segs, ramParts(ram)) : [];
   mem.psegs = ram && ram.uses && ram.progs ? retarget(mem.psegs, progParts(ram, ram.progs)) : [];
@@ -242,8 +251,8 @@ document.addEventListener('keydown', ev => {
 // modules and physical addresses, GPU memory. The tab scrolls when it's
 // taller than the window.
 // ---------------------------------------------------------------------------
-const MSTRIP_H = 24, DIMM_H = 88, DIMM_MIN_W = 120, DIMM_MAX_W = 260, DIMM_GAP = 12, CHAN_GAP = 26;
-const CHAN_H = 20, FAN_H = 56, BAND_H = 7, NOTE_H = 20;
+const MSTRIP_H = 26, DIMM_MIN_W = 120, DIMM_MAX_W = 330, DIMM_GAP = 12, CHAN_GAP = 26;
+const CHAN_H = 20, STRIP_GAP = 28, PAXIS_H = 38, NOTE_H = 20;
 const slotGroup = m => `${m.socket}|${m.channel}`;
 
 // Sticks in slot order, in as few rows as keep each at least DIMM_MIN_W wide,
@@ -253,19 +262,20 @@ function layoutSticks(mods, top) {
   const widthFor = row => (ML.w - gapsIn(row)) / row.length;
   let perRow = mods.length;
   while (perRow > 1 && widthFor(mods.slice(0, perRow)) < DIMM_MIN_W) perRow--;
+  perRow = Math.ceil(mods.length / Math.ceil(mods.length / perRow));   // rows of about the same length
   const items = [];
   let y = top;
   for (let k = 0; k < mods.length; k += perRow) {
     const row = mods.slice(k, k + perRow);
-    const w = Math.min(DIMM_MAX_W, widthFor(row));
+    const w = Math.floor(Math.min(DIMM_MAX_W, widthFor(mods.slice(0, perRow)), widthFor(row)));
     let x = ML.x0 + (ML.w - (w * row.length + gapsIn(row))) / 2;
     y += CHAN_H;
     row.forEach((m, j) => {
       if (j) x += slotGroup(m) !== slotGroup(row[j - 1]) ? CHAN_GAP : DIMM_GAP;
-      items.push({ x, y, w, h: DIMM_H, m, i: k + j, row: k });
+      items.push({ x, y, w, h: STICK_H, m, i: k + j, row: k });
       x += w;
     });
-    y += DIMM_H + 8;
+    y += STICK_H + 8;
   }
   return { items, bottom: y - 8 };
 }
@@ -295,18 +305,17 @@ function mlayout() {
   }
 
   ML.phys = null;
-  if (mem.map || mem.dimms) {
+  if (mem.space) {
     y += MSECTION_GAP;
     const p = { headY: y + 9 };
     y += MHEAD_H;
     if (mem.dimms && mem.dimms.modules.length) {
       p.sticks = layoutSticks(mem.dimms.modules, y);
-      y = p.sticks.bottom + FAN_H;
-    }
-    p.band = { y, h: BAND_H };
-    p.strip = { y: y + BAND_H + 3, h: MSTRIP_H };
+      y = p.sticks.bottom + STRIP_GAP;
+    } else y += 14;   // room for an address pointed out
+    p.strip = { y, h: MSTRIP_H };
     p.axisY = p.strip.y + MSTRIP_H + 4;
-    p.noteY = p.axisY + MAXIS_H + 4;
+    p.noteY = p.axisY + PAXIS_H + 4;
     ML.phys = p;
     y = p.noteY + NOTE_H - 10;
   }
@@ -333,16 +342,16 @@ function mlayout() {
 // ---------------------------------------------------------------------------
 // Drawing helpers
 // ---------------------------------------------------------------------------
-function mtext(str, x, y, size, color, align = 'left', weight = 400) {
-  mctx.font = `${weight} ${size}px ${T.font}`;
+function mtext(str, x, y, size, color, align = 'left', weight = 400, font = T.font) {
+  mctx.font = `${weight} ${size}px ${font}`;
   mctx.textAlign = align;
   mctx.textBaseline = 'middle';
   mctx.fillStyle = color;
   mctx.fillText(str, x, y);
   return mctx.measureText(str).width;
 }
-function mwidth(str, size, weight = 400) {
-  mctx.font = `${weight} ${size}px ${T.font}`;
+function mwidth(str, size, weight = 400, font = T.font) {
+  mctx.font = `${weight} ${size}px ${font}`;
   return mctx.measureText(str).width;
 }
 
@@ -667,14 +676,16 @@ function drawProgs() {
 }
 
 // ---------------------------------------------------------------------------
-// Physical memory: the modules in their slots, which addresses each holds,
-// and what each address holds
+// Physical memory: the modules in their slots, and what each address holds.
+// Addresses are real physical addresses: RAM starts and ends where Windows
+// says it does, holes included.
 // ---------------------------------------------------------------------------
+const PAGE_SIZE = 4096;
 // What the page database says pages in use hold -> the RAM bar's kinds
 const USE_KIND = ['proc', 'mapped', 'shared', 'ptables', 'paged', 'nonpaged', 'kernel', 'kernel', 'kernel',
   'proc', 'kernel', 'kernel'];
+const PAGE_LISTS = ['Free, zeroed', 'Free', 'Standby', 'Modified', 'Modified, not to be written', 'Bad', 'In use', 'In use, being moved'];
 const RANKS = { 1: 'Single rank', 2: 'Dual rank', 4: 'Quad rank', 8: 'Octal rank' };
-const SHARES = { 2: 'half', 3: 'a third', 4: 'a quarter', 6: 'a sixth', 8: 'an eighth' };
 // Colors for the modules, one hue per channel, two tones for the slots in it
 const CHAN_PAL = {
   light: [[0.58, 0.11, 200], [0.55, 0.15, 295], [0.66, 0.15, 55], [0.60, 0.12, 120], [0.58, 0.15, 10], [0.62, 0.11, 240]],
@@ -686,130 +697,53 @@ function slotName(m, i) {
   return parts.filter(Boolean).join(' · ') || `Slot ${i + 1}`;
 }
 
-// The end of the address range drawn, and where RAM sits in it.
+// Where RAM is in physical address space: [start, end) ranges, and the end of the last.
 function physSpace() {
-  const map = mem.map, d = mem.dimms;
-  if (map) {
-    const ranges = [];
-    map.cells.forEach((c, i) => {
-      if (!c) return;
-      const last = ranges[ranges.length - 1];
-      if (last && last[1] === i * map.slice) last[1] = (i + 1) * map.slice;
-      else ranges.push([i * map.slice, (i + 1) * map.slice]);
-    });
-    return { end: map.cells.length * map.slice, ranges };
+  let ranges = mem.phys;
+  if (!ranges || !ranges.length) {
+    const map = mem.map, d = mem.dimms;
+    ranges = [];
+    if (map) {
+      map.cells.forEach((c, i) => {
+        if (!c) return;
+        const last = ranges[ranges.length - 1];
+        if (last && last[1] === i * map.slice) last[1] = (i + 1) * map.slice;
+        else ranges.push([i * map.slice, (i + 1) * map.slice]);
+      });
+    } else if (d && d.arrays.length) ranges = d.arrays;
+    if (!ranges.length) ranges = [[0, mem.last.ram.installed]];
   }
-  if (d && d.arrays.length) return { end: Math.max(...d.arrays.map(a => a[1])), ranges: d.arrays };
-  const end = mem.last.ram.installed;
-  return { end, ranges: [[0, end]] };
+  return { ranges, end: ranges[ranges.length - 1][1] };
 }
 
-// Each filled module's color, and the order addresses go round them when
-// interleaved: the first slot of each channel, then the second...
+const addrX = a => ML.x0 + ML.w * a / mem.space.end;
+
+// Each filled module's color: a hue per channel, two tones for the slots in it.
 function moduleColors(items) {
   const filled = items.filter(it => it.m.size);
   const groups = [...new Set(filled.map(it => slotGroup(it.m)))];
   const pal = CHAN_PAL[darkQuery.matches ? 'dark' : 'light'];
-  const nth = new Map();
-  const colors = new Map();
+  const nth = new Map(), colors = new Map();
   for (const it of filled) {
     const g = groups.indexOf(slotGroup(it.m)), k = nth.get(g) || 0;
     nth.set(g, k + 1);
     const [L, C, h] = pal[g % pal.length];
-    colors.set(it.i, { rgb: oklch(k % 2 ? Math.min(0.9, L + 0.12) : L, C, h), k, g });
+    colors.set(it.i, oklch(k % 2 ? Math.min(0.9, L + 0.12) : L, C, h));
   }
-  const order = [...filled].sort((a, b) => colors.get(a.i).k - colors.get(b.i).k || colors.get(a.i).g - colors.get(b.i).g);
-  return { colors, order };
+  return colors;
 }
 
-function fitText(str, maxW, size, weight = 400, font = T.font) {
-  mctx.font = `${weight} ${size}px ${font}`;
-  if (mctx.measureText(str).width <= maxW) return str;
-  while (str.length > 1 && mctx.measureText(str + '…').width > maxW) str = str.slice(0, -1);
-  return str + '…';
+function hexAddr(a) {   // wide enough for the highest address, so they line up
+  const digits = Math.max(8, Math.ceil(Math.log2(mem.space.end + 1) / 4));
+  return '0x' + Math.max(0, Math.floor(a)).toString(16).toUpperCase().padStart(digits, '0');
 }
+const hexRange = (s, e) => `${hexAddr(s)} – ${hexAddr(e - 1)}`;   // both ends included, as debuggers show ranges
+const hexPage = a => '0x' + Math.floor(a / PAGE_SIZE).toString(16).toUpperCase();
 
-function stickText(str, x, y, maxW, size, color, weight = 400, font = T.font, align = 'left') {
-  const s = fitText(str, maxW, size, weight, font);
-  mctx.font = `${weight} ${size}px ${font}`;
-  mctx.textAlign = align;
-  mctx.textBaseline = 'middle';
-  mctx.fillStyle = color;
-  mctx.fillText(s, x, y);
-  return mctx.measureText(s).width;
-}
-
-// A memory module: circuit board, chips, gold contacts with the key notch,
-// and a label with what the firmware says about it.
-function drawStick(it, color, hot) {
-  const { x, y, w, h, m } = it;
-  hit(x, y, x + w, y + h, { kind: 'dimm', key: it.i });
-  if (!m.size) {
-    mctx.setLineDash([4, 3]);
-    mctx.strokeStyle = hot ? T.hl : T.muted;
-    mctx.lineWidth = hot ? 2 : 1;
-    mctx.beginPath();
-    mctx.roundRect(x + 0.5, y + 0.5, w - 1, h - 1, 5);
-    mctx.stroke();
-    mctx.setLineDash([]);
-    mtext(m.size === 0 ? 'Empty slot' : 'Size not reported', x + w / 2, y + h / 2 - 8, 12, T.muted, 'center', 600);
-    stickText(slotName(m, it.i), x + w / 2, y + h / 2 + 9, w - 12, 11, T.muted, 400, T.font, 'center');
-    return;
-  }
-  const pins = 11, board = '#1f4a35';
-  mctx.fillStyle = board;
-  mctx.beginPath();
-  mctx.roundRect(x, y, w, h, [4, 4, 2, 2]);
-  mctx.fill();
-  mctx.fillStyle = T.bg;   // the latch notches at each end
-  for (const cx of [x, x + w]) {
-    mctx.beginPath();
-    mctx.arc(cx, y + h * 0.58, 3.5, 0, Math.PI * 2);
-    mctx.fill();
-  }
-  const chips = w >= 200 ? 8 : w >= 150 ? 6 : 4, cw = (w - 16) / chips;
-  mctx.fillStyle = '#131414';
-  for (let k = 0; k < chips; k++) mctx.fillRect(x + 8 + k * cw + 2, y + 9, cw - 4, h - pins - 18);
-  mctx.fillStyle = '#d8b450';   // contacts
-  for (let cx = x + 5; cx < x + w - 6; cx += 3.2) mctx.fillRect(cx, y + h - pins + 2, 1.7, pins - 3);
-  const notch = m.type === 'DDR5' ? 0.5 : m.type === 'DDR4' ? 0.47 : m.type === 'DDR3' ? 0.43 : 0.45;
-  mctx.fillStyle = T.bg;
-  mctx.fillRect(x + w * notch - 3, y + h - pins + 1, 6, pins);
-  // The label
-  const compact = w < 170;
-  const sx = x + (compact ? 6 : w * 0.1), sw = w - 2 * (sx - x), sy = y + 6, sh = h - pins - 11;
-  mctx.save();
-  mctx.beginPath();
-  mctx.roundRect(sx, sy, sw, sh, 3);
-  mctx.clip();
-  mctx.fillStyle = '#eeece6';
-  mctx.fillRect(sx, sy, sw, sh);
-  mctx.fillStyle = rgb(color);
-  mctx.fillRect(sx, sy, 5, sh);
-  mctx.restore();
-  const tx = sx + 11, tw = sw - 16;
-  const brand = m.brand || 'Unknown brand';
-  const spec = [fmtModule(m.size), m.type, m.configured || m.speed ? `${m.configured || m.speed} MT/s` : ''].filter(Boolean).join(' · ');
-  const more = [RANKS[m.rank] || '', m.volts ? `${(m.volts / 1000).toFixed(2)} V` : '', m.ecc ? 'ECC' : ''].filter(Boolean).join(' · ');
-  const lw = mwidth(m.locator, 10);
-  const bw = stickText(brand, tx, sy + 11, tw - (compact ? 0 : lw + 8), 13, '#1b1b1a', 700);
-  if (!compact && m.locator && tx + bw + 8 + lw <= sx + sw - 5) {
-    mtext(m.locator, sx + sw - 5, sy + 11, 10, '#6d6c66', 'right');
-  }
-  stickText(spec, tx, sy + 25, tw, 11, '#2a2a28', 600);
-  if (sh >= 46) stickText(m.part || 'No part number', tx, sy + 38, tw, 10.5, '#4b4a46', 400, UC.mono || 'monospace');
-  if (sh >= 58 && more) stickText(more, tx, sy + 51, tw, 10, '#6d6c66');
-  if (hot) {
-    mctx.strokeStyle = T.hl;
-    mctx.lineWidth = 2;
-    mctx.beginPath();
-    mctx.roundRect(x - 2, y - 2, w + 4, h + 4, 5);
-    mctx.stroke();
-  }
-}
-
-function physSummary(d, end) {
-  if (!d) return `by physical address, from byte 0 to ${fmtGB(end)} GB`;
+function physSummary(d) {
+  const { end } = mem.space;
+  const to = `${hexAddr(0)} to ${hexAddr(end - 1)}`;
+  if (!d) return `by physical address, ${to}`;
   const filled = d.modules.filter(m => m.size);
   const sizes = filled.map(m => m.size);
   const same = sizes.length && sizes.every(s => s === sizes[0]);
@@ -817,127 +751,148 @@ function physSummary(d, end) {
   const what = filled.length
     ? `${same ? `${filled.length} × ${fmtModule(sizes[0])}` : sizes.map(fmtModule).join(' + ')}${types.length === 1 ? ` ${types[0]}` : ''}`
     : 'No modules reported';
-  const how = filled.length < 2 ? ''
-    : d.mapping === 'interleaved' ? `interleaved, so each module holds ${same && SHARES[filled.length] || 'part'} of every address range`
-    : d.mapping === 'ranges' ? 'each module holds its own address range'
-    : "the firmware doesn't say which addresses each module holds";
-  return [what, `${filled.length} of ${d.slots} slots`, how].filter(Boolean).join(' · ');
+  return [what, `${filled.length} of ${d.slots} slots`, to].join(' · ');
+}
+
+function fitText(str, maxW, size, weight = 400, font = T.font) {
+  if (mwidth(str, size, weight, font) <= maxW) return str;
+  while (str.length > 1 && mctx.measureText(str + '…').width > maxW) str = str.slice(0, -1);
+  return str + '…';
+}
+
+function drawStick(it, color, hot) {
+  const M = STICK_MARGIN, pic = stickPicture(it.m, slotName(it.m, it.i), it.w, color, mdpr);
+  const snap = v => Math.round(v * mdpr) / mdpr;
+  mctx.drawImage(pic, snap(it.x - M), snap(it.y - M), pic.width / mdpr, pic.height / mdpr);
+  hit(it.x, it.y, it.x + it.w, it.y + it.h, { kind: 'dimm', key: it.i });
+  if (hot) {
+    mctx.strokeStyle = T.hl;
+    mctx.lineWidth = 2;
+    mctx.beginPath();
+    mctx.roundRect(it.x - 3, it.y - 2, it.w + 6, it.h + 5, 6);
+    mctx.stroke();
+  }
 }
 
 function drawPhys() {
-  const p = ML.phys, d = mem.dimms, map = mem.map;
-  const { end, ranges } = physSpace();
-  const X = a => ML.x0 + ML.w * a / end;
-  drawHead(p.headY, 'Physical memory', physSummary(d, end));
-  const hovered = mem.hover && mem.hover.kind === 'dimm' ? mem.hover.key : null;
-  let colors = new Map(), order = [];
+  const p = ML.phys, hv = mem.hover;
+  drawHead(p.headY, 'Physical memory', physSummary(mem.dimms));
   if (p.sticks) {
-    ({ colors, order } = moduleColors(p.sticks.items));
-    const span = ranges.length ? [ranges[0][0], ranges[ranges.length - 1][1]] : [0, end];
-    // Fans from each module to the addresses it holds, under the sticks
-    for (const it of p.sticks.items) {
-      const c = colors.get(it.i);
-      if (!c) continue;
-      const targets = d.mapping === 'ranges' && it.m.ranges.length ? it.m.ranges : [span];
-      const dim = hovered != null && hovered !== it.i, hot = hovered === it.i;
-      for (const [s, e] of targets) {
-        mctx.beginPath();
-        mctx.moveTo(it.x + 10, it.y + it.h + 2);
-        mctx.lineTo(it.x + it.w - 10, it.y + it.h + 2);
-        mctx.lineTo(X(e), p.band.y - 2);
-        mctx.lineTo(X(s), p.band.y - 2);
-        mctx.closePath();
-        mctx.fillStyle = rgba(c.rgb, hot ? 0.28 : dim ? 0.04 : 0.13);
-        mctx.fill();
-        mctx.strokeStyle = rgba(c.rgb, hot ? 0.95 : dim ? 0.15 : 0.55);
-        mctx.lineWidth = hot ? 1.5 : 1;
-        mctx.stroke();
-      }
-    }
-    // Channel names over each run of slots on one channel
-    const multiSocket = new Set(d.modules.map(m => m.socket)).size > 1;
-    const items = p.sticks.items;
-    for (let a = 0; a < items.length;) {
-      let b = a;
-      while (b + 1 < items.length && items[b + 1].row === items[a].row && slotGroup(items[b + 1].m) === slotGroup(items[a].m)) b++;
-      const m = items[a].m;
-      const name = [multiSocket && m.socket ? `CPU ${m.socket}` : '', m.channel ? `Channel ${m.channel}` : ''].filter(Boolean).join(' · ');
-      if (name) {
-        const x0 = items[a].x, x1 = items[b].x + items[b].w, ly = items[a].y - 10;
-        mctx.strokeStyle = T.grid;
-        mctx.lineWidth = 1;
-        mctx.beginPath();
-        mctx.moveTo(x0, ly + 4.5);
-        mctx.lineTo(x1, ly + 4.5);
-        mctx.stroke();
-        const tw = mwidth(name, 11, 600);
-        mctx.fillStyle = T.bg;
-        mctx.fillRect((x0 + x1) / 2 - tw / 2 - 6, ly - 6, tw + 12, 12);
-        mtext(name, (x0 + x1) / 2, ly, 11, T.ink2, 'center', 600);
-      }
-      a = b + 1;
-    }
-    for (const it of items) drawStick(it, colors.has(it.i) ? colors.get(it.i).rgb : [128, 128, 128], hovered === it.i);
+    const colors = moduleColors(p.sticks.items);
+    drawChannels(p.sticks.items);
+    for (const it of p.sticks.items) drawStick(it, colors.get(it.i) || [128, 128, 128], !!hv && hv.kind === 'dimm' && hv.key === it.i);
   }
-
-  // Which module holds each address: stripes going round the modules when
-  // they're interleaved (drawn wider than the real few hundred bytes), or
-  // each module's own range.
-  const b = p.band;
-  if (order.length) {
-    if (d.mapping === 'ranges') {
-      for (const it of order) {
-        const c = colors.get(it.i), dim = hovered != null && hovered !== it.i;
-        for (const [s, e] of it.m.ranges) {
-          mctx.fillStyle = rgba(c.rgb, dim ? 0.25 : 1);
-          mctx.fillRect(X(s), b.y, Math.max(1, X(e) - X(s)), b.h);
-        }
-      }
-    } else {
-      let k = 0;
-      for (const [s, e] of ranges) {
-        for (let x = Math.round(X(s)); x < X(e); x += 4, k++) {
-          const it = order[k % order.length], c = colors.get(it.i);
-          mctx.fillStyle = rgba(c.rgb, hovered != null && hovered !== it.i ? 0.2 : d.mapping === 'unknown' ? 0.55 : 1);
-          mctx.fillRect(x, b.y, Math.min(4, X(e) - x), b.h);
-        }
-      }
-    }
-  }
-
   // What each address holds
   const { y, h } = p.strip;
   mctx.fillStyle = T.gap;
   mctx.fillRect(ML.x0, y, ML.w, h);
-  if (map) {
-    drawCells(map, y, h);
-    hit(ML.x0, b.y - 2, ML.x1, y + h + 2, { kind: 'cell' });
-    if (mem.hover && mem.hover.kind === 'cell' && mem.hover.i != null) {
-      const n = map.cells.length, Xi = i => Math.round(ML.x0 + ML.w * i / n), i = mem.hover.i;
-      moutline(Xi(i), Math.max(Xi(i) + 1, Xi(i + 1)), { y, h });
-    }
-  } else {
+  if (mem.map) drawCells(y, h);
+  else {
     mctx.fillStyle = MC.hw;
-    for (const [s, e] of ranges) mctx.fillRect(X(s), y, Math.max(1, X(e) - X(s)), h);
+    for (const [s, e] of mem.space.ranges) mctx.fillRect(addrX(s), y, Math.max(1, addrX(e) - addrX(s)), h);
   }
+  hit(ML.x0, y - 2, ML.x1, y + h + 2, { kind: 'cell' });
   mctx.strokeStyle = T.grid;
   mctx.lineWidth = 1;
   mctx.strokeRect(ML.x0 - 0.5, y - 0.5, ML.w + 1, h + 1);
-  drawAxis(p.axisY, end, ML.x0, ML.w);
-  const note = !order.length ? (map ? 'What each physical address holds: in use, modified, standby and free. Gaps have no RAM.' : '')
-    : (d.mapping === 'ranges' ? 'Colored band: the address range each module holds.'
-      : d.mapping === 'interleaved' ? 'Colored band: consecutive addresses go round the modules (drawn far wider than the real few hundred bytes).'
-      : "Colored band: how most memory controllers interleave addresses; the firmware doesn't say.")
-      + (map ? ' Bar: what each address holds. Gaps have no RAM.' : ' What each address holds needs administrator rights.');
-  if (note) stickText(note, ML.x0, p.noteY, ML.w, 11, T.muted);
+  if (hv && hv.kind === 'cell') {
+    const at = cellAt(hv.a);
+    moutline(addrX(at.s), addrX(at.e), { y, h });
+  }
+  drawAddrAxis(p.axisY);
+  const note = mem.pin != null ? pinText() : mem.map ? 'What each physical address holds. Gaps have no RAM.'
+    : 'Where RAM is. What each address holds needs administrator rights.';
+  mtext(fitText(note, ML.w, 11.5), ML.x0, p.noteY, 11.5, mem.pin != null ? T.ink : T.muted);
+  if (mem.pin != null) drawPin(p, addrX(mem.pin));
+}
+
+// Channel names over each run of slots on one channel
+function drawChannels(items) {
+  const multiSocket = new Set(mem.dimms.modules.map(m => m.socket)).size > 1;
+  for (let a = 0; a < items.length;) {
+    let b = a;
+    while (b + 1 < items.length && items[b + 1].row === items[a].row && slotGroup(items[b + 1].m) === slotGroup(items[a].m)) b++;
+    const m = items[a].m;
+    const name = [multiSocket && m.socket ? `CPU ${m.socket}` : '', m.channel ? `Channel ${m.channel}` : ''].filter(Boolean).join(' · ');
+    if (name) {
+      const x0 = items[a].x, x1 = items[b].x + items[b].w, ly = items[a].y - 11;
+      mctx.strokeStyle = T.grid;
+      mctx.lineWidth = 1;
+      mctx.beginPath();
+      mctx.moveTo(x0, ly + 4.5);
+      mctx.lineTo(x1, ly + 4.5);
+      mctx.stroke();
+      const tw = mwidth(name, 11, 600), mid = (x0 + x1) / 2;
+      mctx.fillStyle = T.bg;
+      mctx.fillRect(mid - tw / 2 - 6, ly - 6, tw + 12, 12);
+      mtext(name, mid, ly, 11, T.ink2, 'center', 600);
+    }
+    a = b + 1;
+  }
+}
+
+// Addresses in hex under the strip, with GB below.
+function drawAddrAxis(y) {
+  const { end } = mem.space, gap = mwidth(hexAddr(end), 10.5, 400, UC.mono) + 16;
+  let step = 16 * MiB;
+  while (ML.w * step / end < gap) step *= 2;
+  mctx.strokeStyle = T.grid;
+  mctx.lineWidth = 1;
+  mctx.beginPath();
+  mctx.moveTo(ML.x0, y + 0.5);
+  mctx.lineTo(ML.x1, y + 0.5);
+  mctx.stroke();
+  for (let a = 0; a <= end; a += step) {
+    const x = Math.round(addrX(a)) + 0.5, tx = mclamp(x, gap / 2 - 6, mW - gap / 2 + 6);   // whole, at the edges too
+    mctx.strokeStyle = T.muted;
+    mctx.beginPath();
+    mctx.moveTo(x, y);
+    mctx.lineTo(x, y + 4);
+    mctx.stroke();
+    mtext(hexAddr(a), tx, y + 12, 10.5, T.ink2, 'center', 400, UC.mono);
+    mtext(`${+(a / GiB).toFixed(3)} GB`, tx, y + 26, 10.5, T.muted, 'center');
+  }
+}
+
+// The address typed in, pointed out on the strip
+function drawPin(p, x) {
+  const text = hexAddr(mem.pin), tw = mwidth(text, 11, 600, UC.mono);
+  const ty = p.strip.y - 14, tx = mclamp(x, tw / 2 + 12, mW - tw / 2 - 12);
+  mctx.strokeStyle = T.hl;
+  mctx.lineWidth = 1.5;
+  mctx.beginPath();
+  mctx.moveTo(x, p.strip.y - 5);
+  mctx.lineTo(x, p.strip.y + p.strip.h);
+  mctx.stroke();
+  mctx.fillStyle = T.hl;
+  mctx.beginPath();
+  mctx.roundRect(tx - tw / 2 - 7, ty - 9, tw + 14, 18, 4);
+  mctx.fill();
+  mtext(text, tx, ty + 0.5, 11, T.bg, 'center', 600, UC.mono);
+}
+
+// What its page holds, in words
+function pinText() {
+  const a = mem.pin, out = [hexAddr(a), `page frame ${hexPage(a)}`];
+  if (!mem.space.ranges.some(([s, e]) => a >= s && a < e)) return [...out, 'no RAM at this address: it belongs to hardware or the firmware'].join(' · ');
+  if (!mem.map) return [...out, 'RAM'].join(' · ');
+  const info = mem.page && mem.page.address === a && mem.page.info;
+  if (info) {
+    const [list, use, priority, va] = info;
+    out.push(PAGE_LISTS[list]);
+    if (list >= 2 && USE_NAMES[use]) out.push(USE_NAMES[use]);
+    if (list === 2 || list >= 6) out.push(`priority ${priority}`);
+    if (va) out.push(`mapped at virtual address 0x${va}`);
+  }
+  return out.join(' · ');
 }
 
 // One column per slice of address space, its height split by how that
 // slice's RAM is used.
-function drawCells(map, y, h) {
-  const cells = map.cells, n = cells.length;
-  const X = i => Math.round(ML.x0 + ML.w * i / n);
-  for (let i = 0; i < n; i++) {
+function drawCells(y, h) {
+  const { cells, slice } = mem.map, { end } = mem.space;
+  const X = i => Math.round(addrX(Math.min(end, i * slice)));
+  for (let i = 0; i < cells.length; i++) {
     const c = cells[i], x0 = X(i), w = Math.max(1, X(i + 1) - x0);
     if (!c) continue;   // no RAM here: the background shows through
     const ram = c[0] / 1000;
@@ -959,6 +914,27 @@ function drawCells(map, y, h) {
     band(c[3], MC.standby);
     band(c[4], MC.free);
   }
+}
+
+// What's drawn at an address: { s, e, c (the cell, or null) }. Without a map
+// it's the RAM range, or the gap between ranges.
+function cellAt(a) {
+  const map = mem.map, { end, ranges } = mem.space;
+  if (map) {
+    const i = Math.min(map.cells.length - 1, Math.floor(a / map.slice));
+    return { s: i * map.slice, e: Math.min(end, (i + 1) * map.slice), c: map.cells[i] };
+  }
+  const r = ranges.find(q => a >= q[0] && a < q[1]);
+  return r ? { s: r[0], e: r[1], c: null } : { ...gapAt(a), c: null };
+}
+
+function gapAt(a) {   // the addresses without RAM around an address
+  let s = 0, e = mem.space.end;
+  for (const [x, y] of mem.space.ranges) {
+    if (y <= a) s = Math.max(s, y);
+    if (x > a) e = Math.min(e, x);
+  }
+  return { s, e };
 }
 
 function drawGpu() {
@@ -986,7 +962,7 @@ function mdraw() {
   }
   drawRam();
   if (ML.progs && mem.psegs.length) drawProgs();
-  if (ML.phys && (mem.map || mem.dimms)) drawPhys();
+  if (ML.phys && mem.space) drawPhys();
   if (ML.gpu && m.gpu && mem.gsegs.length) drawGpu();
 }
 
@@ -1010,11 +986,7 @@ function memAt(mx, my) {
   for (let i = mem.hits.length - 1; i >= 0; i--) {   // the last drawn is on top
     const h = mem.hits[i];
     if (mx < h.x0 || mx > h.x1 || my < h.y0 || my > h.y1) continue;
-    if (h.kind === 'cell') {
-      if (!mem.map) continue;
-      const n = mem.map.cells.length;
-      return { kind: 'cell', i: mclamp(Math.floor((mx - ML.x0) / ML.w * n), 0, n - 1) };
-    }
+    if (h.kind === 'cell') return { kind: 'cell', a: mclamp((mx - ML.x0) / ML.w * mem.space.end, 0, mem.space.end - 1) };
     return { kind: h.kind, key: h.key };
   }
   return null;
@@ -1023,6 +995,7 @@ function memAt(mx, my) {
 const swatch = color => `<span class="sw" style="background:${color}"></span>`;
 const tipHead = (color, title, sub = '') => `<div class="head">${color ? swatch(color) : ''}${esc(title)}${sub ? ` <span class="faint">${esc(sub)}</span>` : ''}</div>`;
 const tipDesc = text => `<div class="desc">${esc(text)}</div>`;
+const tipMono = text => `<span class="mono">${esc(text)}</span>`;
 
 function segTip(key) {
   const r = mem.last.ram, s = mem.segs.find(x => x.key === key);
@@ -1075,22 +1048,28 @@ function dimTip(key) {
     tipDesc('Modified plus standby: what Task Manager calls Cached.');
 }
 
-function cellTip(i) {
-  const map = mem.map, c = map.cells[i];
-  const a = i * map.slice / GiB, b = (i + 1) * map.slice / GiB;
-  const range = `${a.toFixed(2)}–${b.toFixed(2)} GB`;
-  if (!c) {
-    return tipHead('', range, 'physical address') +
-      tipDesc('No RAM at these addresses. The range is kept for hardware such as the graphics card.');
+function cellTip(a) {
+  const at = cellAt(a), c = at.c, p = v => `${Math.round(v / 10)}%`;
+  const head = `<div class="head">${tipMono(hexRange(at.s, at.e))}</div>`;
+  const size = `<div class="sub">${fmtSize(at.e - at.s)} · page frames ${hexPage(at.s)}–${hexPage(at.e - 1)}</div>`;
+  const ram = mem.space.ranges.filter(([s, e]) => s < at.e && e > at.s);
+  if (!ram.length) {
+    const g = gapAt(a);
+    return head + size + tipDesc('No RAM at these addresses: they belong to hardware such as the graphics card, or to the firmware.') +
+      `<div class="sub">The whole gap: ${tipMono(hexRange(g.s, g.e))} (${fmtSize(g.e - g.s)})</div>`;
   }
-  const p = v => `${Math.round(v / 10)}%`;
-  let html = tipHead('', range, 'physical address') +
-    `<div>${swatch(MC.proc)}In use ${p(c[1])} · ${swatch(MC.modified)}Modified ${p(c[2])} · ${swatch(MC.standby)}Standby ${p(c[3])} · ${swatch(MC.free)}Free ${p(c[4])}</div>`;
-  for (let j = 5; j + 1 < c.length; j += 2) {
-    html += `<div class="sub">${swatch(MC[USE_KIND[c[j]]])}${esc(USE_NAMES[c[j]] || 'Other')} ${p(c[j + 1])}</div>`;
+  let html = head + size;
+  if (c) {
+    html += `<div>${swatch(MC.proc)}In use ${p(c[1])} · ${swatch(MC.modified)}Modified ${p(c[2])} · ${swatch(MC.standby)}Standby ${p(c[3])} · ${swatch(MC.free)}Free ${p(c[4])}</div>`;
+    for (let j = 5; j + 1 < c.length; j += 2) {
+      html += `<div class="sub">${swatch(MC[USE_KIND[c[j]]])}${esc(USE_NAMES[c[j]] || 'Other')} ${p(c[j + 1])}</div>`;
+    }
   }
-  if (c[0] < 995) html += `<div class="faint">Only ${p(c[0])} of this range is RAM; the rest is kept for hardware</div>`;
-  return html;
+  if (ram.length > 1 || ram[0][0] > at.s || ram[0][1] < at.e) {   // only some of it is RAM
+    html += ram.slice(0, 4).map(([s, e]) => `<div class="sub">RAM at ${tipMono(hexRange(Math.max(s, at.s), Math.min(e, at.e)))}</div>`).join('') +
+      (ram.length > 4 ? `<div class="faint">and ${ram.length - 4} more ranges</div>` : '');
+  }
+  return html + `<div class="faint">${mem.copied && performance.now() < mem.copied.until ? `Copied ${esc(mem.copied.text)}` : 'Click to copy the start address'}</div>`;
 }
 
 function gsegTip(key) {
@@ -1129,6 +1108,7 @@ function dimmTip(i) {
   }
   const rows = [
     [m.part ? `Part ${m.part}` : '', m.maker && m.maker !== m.brand ? `made by ${m.maker}` : ''],
+    [m.serial ? `Serial number ${m.serial}` : 'No serial number reported', ''],
     [`${fmtModule(m.size)} ${[m.type, m.form].filter(Boolean).join(' ')}`.trim(), ''],
     [m.configured && m.speed && m.configured !== m.speed ? `Runs at ${m.configured} MT/s; rated ${m.speed} MT/s`
       : m.configured || m.speed ? `${m.configured || m.speed} MT/s` : '', ''],
@@ -1137,20 +1117,14 @@ function dimmTip(i) {
   ];
   let html = tipHead('', m.brand || m.maker || 'Memory module', slot);
   for (const [a, b] of rows) if (a || b) html += `<div class="sub">${esc([a, b].filter(Boolean).join(' · '))}</div>`;
-  const others = d.modules.filter(x => x.size).length - 1;
-  const how = d.mapping === 'interleaved' && others > 0
-    ? `Its ${fmtModule(m.size)} is spread across every address, interleaved with ${others === 1 ? 'the other module' : `the other ${others} modules`}.`
-    : d.mapping === 'ranges' && m.ranges.length
-      ? `Holds addresses ${m.ranges.map(([s, e]) => `${(s / GiB).toFixed(2)}–${(e / GiB).toFixed(2)} GB`).join(', ')}.`
-      : others > 0 ? "The firmware doesn't say which addresses it holds." : 'It holds every address.';
-  return html + tipDesc(how);
+  return html;
 }
 
 function showMemTip() {
   const hv = mem.hover, m = mem.last;
   if (!hv || !m || !m.ram) { mtip.hidden = true; return; }
   const html = hv.kind === 'seg' ? segTip(hv.key) : hv.kind === 'dim' ? dimTip(hv.key)
-    : hv.kind === 'cell' && mem.map ? cellTip(hv.i) : hv.kind === 'pseg' ? psegTip(hv.key)
+    : hv.kind === 'cell' && mem.space ? cellTip(hv.a) : hv.kind === 'pseg' ? psegTip(hv.key)
     : hv.kind === 'dimm' ? dimmTip(hv.key) : hv.kind === 'gseg' && m.gpu ? gsegTip(hv.key) : '';
   if (!html) { mtip.hidden = true; return; }
   mtip.innerHTML = html;
@@ -1168,10 +1142,70 @@ mcv.addEventListener('mousemove', ev => {
   const r = mcv.getBoundingClientRect();
   mem.mouse = [ev.clientX, ev.clientY];
   mem.hover = memAt(ev.clientX - r.left, ev.clientY - r.top);
-  mcv.style.cursor = mem.hover ? 'default' : '';
+  mcv.style.cursor = !mem.hover ? '' : mem.hover.kind === 'cell' ? 'pointer' : 'default';
   showMemTip();
 });
 mcv.addEventListener('mouseleave', () => { mem.hover = null; mem.mouse = null; mtip.hidden = true; });
+mcv.addEventListener('click', () => {
+  if (mem.hover && mem.hover.kind === 'cell') copyText(hexAddr(cellAt(mem.hover.a).s));
+});
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {   // no clipboard access: the old way
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.append(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+  }
+  mem.copied = { text, until: performance.now() + 2000 };
+  showMemTip();
+}
+
+// ---------------------------------------------------------------------------
+// The address box: point out a physical address typed in hex, as a debugger
+// shows it, and say what its page holds
+// ---------------------------------------------------------------------------
+function lookUp(address) {
+  fetch('/api/sys', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }),
+  }).catch(() => { /* it's still pointed out */ });
+}
+
+function pinAddress(str) {
+  const t = str.trim().replace(/^0x/i, '').replace(/[`'_\s,]/g, '').replace(/h$/i, '').replace(/^0+(?=.)/, '');
+  const a = /^[0-9a-f]{1,13}$/i.test(t) ? parseInt(t, 16) : NaN;
+  const box = $('mctl-addr');
+  const ok = mem.space && ML && ML.phys && a < mem.space.end;
+  box.classList.toggle('bad', !ok);
+  if (!ok) {
+    box.title = mem.space ? `An address in hex, up to ${hexAddr(mem.space.end - 1)}` : 'No physical addresses to show yet';
+    return;
+  }
+  mem.pin = a;
+  lookUp(a);
+  const p = ML.phys, top = p.strip.y - 40, bottom = p.noteY + 20;   // bring it into view
+  if (top < mstage.scrollTop || bottom > mstage.scrollTop + mH) mstage.scrollTop = Math.max(0, bottom - mH);
+}
+
+function clearPin() {
+  mem.pin = mem.page = null;
+  lookUp(null);
+  const box = $('mctl-addr');
+  box.value = '';
+  box.classList.remove('bad');
+}
+
+$('mctl-addr').addEventListener('keydown', ev => {
+  if (ev.key === 'Enter') { if (ev.target.value.trim()) pinAddress(ev.target.value); else clearPin(); }
+  else if (ev.key === 'Escape') clearPin();
+  else return;
+  ev.preventDefault();
+});
+$('mctl-addr').addEventListener('input', ev => ev.target.classList.remove('bad'));
 
 // ---------------------------------------------------------------------------
 // Header numbers, legend, side lists, notices
@@ -1196,10 +1230,6 @@ function renderLegend() {
   const pair = (a, b, label) => `<span class="item"><span class="sw" style="background:linear-gradient(90deg, ${a} 50%, ${b} 50%)"></span>${label}</span>`;
   const items = mem.segs.map(s => `<span class="item">${swatch(kindColor(s.key))}${esc(kindOf(s.key).name)}</span>`);
   if (mem.psegs.length) items.push(pair(MC.progA, MC.progB, 'Programs'));
-  if (mem.dimms) {
-    const pal = CHAN_PAL[darkQuery.matches ? 'dark' : 'light'].slice(0, 2).map(c => rgb(oklch(...c)));
-    items.push(pair(pal[0], pal[1], 'Memory modules, a color per channel'));
-  }
   if (mem.gsegs.length) items.push(pair(MC.gpuA, MC.gpuB, 'GPU memory by process'));
   items.push('<span class="item muted">Hover for details · scroll for more</span>');
   $('mlegend').innerHTML = items.join('');
