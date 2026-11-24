@@ -4,14 +4,20 @@ A live isometric view of this Windows machine's network traffic, one bar per por
 a map of everything in its memory and GPU memory, plus real-time graphs of CPU,
 network and disk activity for this PC and Linux machines on your network. The views
 are tabs along the top of the window: **Network ports**, **Memory & GPU** and
-**CPU, disk & network**. The app remembers which tab you had open.
+**CPU, disk & network**. The app remembers which tab you had open. Its version is at
+the top right of the tab bar, and in the exe's file properties (Details).
+
+Everything comes from the PC it runs on: memory size, memory modules and slots, the
+graphics card, the ephemeral port range and so on are read when it starts, not
+assumed.
 
 ## Network ports
 
 - Ports 1–1024 are a 32 × 32 block of 5 px bars in front.
 - Ports 1025–65535 are a 256 × 252 field of 2 px bars behind it, 256 ports per row.
-  The darker band is the ephemeral range, 49152–65535: the short-lived local ports
-  Windows assigns to outgoing connections.
+  The darker band is the ephemeral range: the short-lived local ports Windows
+  assigns to outgoing connections. It's read from Windows when the app starts
+  (49152–65535 by default; `netsh int ipv4 show dynamicport tcp` shows it).
 - Bar height shows traffic on a log scale, from 100 b/s up to the scale you pick.
   On the big field, color runs from blue for light traffic through violet to red
   for heavy traffic. Ports 1–1024 run from amber to red instead.
@@ -78,16 +84,29 @@ are tabs along the top of the window: **Network ports**, **Memory & GPU** and
 - Lines under the bar show the totals Task Manager uses: **In use**, **Available**
   (standby plus free), **Cached** (modified plus standby) and **Committed**. Committed
   memory can be more than RAM; then its line ends in an arrow.
-- **By physical address**: where each kind sits, from byte 0 to the end of RAM in
-  physical address space. Each column is a slice (64 MB or more, so there are at
-  most 600), split by how much of it is in use, modified, standby and free, with the
-  part in use colored by what most of it holds. Gaps are addresses with no RAM:
-  devices such as the graphics card are mapped there, usually just below 4 GB.
+- **Memory by program**: the 30 programs using the most RAM, each a segment on the
+  same scale as the bar above, labelled the same way. A program's processes are
+  added up by name, and its size is the private working set, as in Task Manager's
+  Memory column. Then come the other programs, memory in use that no one program
+  owns (shared and system), memory not in use, and hardware reserved. Hover a
+  program for its process count, working set and committed memory.
+- **Physical memory**: the memory slots as the firmware describes them, each module
+  drawn as a stick with its brand, size, type, speed, part number, rank and voltage,
+  empty slots dashed, grouped by channel. Fans run from each module to the
+  addresses it holds, and a striped band shows which module holds each address:
+  most systems interleave addresses across channels and modules, so each module
+  holds part of every range; where the firmware gives each module its own range,
+  that's drawn instead. Below that, the physical address bar shows what each
+  address holds, from byte 0 to the end of RAM: each column is a slice (64 MB or
+  more, at most 600 of them), split into in use, modified, standby and free, with
+  the part in use colored by what most of it holds. Gaps are addresses with no
+  RAM: devices such as the graphics card are mapped there, usually just below 4 GB.
 - **GPU memory**: the graphics card's own memory as one bar, split by the apps using
   it, memory not owned by one app, and free.
 - Hover anything for details: what each kind of memory is, the standby priorities,
   how much of the paged pool is in the page file, what "other kernel memory" holds,
-  the page files, and each address slice's use.
+  the page files, each program, each module, and each address slice's use.
+- The tab scrolls when it's taller than the window.
 - **Samples** sets how often everything on this tab updates, with the same choices
   as the CPU, disk & network tab: 20, 10, 4, 2 or 1 a second. **Up** and **Down**
   change it too. It's remembered between runs. The bars and charts follow every
@@ -188,6 +207,11 @@ internet connection: it sets up pywebview, PyInstaller and Pillow in
 `dist\omniTop.exe`. Rebuild after editing anything in `web\`, `server.py`,
 `sysmon.py`, `perfmon.py`, `netwatch.py` or `desktop.py`.
 
+The version is `VERSION` in `server.py`; raise it for each release. The build
+stamps it into the exe's file properties. It also draws the icon: a ring split like
+the memory bar around a performance graph, each size from 16 to 256 px drawn
+separately.
+
 ## How it works
 
 `server.py` starts a real-time ETW session on the `Microsoft-Windows-Kernel-Network`
@@ -251,6 +275,14 @@ GPU tab and sends the result on the same stream.
   rates it reads an interleaved part of them each time (a twentieth at 20 a
   second), so the whole set is read once a second at any rate. The address map
   goes to the view at most 4 times a second.
+- **Programs**: one `NtQuerySystemInformation` call (`SystemProcessInformation`) lists
+  every process with its private working set, working set and commit, once a
+  second; no rights needed.
+- **Memory modules**: from the firmware's SMBIOS tables (`GetSystemFirmwareTable`,
+  no rights needed): memory arrays and their slots (type 16), each slot's module
+  (type 17), and where they sit in address space (types 19 and 20). The brand comes
+  from the part number when it's a known one, since the firmware often names the
+  DRAM maker or gives a JEDEC code instead.
 - **GPU**: its memory size comes from D3DKMT. Use and engine utilization come from
   the performance counters Task Manager reads (`GPU Engine`, `GPU Adapter Memory`,
   `GPU Process Memory`).

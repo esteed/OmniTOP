@@ -35,7 +35,9 @@ const state = {
   side: 'both', proto: 'all', max: 1e9, paused: false, hideOwn: false,
   mode: null, connected: false, services: {}, hover: null, pins: [], mouse: null,
   focus: null,                        // port whose details bubble the pointer is on
+  dyn: { start: 49152, end: 65535 },  // this PC's ephemeral port range, from /api/info
 };
+const isDyn = p => p >= state.dyn.start && p <= state.dyn.end;
 // port -> { c, hist, proc, rate, base, own, target, btarget, h, hb }
 // base is traffic this app didn't cause, own is traffic it did, and rate is
 // what's shown: base plus own, unless own traffic is hidden.
@@ -142,12 +144,12 @@ function cellOf(p) {
 }
 
 function svcName(p) {
-  return state.services[p] || (p >= 49152 ? 'ephemeral' : '');
+  return state.services[p] || (isDyn(p) ? 'ephemeral' : '');
 }
 
 function zoneName(p) {
-  if (p <= 1023) return 'Well-known port';
-  return p >= 49152 ? 'Ephemeral port' : 'Registered port';
+  if (isDyn(p)) return 'Ephemeral port';
+  return p <= 1023 ? 'Well-known port' : 'Registered port';
 }
 
 // Pick the bytes that match the current filters out of [tcpL, tcpR, udpL, udpR].
@@ -432,7 +434,7 @@ function ephemeralNote(g) {
   g.translate(x, y);
   g.rotate(Math.atan2(S, C));   // the world x axis runs 30° below horizontal
   const dy = 5 / C + size * 0.85 / K;   // clear of the floor's 5 px edge
-  const head = 'Ephemeral ports 49152–65535';
+  const head = `Ephemeral ports ${state.dyn.start}–${state.dyn.end}`;
   font(g, size, 600);
   const w = g.measureText(head).width;
   text(g, head, 0, dy, size, T.ink2, 'left', 600);
@@ -460,8 +462,17 @@ function buildLayers() {
   let g;
   [layerBig, g] = makeLayer();
   slab(g, 0, 0, HI_COLS * 2, HI_ROWS * 2, 5, T.floor);
-  poly(g, quad(0, 376, 512, 128), T.dyn);          // rows from 49152 onward
-  poly(g, quad(510, 374, 2, 2), T.dyn);            // 49152 is the last cell of row 187
+  // This PC's ephemeral range, shaded cell by cell: a part row, whole rows, a part row
+  const i0 = Math.max(1025, state.dyn.start) - 1025, i1 = Math.min(1025 + HI_ROWS * HI_COLS - 1, state.dyn.end) - 1025;
+  const r0 = Math.floor(i0 / HI_COLS), c0 = i0 % HI_COLS, r1 = Math.floor(i1 / HI_COLS), c1 = i1 % HI_COLS;
+  if (i1 >= i0) {
+    if (r0 === r1) poly(g, quad(c0 * 2, r0 * 2, (c1 - c0 + 1) * 2, 2), T.dyn);
+    else {
+      poly(g, quad(c0 * 2, r0 * 2, (HI_COLS - c0) * 2, 2), T.dyn);
+      if (r1 > r0 + 1) poly(g, quad(0, (r0 + 1) * 2, HI_COLS * 2, (r1 - r0 - 1) * 2), T.dyn);
+      poly(g, quad(0, r1 * 2, (c1 + 1) * 2, 2), T.dyn);
+    }
+  }
   checker(g, 0, 0, HI_COLS * 2, HI_ROWS * 2);
   g.beginPath();
   for (let k = 32; k < 512; k += 32) { const a = proj(k, 0), b = proj(k, 504); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); }
@@ -469,10 +480,16 @@ function buildLayers() {
   g.strokeStyle = T.grid;
   g.lineWidth = 1 / K;
   g.stroke();
-  for (const r of [0, 32, 64, 96, 128, 160, 188]) {
-    const dyn = r === 188;
-    const [a, b] = proj(0, dyn ? 376 : r * 2 + 1);
-    text(g, dyn ? '49152' : String(1025 + 256 * r), a - 8 / K, b, 11, dyn ? T.ink2 : T.muted, 'right', dyn ? 600 : 400);
+  // Row numbers every 32 rows, and the first ephemeral port where its row starts
+  const dynRow = c0 ? r0 + 1 : r0;
+  for (let r = 0; r < HI_ROWS; r += 32) {
+    if (Math.abs(r - dynRow) < 14) continue;
+    const [a, b] = proj(0, r * 2 + 1);
+    text(g, String(1025 + 256 * r), a - 8 / K, b, 11, T.muted, 'right');
+  }
+  if (i1 >= i0) {
+    const [a, b] = proj(0, dynRow * 2);
+    text(g, String(1025 + i0), a - 8 / K, b, 11, T.ink2, 'right', 600);
   }
   edgeTitle(g, 0, HI_ROWS * 2 - 40, 'Ports 1025–65535', size => -(38 / K + size * 0.6 / K));
   ephemeralNote(g);
@@ -1025,8 +1042,17 @@ async function loadInfo() {
     const info = await (await fetch('/api/info', { cache: 'no-store' })).json();
     state.mode = info.mode;
     state.services = info.services || {};
+    if (info.dynamic) {   // the grid's ephemeral band follows this PC's range
+      state.dyn = { start: info.dynamic.start, end: info.dynamic.end };
+      layersDirty = true;
+    }
     if (info.tick > 0) setTick(info.tick);
     document.title = `omniTop · ${info.host}`;
+    if (info.version) {   // top right of the tab bar, beside the Live / Demo data light
+      $('version').textContent = `omniTop ${info.version}`;
+      $('version').title = `omniTop version ${info.version}`;
+      $('version').hidden = false;
+    }
     // Put back the sample rate chosen last time.
     const want = loadPref('rate');
     if (!rateRestored && RATES.includes(want) && Math.round(1 / info.tick) !== want) {

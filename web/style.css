@@ -134,6 +134,14 @@ select {
 }
 .tab.alarm::after { background: #fff; }
 .tabs-end { margin-left: auto; align-self: center; padding: 0 0 6px 8px; flex: none; white-space: nowrap; }
+.version {
+  margin-right: 12px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+  user-select: text;
+}
 .page { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; }
 .page[hidden] { display: none; }
 
@@ -274,7 +282,11 @@ aside .hint { font-size: 12px; color: var(--muted); margin: -4px 0 10px; }
 .tip .sub { color: var(--text-2); }
 .tip .faint { color: var(--muted); }
 .tip .desc { white-space: normal; max-width: 300px; color: var(--text-2); }
-#mlegend { gap: 4px 14px; }
+/* Memory & GPU: the area scrolls when it's taller than the window; the legend
+   sits below the drawing (memory.js sets its top) */
+#mstage { overflow-x: hidden; overflow-y: auto; scrollbar-gutter: stable; }
+#mstage #mcv { position: absolute; left: 0; top: 0; right: auto; bottom: auto; }
+#mlegend { gap: 4px 14px; bottom: auto; }
 #mlegend .sw { border: 0; width: 12px; }
 
 #top { list-style: none; margin: 0; padding: 0; }

@@ -18,9 +18,11 @@ import json
 import os
 import queue
 import random
+import re
 import shutil
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -35,6 +37,10 @@ from urllib.request import urlopen
 import netwatch
 import perfmon
 import sysmon
+
+# The app's version, shown in the tab bar. Raise it for each release; build.py
+# reads it from here and stamps it into the exe's file properties.
+VERSION = "1.7.0"
 
 # In the packaged exe the web files are unpacked next to the bundled modules.
 HERE = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
@@ -834,7 +840,7 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
     allowed_origins = {f"http://{h}" for h in allowed_hosts}
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "omniTop/1.0"
+        server_version = f"omniTop/{VERSION}"
 
         def log_message(self, fmt, *args):  # keep the console for status lines
             pass
@@ -997,6 +1003,31 @@ def load_services() -> dict[int, str]:
     return out
 
 
+WINDOWS_DYNAMIC = (49152, 65535)   # Windows' default ephemeral range, if this PC's can't be read
+
+
+def dynamic_ports() -> dict:
+    """This PC's ephemeral (dynamic) TCP port range: {"start", "end", "read"}.
+
+    Windows hands these ports out to outgoing connections. The range can be
+    changed (netsh int ipv4 set dynamicport), so it's read rather than
+    assumed. netsh's labels are translated, so only its two numbers are used:
+    the first port, then how many.
+    """
+    try:
+        out = subprocess.run(["netsh", "interface", "ipv4", "show", "dynamicport", "tcp"],
+                             capture_output=True, text=True, timeout=5,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        nums = [int(n) for n in re.findall(r"\d+", out)]
+        if len(nums) >= 2:
+            start, count = nums[-2], nums[-1]
+            if 1 <= start <= 65535 and 1 <= count and start + count - 1 <= 65535:
+                return {"start": start, "end": start + count - 1, "read": True}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return {"start": WINDOWS_DYNAMIC[0], "end": WINDOWS_DYNAMIC[1], "read": False}
+
+
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
@@ -1118,7 +1149,7 @@ class Server:
         self.sysmon = sysmon.SystemMonitor(self.hub, mode, ProcessNames().get)
         try:
             info = {"mode": mode, "rates": list(RATES), "host": socket.gethostname(),
-                    "services": load_services()}
+                    "version": VERSION, "services": load_services(), "dynamic": dynamic_ports()}
             self.httpd = ThreadingHTTPServer(
                 ("127.0.0.1", self.port),
                 make_handler(self.hub, info, self.port, self.rate, on_write, self.perf,

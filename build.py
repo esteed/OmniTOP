@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -33,64 +34,99 @@ def oklch(L: float, C: float, h: float) -> tuple[int, int, int]:
         C = max(0.0, C - 0.004)
 
 
-STOPS = [(0.58, 0.17, 258), (0.56, 0.19, 285), (0.58, 0.22, 332), (0.62, 0.23, 374), (0.64, 0.23, 388)]
+# The icon: a ring split like the Memory & GPU tab's memory bar (in use,
+# kernel, modified, standby, free), around a performance graph, on a dark tile.
+ICON_RING = [((0.68, 0.15, 152), 0.40), ((0.66, 0.17, 355), 0.15), ((0.84, 0.15, 78), 0.09),
+             ((0.66, 0.14, 248), 0.24), ((0.40, 0.012, 240), 0.12)]
+ICON_GRAPH = [(-1, 0.30), (-0.62, 0.05), (-0.34, 0.38), (-0.02, -0.42), (0.30, 0.12), (0.58, -0.18), (1, -0.02)]
+ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
 
 
-def ramp(t: float) -> tuple[int, int, int]:
-    n = len(STOPS) - 1
-    x = min(max(t, 0.0), 1.0) * n
-    k = min(n - 1, int(x))
-    f = x - k
-    a, b = STOPS[k], STOPS[k + 1]
-    return oklch(*(a[i] + (b[i] - a[i]) * f for i in range(3)))
+def icon_image(size: int):
+    """One size of the icon, drawn 8x larger and scaled down for smooth edges.
+
+    Strokes have a floor in output pixels, so small sizes stay legible.
+    """
+    from PIL import Image, ImageChops, ImageDraw
+
+    ss = 8
+    S = size * ss
+    px = ss                                      # one output pixel
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    m = max(0.5 * px, S * 0.03)
+    tile = (32, 32, 30, 255)
+    d.rounded_rectangle((m, m, S - m, S - m), radius=S * 0.22, fill=tile,
+                        outline=(70, 70, 66, 255), width=max(1, round(0.8 * px)))
+    cx = cy = S / 2
+    r1 = S * 0.38
+    r0 = r1 - max(S * 0.10, 2.0 * px)
+    gap = 0.0 if size <= 24 else 4.0             # degrees between the ring's parts
+
+    def arc(a0: float, a1: float, steps: int = 96) -> list:
+        outer = [(cx + r1 * math.cos(math.radians(a0 + (a1 - a0) * i / steps)),
+                  cy + r1 * math.sin(math.radians(a0 + (a1 - a0) * i / steps))) for i in range(steps + 1)]
+        inner = [(cx + r0 * math.cos(math.radians(a1 - (a1 - a0) * i / steps)),
+                  cy + r0 * math.sin(math.radians(a1 - (a1 - a0) * i / steps))) for i in range(steps + 1)]
+        return outer + inner
+
+    a = -90.0
+    for color, share in ICON_RING:
+        span = 360 * share
+        d.polygon(arc(a + gap / 2, a + span - gap / 2), fill=oklch(*color) + (255,))
+        a += span
+
+    w, h = r0 * 0.86, r0 * 0.62
+    pts = [(cx + w * x, cy + h * y) for x, y in ICON_GRAPH]
+    # The area under the graph, see-through, filling the inside of the ring
+    fill = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    edge = [(cx + r0 * 1.2, pts[-1][1]), (cx + r0 * 1.2, cy + r0 * 1.2), (cx - r0 * 1.2, cy + r0 * 1.2),
+            (cx - r0 * 1.2, pts[0][1])]
+    ImageDraw.Draw(fill).polygon(pts + edge, fill=(246, 246, 242, 46))
+    inside = Image.new("L", (S, S), 0)
+    ri = r0 - max(S * 0.025, 0.7 * px)
+    ImageDraw.Draw(inside).ellipse((cx - ri, cy - ri, cx + ri, cy + ri), fill=255)
+    fill.putalpha(ImageChops.multiply(fill.getchannel("A"), inside))
+    img.alpha_composite(fill)
+    lw = max(S * 0.055, 1.5 * px)
+    d.line(pts, fill=(246, 246, 242, 255), width=round(lw), joint="curve")
+    for x, y in (pts[0], pts[-1]):               # round ends
+        d.ellipse((x - lw / 2, y - lw / 2, x + lw / 2, y + lw / 2), fill=(246, 246, 242, 255))
+    return img.resize((size, size), Image.LANCZOS)
 
 
 def make_icon(path: str) -> None:
-    """A 3 x 3 isometric bar grid, short blue bars in front, tall red ones behind."""
-    from PIL import Image, ImageDraw
+    """Write the icon with each size drawn separately."""
+    images = [icon_image(s) for s in ICON_SIZES]
+    images[-1].save(path, format="ICO", sizes=[(s, s) for s in ICON_SIZES], append_images=images[:-1])
 
-    cos30 = math.cos(math.pi / 6)
 
-    def proj(x, y, z):
-        return ((x - y) * cos30, (x + y) * 0.5 - z)
+def app_version() -> str:
+    """VERSION from server.py, read as text so building doesn't import the app."""
+    with open(os.path.join(HERE, "server.py"), encoding="utf-8") as f:
+        m = re.search(r'^VERSION = "(\d+(?:\.\d+){0,3})"', f.read(), re.M)
+    if not m:
+        raise SystemExit('server.py has no VERSION = "x.y.z" line')
+    return m.group(1)
 
-    heights = {(0, 0): 2.6, (1, 0): 1.9, (0, 1): 1.6, (2, 0): 1.0, (1, 1): 1.25, (0, 2): 0.8,
-               (2, 1): 0.55, (1, 2): 0.45, (2, 2): 0.25}
-    cell, bar, plate = 1.0, 0.72, 0.22
-    polys = []  # (points in world units, fill)
 
-    def shade(c, k):
-        return tuple(round(v * (1 - k)) for v in c)
-
-    # floor plate with a little thickness
-    n = 3 * cell
-    polys.append(([(0, n, 0), (n, n, 0), (n, n, -plate), (0, n, -plate)], (35, 35, 33)))
-    polys.append(([(n, 0, 0), (n, n, 0), (n, n, -plate), (n, 0, -plate)], (21, 21, 20)))
-    polys.append(([(0, 0, 0), (n, 0, 0), (n, n, 0), (0, n, 0)], (52, 52, 49)))
-    for (gx, gy), hgt in sorted(heights.items(), key=lambda kv: kv[0][0] + kv[0][1]):
-        x0 = gx * cell + (cell - bar) / 2
-        y0 = gy * cell + (cell - bar) / 2
-        x1, y1 = x0 + bar, y0 + bar
-        col = ramp(hgt / 2.6)
-        polys.append(([(x0, y1, 0), (x1, y1, 0), (x1, y1, hgt), (x0, y1, hgt)], shade(col, 0.22)))
-        polys.append(([(x1, y0, 0), (x1, y1, 0), (x1, y1, hgt), (x1, y0, hgt)], shade(col, 0.40)))
-        polys.append(([(x0, y0, hgt), (x1, y0, hgt), (x1, y1, hgt), (x0, y1, hgt)], col))
-
-    pts = [proj(*p) for poly, _ in polys for p in poly]
-    minx, maxx = min(p[0] for p in pts), max(p[0] for p in pts)
-    miny, maxy = min(p[1] for p in pts), max(p[1] for p in pts)
-    size = 1024
-    margin = size * 0.04
-    k = (size - 2 * margin) / max(maxx - minx, maxy - miny)
-    ox = (size - (maxx - minx) * k) / 2 - minx * k
-    oy = (size - (maxy - miny) * k) / 2 - miny * k
-
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    for poly, fill in polys:
-        d.polygon([(ox + proj(*p)[0] * k, oy + proj(*p)[1] * k) for p in poly], fill=fill + (255,))
-    img = img.resize((256, 256), Image.LANCZOS)
-    img.save(path, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+def make_version_file(path: str, version: str) -> None:
+    """The exe's version resource: Properties > Details shows it."""
+    nums = tuple((list(map(int, version.split("."))) + [0, 0, 0])[:4])
+    strings = {"FileDescription": "omniTop", "FileVersion": version, "InternalName": "omniTop",
+               "OriginalFilename": "omniTop.exe", "ProductName": "omniTop", "ProductVersion": version}
+    table = ",\n        ".join(f"StringStruct({k!r}, {v!r})" for k, v in strings.items())
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={nums}, prodvers={nums}, mask=0x3f, flags=0x0,
+                    OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+        {table}])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+""")
 
 
 def main() -> int:
@@ -99,11 +135,16 @@ def main() -> int:
     os.makedirs(WORK, exist_ok=True)
     icon = os.path.join(WORK, "omniTop.ico")
     make_icon(icon)
+    version = app_version()
+    version_file = os.path.join(WORK, "version.txt")
+    make_version_file(version_file, version)
+    print(f"Building omniTop {version}")
     PyInstaller.__main__.run([
         os.path.join(HERE, "desktop.py"),
         "--name", "omniTop",
         "--onefile", "--windowed", "--noconfirm", "--clean",
         "--icon", icon,
+        "--version-file", version_file,
         "--add-data", f"{os.path.join(HERE, 'web')}{os.pathsep}web",
         "--distpath", os.path.join(HERE, "dist"),
         "--workpath", os.path.join(WORK, "work"),
