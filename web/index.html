@@ -180,17 +180,17 @@
         <button type="button" data-v="0" title="One graph per machine: the average of all its threads">All threads</button>
       </div>
       <label class="chk" title="The amber 3-second average line (A)"><input type="checkbox" id="pctl-avg" checked>Average</label>
-      <label class="chk" title="The Linux machines' rows (R)"><input type="checkbox" id="pctl-remotes" checked>Linux machines</label>
+      <label class="chk" title="The rows of remote machines: the ones settings.ini lists besides this PC (R)"><input type="checkbox" id="pctl-remotes" checked>Remote machines</label>
       <label class="chk" title="The network adapters column (N)"><input type="checkbox" id="pctl-net" checked>Network</label>
       <label class="chk" title="The disk devices column (D)"><input type="checkbox" id="pctl-disk" checked>Disks</label>
       <button type="button" id="pctl-pause" title="Freeze the graphs; sampling carries on (Space)">Pause</button>
       <button type="button" id="pctl-top" title="Keep this window above others (T)" hidden>Always on top</button>
-      <button type="button" id="pctl-edit" title="Choose adapters, drives and Linux machines in settings.ini (E)" hidden>Settings…</button>
+      <button type="button" id="pctl-edit" title="Choose adapters, drives and remote machines in settings.ini (E)" hidden>Settings…</button>
     </div>
   </header>
   <main>
     <div id="pstage" class="stage">
-      <canvas id="pcv" role="img" aria-label="Line graphs of CPU use per thread, network throughput per adapter and disk activity per drive, for this PC and each Linux machine"></canvas>
+      <canvas id="pcv" role="img" aria-label="Line graphs of CPU use per thread, network throughput per adapter and disk activity per drive, for this PC and each remote machine"></canvas>
       <div id="ptip" class="tip" hidden></div>
     </div>
   </main>

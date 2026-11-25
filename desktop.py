@@ -2,6 +2,8 @@
 
     omniTop.exe          live capture (Windows asks for administrator rights)
     omniTop.exe --demo   simulated traffic
+    omniTop.exe --agent  no window: lets omniTop on other PCs watch this one (see agent.py);
+                         --install-agent and --uninstall-agent make it start with Windows or not
 
 The window runs with your normal rights. Capture needs administrator rights,
 so it runs in a second, elevated copy of this program that has no window of
@@ -27,6 +29,7 @@ import urllib.request
 import winreg
 from ctypes import wintypes
 
+import agent
 import server
 
 TITLE = "omniTop"
@@ -43,11 +46,12 @@ ERROR_ALREADY_EXISTS = 183
 ERROR_CANCELLED = 1223
 SEE_MASK_NOCLOSEPROCESS = 0x00000040
 SEE_MASK_NOASYNC = 0x00000100
-SW_HIDE, SW_RESTORE = 0, 9
+SEE_MASK_FLAG_NO_UI = 0x00000400       # errors come back to us, not in a box of the shell's
+SW_HIDE, SW_SHOWNORMAL, SW_RESTORE = 0, 1, 9
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 SWP_FRAMECHANGED = 0x0020
 SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0002, 0x0001, 0x0004, 0x0010
-MB_ICONERROR = 0x10
+MB_ICONERROR, MB_ICONINFORMATION = 0x10, 0x40
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -73,6 +77,7 @@ kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.WaitForSingleObject.restype = wintypes.DWORD
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
 kernel32.CreateMutexW.restype = wintypes.HANDLE
 user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
@@ -182,7 +187,7 @@ def helper_command(port: int) -> tuple[str, str]:
     if FROZEN:
         return local_copy(sys.executable, os.path.join(APP_DIR, os.path.basename(sys.executable))), args
     here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("desktop.py", "server.py", "sysmon.py", "perfmon.py", "netwatch.py"):
+    for name in ("desktop.py", "agent.py", "server.py", "sysmon.py", "perfmon.py", "netwatch.py"):
         local_copy(os.path.join(here, name), os.path.join(APP_DIR, name))
     shutil.copytree(server.WEB_DIR, os.path.join(APP_DIR, "web"), dirs_exist_ok=True)
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
@@ -190,16 +195,16 @@ def helper_command(port: int) -> tuple[str, str]:
     return exe, f'"{os.path.join(APP_DIR, "desktop.py")}" {args}'
 
 
-def launch_elevated(exe: str, params: str) -> int | None:
+def launch_elevated(exe: str, params: str, show: int = SW_HIDE) -> int | None:
     """Start exe as administrator. Returns its process handle, or None if the user said no."""
     sei = SHELLEXECUTEINFOW()
     sei.cbSize = ctypes.sizeof(sei)
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI
     sei.lpVerb = "runas"
     sei.lpFile = exe
     sei.lpParameters = params
     sei.lpDirectory = APP_DIR
-    sei.nShow = SW_HIDE
+    sei.nShow = show
     if not shell32.ShellExecuteExW(ctypes.byref(sei)):
         err = ctypes.get_last_error()
         if err == ERROR_CANCELLED:
@@ -263,6 +268,65 @@ def run_capture(port: int, parent_pid: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# The agent other PCs watch this one through (no window)
+# ---------------------------------------------------------------------------
+
+def console():
+    """Something to print with, if this was started from a console; else None."""
+    if not FROZEN:
+        return print if sys.stdout else None
+    if not kernel32.AttachConsole(wintypes.DWORD(-1)):      # the parent's
+        return None
+    try:
+        out = open("CONOUT$", "w", encoding="utf-8", buffering=1)   # noqa: SIM115 - for as long as this runs
+    except OSError:
+        return None
+    return lambda text: print(text, file=out)
+
+
+def run_agent(listen: str, port: int) -> int:
+    echo = console()
+    if echo:
+        echo("Ctrl+C, or closing this window, stops the agent.")
+    return agent.run(listen, port, server.VERSION, os.path.join(APP_DIR, "agent.log"), echo)
+
+
+def manage_agent(action: str, port: int) -> int:
+    """Install or uninstall the agent, asking for administrator rights if need be."""
+    if not FROZEN:
+        raise SystemExit("Installing the agent needs omniTop.exe. From source, run: python desktop.py --agent")
+    if not server.is_admin():
+        os.makedirs(APP_DIR, exist_ok=True)
+        # A copy on a local drive: elevated processes can't always see mapped ones.
+        exe = local_copy(sys.executable, os.path.join(APP_DIR, "omniTop-setup.exe"))
+        try:
+            proc = launch_elevated(exe, f"--{action}-agent --agent-port {port}", SW_SHOWNORMAL)
+            if proc is None:
+                raise SystemExit("This needs administrator rights, and Windows didn't grant them. Nothing was changed.")
+            kernel32.WaitForSingleObject(proc, INFINITE)
+            code = wintypes.DWORD(1)
+            kernel32.GetExitCodeProcess(proc, ctypes.byref(code))
+            kernel32.CloseHandle(proc)
+        finally:
+            try:
+                os.remove(exe)
+            except OSError:
+                pass
+        return int(code.value)                    # it has said what went wrong, if anything did
+    try:
+        text = agent.install(sys.executable, port) if action == "install" else agent.uninstall()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit(str(exc) or type(exc).__name__) from None
+    user32.MessageBoxW(None, text, TITLE, MB_ICONINFORMATION)
+    return 0
+
+
+def can_ask() -> bool:
+    """Whether anyone could see a message: not the capture helper, and not a service's session."""
+    return "--capture" not in sys.argv and not agent.in_services_session()
+
+
+# ---------------------------------------------------------------------------
 # Window
 # ---------------------------------------------------------------------------
 
@@ -298,9 +362,10 @@ networks=auto
 # Drives to graph: letters such as C:,D:, or auto for every fixed drive, or none. Up to 6.
 disks=auto
 
-# Linux machines running cpugraph-agent, up to 6, separated by ; - host names or IP
+# Remote machines to show, up to 6, separated by ; - Windows PCs running omniTop's agent
+# (omniTop.exe --install-agent) or Linux machines running cpugraph-agent: host names or IP
 # addresses, each optionally with :port (default 7820). A [section] named like the
-# machine can choose its networks= and disks= (by their Linux names).
+# machine can choose its networks= and disks= (by the names that machine uses).
 remotes=
 """
 
@@ -460,8 +525,22 @@ def main() -> int:
     ap.add_argument("--capture", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--port", type=int, default=server.DEFAULT_PORT, help=argparse.SUPPRESS)
     ap.add_argument("--parent", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--agent", action="store_true", help="let omniTop on other PCs watch this one")
+    ap.add_argument("--install-agent", action="store_true", help="start the agent with Windows")
+    ap.add_argument("--uninstall-agent", action="store_true", help="remove the agent")
+    ap.add_argument("--agent-cleanup", action="store_true", help=argparse.SUPPRESS)   # run by --uninstall-agent
+    ap.add_argument("--agent-port", type=int, default=server.perfmon.AGENT_PORT, help="the agent's TCP port (default 7820)")
+    ap.add_argument("--listen", default="", help="an address for --agent to listen on (default all)")
     args = ap.parse_args()
 
+    if not 0 < args.agent_port < 65536:
+        raise SystemExit("--agent-port must be between 1 and 65535.")
+    if args.agent_cleanup:
+        return agent.cleanup(os.path.join(APP_DIR, "agent.log"))
+    if args.agent:
+        return run_agent(args.listen, args.agent_port)
+    if args.install_agent or args.uninstall_agent:
+        return manage_agent("install" if args.install_agent else "uninstall", args.agent_port)
     server.check_layouts()
     if args.capture:
         return run_capture(args.port, args.parent)
@@ -475,10 +554,10 @@ if __name__ == "__main__":
         code = main()
     except SystemExit as stop:
         code = stop.code if isinstance(stop.code, int) else 1
-        if isinstance(stop.code, str) and "--capture" not in sys.argv:
+        if isinstance(stop.code, str) and can_ask():
             user32.MessageBoxW(None, stop.code, TITLE, MB_ICONERROR)
     except BaseException:  # noqa: BLE001 - a windowed exe has no console to print to
-        if "--capture" not in sys.argv:
+        if can_ask():
             user32.MessageBoxW(None, traceback.format_exc(limit=6), TITLE + " crashed", MB_ICONERROR)
         code = 1
     sys.exit(code)

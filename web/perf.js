@@ -2,7 +2,7 @@
 
 // ---------------------------------------------------------------------------
 // CPU, disk & network tab: a port of CPU Graph 2.0 (github.com/esteed/CpuGraph).
-// One row per machine (This PC, then each Linux machine running cpugraph-agent)
+// One row per machine (This PC, then each remote machine running cpugraph-agent)
 // with three columns: a small graph per CPU thread, a strip per network adapter
 // and a strip per disk. All graphs share one time axis. Every number is a
 // 3-second average; the lines show the samples. Uses the theme and helpers from
@@ -540,7 +540,7 @@ function stripProblems(p, status, problem) {
   pText(text, status ? p.x + p.w / 2 : p.x + 8, y, 12.5, PC.warn, 400, status ? 'center' : 'left', p.w - 16);
 }
 
-// A message across a whole row (a Linux machine that can't be reached).
+// A message across a whole row (a remote machine that can't be reached).
 function veil(text, row) {
   const g = pctx, w = Math.min(pWidth(text, 12.5) + 28, row.w - 8), h = 30;
   if (w < 40 || row.h < h) return;

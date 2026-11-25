@@ -2,7 +2,7 @@
 
 A live isometric view of this Windows machine's network traffic, one bar per port,
 a map of everything in its memory and GPU memory, plus real-time graphs of CPU,
-network and disk activity for this PC and Linux machines on your network. The views
+network and disk activity for this PC and other machines on your network. The views
 are tabs along the top of the window: **Network ports**, **Memory & GPU** and
 **CPU, disk & network**. The app remembers which tab you had open. Its version is at
 the top right of the tab bar, and in the exe's file properties (Details).
@@ -138,8 +138,8 @@ assumed.
 ## CPU, disk & network
 
 This tab is [CPU Graph 2.0](https://github.com/esteed/CpuGraph) brought into the app.
-It has one row per machine: **This PC** first, then each Linux machine running
-`cpugraph-agent`. Each row has three columns:
+It has one row per machine: **This PC** first, then each remote machine, Windows or
+Linux, running an agent. Each row has three columns:
 
 - **CPU threads**: one small graph per logical processor. The row title shows the
   machine's name, thread count and total CPU use.
@@ -163,14 +163,14 @@ the tab is open:
 | Space | Pause / resume the graphs (sampling continues) |
 | Up / Down | Faster / slower sampling: 20, 10, 4, 2, 1 per second |
 | Left / Right | Shorter / longer time span |
-| R / N / D | Show / hide the Linux machines, the network column, the disk column |
+| R / N / D | Show / hide the remote machines, the network column, the disk column |
 | M | This PC's total: CPU time ↔ Processor utility (matches Task Manager) |
 | C | A graph per CPU thread ↔ one graph of all threads per machine |
 | A | Show / hide the 3-second average line |
 | T | Always on top (desktop app) |
 | E | Open settings.ini in Notepad (desktop app) |
 
-**Choosing adapters, drives and Linux machines.** The tab reads CPU Graph's own
+**Choosing adapters, drives and remote machines.** The tab reads CPU Graph's own
 settings file, `%LOCALAPPDATA%\CpuGraph\settings.ini`, so both apps show the same
 things. It never writes to that file, apart from creating a starting one if you press
 E on a PC that doesn't have one. The file's lines are explained in
@@ -178,17 +178,40 @@ E on a PC that doesn't have one. The file's lines are explained in
 
 - `networks=`, `disks=` and `scale.<adapter>=` choose this PC's adapters, drives and
   network scales.
-- `remotes=` lists Linux machines (up to six).
+- `remotes=` lists remote machines (up to six).
 - A machine's `[section]` picks its adapters and disks.
 
 Changes apply within a couple of seconds. Without the file, the tab shows the
-connected network cards, every fixed drive, and no Linux machines.
+connected network cards, every fixed drive, and no remote machines.
 
-**Linux machines** run `cpugraph-agent` from the CPU Graph repository; its README
-explains how to build and install it. Agents 2.0 and later send every CPU thread,
-the chosen adapters and the chosen disks. Older agents send only the total CPU, and
-their row says so. A machine that can't be reached says why across its row and
-reconnects by itself. The app connects to the agents only while its window is open.
+**Remote machines** run an agent that streams their numbers. A machine that can't be
+reached says why across its row and reconnects by itself. The app connects to the
+agents only while its window is open.
+
+- **Windows PCs** run omniTop's own agent. Copy `omniTop.exe` to the PC and run
+  `omniTop.exe --install-agent`. Windows asks for administrator rights, then it:
+  - copies itself to `Program Files\omniTop agent`
+  - adds a scheduled task, **omniTop agent**, that starts with Windows and runs as
+    LOCAL SERVICE, an account with few rights; no one needs to be signed in
+  - opens TCP port 7820 for it in Windows Firewall, on private and domain networks
+
+  It then shows what to add to `remotes=` on the PC you watch from. Run
+  `--install-agent` again with a newer `omniTop.exe` to upgrade it.
+  `omniTop.exe --uninstall-agent` removes all of it. `omniTop.exe --agent` runs the
+  agent without installing anything, until it's closed.
+  - `--agent-port 7821` uses another port (then write `host:7821` in `remotes=`), and
+    with `--agent`, `--listen 192.168.1.20` listens on one address only.
+  - In the machine's `[section]`, write adapters by the names Windows shows and disks
+    as drive letters: `networks=Wi-Fi;Realtek 2.5GbE` and `disks=C:,D:`.
+- **Linux machines** run `cpugraph-agent` from the CPU Graph repository; its README
+  explains how to build and install it. Agents 2.0 and later send every CPU thread,
+  the chosen adapters and the chosen disks. Older agents send only the total CPU, and
+  their row says so.
+
+The agents only read counters and run no commands. The connection isn't encrypted or
+authenticated: anyone who can reach the port can read the machine's CPU, network and
+disk activity and its adapter and drive names. To limit that, restrict the firewall
+rule to your PC's address.
 
 ## Run it
 
@@ -308,9 +331,18 @@ PC each tick, on its own clock, at the rate chosen in the CPU, disk & network ta
 - **Network**: each adapter's counters and link speed come from one `GetIfEntry2` call.
 - **Disks**: from the `LogicalDisk` performance counters.
 
-Each Linux machine has its own thread, which connects to its agent, reads samples
+Each remote machine has its own thread, which connects to its agent, reads samples
 and reconnects every 5 s after a failure. Agent timestamps are mapped onto the app's
 clock using the fastest network trip seen so far, so all rows line up.
+
+`agent.py` is the Windows agent. It speaks the same protocol as `cpugraph-agent`
+(version 2) with the readers `perfmon.py` uses for This PC, so it needs no rights of its
+own. Names in the protocol are single words, so `Realtek 2.5GbE` travels as
+`Realtek_2.5GbE`, with a `label` line carrying the real name. Each of up to 8 viewers
+has its own readings and sample rate. At 20 samples a second it uses about 1% of one
+core; with no one watching, none. It keeps a short log in
+`%LOCALAPPDATA%\PortTrafficViz\agent.log` (installed, under LOCAL SERVICE's profile:
+`C:\Windows\ServiceProfiles\LocalService`).
 
 The server only listens on 127.0.0.1 and refuses requests whose `Host` header
 isn't its own address.

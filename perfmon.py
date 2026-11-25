@@ -8,13 +8,14 @@ A port of CPU Graph 2.0 (github.com/esteed/CpuGraph) into this app:
 - Network: one GetIfEntry2 call per adapter returns its 64-bit byte counters
   together with the live link state and speed.
 - Disks: the LogicalDisk performance counters (busy time, read and write bytes).
-- Linux machines: cpugraph-agent (protocol 1 or 2) streams timestamped samples
-  over TCP; they're mapped onto this app's clock so all rows line up.
+- Remote machines: cpugraph-agent on Linux, or omniTop's own agent on Windows
+  (agent.py), streams timestamped samples over TCP (protocol 1 or 2); they're
+  mapped onto this app's clock so all rows line up.
 
-Which adapters, drives and Linux machines to show comes from CPU Graph's own
+Which adapters, drives and remote machines to show comes from CPU Graph's own
 settings file, %LOCALAPPDATA%\\CpuGraph\\settings.ini, so both apps agree. It's
 only read here, never written. Without it: the connected network cards, every
-fixed drive, and no Linux machines.
+fixed drive, and no remote machines.
 
 Samples go out as "perf" server-sent events, one per tick; "perfmeta" events
 describe the machines and their adapters and disks.
@@ -26,6 +27,7 @@ import json
 import math
 import os
 import random
+import re
 import socket
 import struct
 import threading
@@ -35,7 +37,7 @@ from ctypes import wintypes
 from sysmon import PDH_FMT_COUNTERVALUE
 
 INTERVALS = (50, 100, 250, 500, 1000)    # ms between samples: 20, 10, 4, 2, 1 a second
-MAX_ITEMS = 6                            # adapters, drives and Linux machines, each
+MAX_ITEMS = 6                            # adapters, drives and remote machines, each
 AGENT_PORT = 7820
 RETRY_SECONDS = 5
 SETTINGS_PATH = os.path.join(os.environ.get("LOCALAPPDATA") or "", "CpuGraph", "settings.ini")
@@ -322,6 +324,7 @@ def adapters() -> list[dict]:
             out.append({"luid": struct.unpack_from("<Q", row, 0)[0], "alias": _wstr(row, OFF_ALIAS),
                         "desc": _wstr(row, OFF_DESC), "type": kind,
                         "card": row[OFF_FLAGS] & 0x5 == 0x5,   # hardware interface with a connector
+                        "filter": bool(row[OFF_FLAGS] & 0x2),  # a filter driver's view of another adapter
                         "up": struct.unpack_from("<i", row, OFF_OPER)[0] == 1})
         out.sort(key=lambda a: a["alias"].lower())
         return out
@@ -470,7 +473,7 @@ def size_text(b: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Linux machines running cpugraph-agent
+# Remote machines running an agent: cpugraph-agent (Linux) or agent.py (Windows)
 # ---------------------------------------------------------------------------
 
 class AgentError(Exception):
@@ -493,7 +496,7 @@ def parse_endpoint(target: str) -> tuple[str, int]:
 
 
 class RemoteAgent:
-    """Streams one Linux machine's samples. Its own thread connects, reads and reconnects."""
+    """Streams one remote machine's samples. Its own thread connects, reads and reconnects."""
 
     DRIFT = 200e-6           # real clocks differ by far less than 200 ppm
 
@@ -511,6 +514,7 @@ class RemoteAgent:
         self.have_disks: list[str] = []
         self.links: list[float] = []
         self.about: dict[str, str] = {}
+        self.labels: dict[tuple[str, str], str] = {}   # ("net" or "disk", name) -> the name that machine shows
 
     @property
     def endpoint(self) -> str:
@@ -566,12 +570,14 @@ class RemoteAgent:
         return str(exc) or type(exc).__name__
 
     def _send(self, sock, text: str) -> None:
-        sock.sendall(text.encode("ascii", errors="replace"))
+        sock.sendall(text.encode("utf-8", errors="replace"))
 
     def _selection(self) -> str:
         c = self.monitor.choice_for_remote(self.target, self.agent_host)
-        return (f"net {'auto' if c.networks is None else ' '.join(c.networks)}\n"
-                f"disk {'auto' if c.disks is None else ' '.join(c.disks)}\n")
+
+        def words(names: list[str] | None) -> str:   # names are single words in the protocol
+            return "auto" if names is None else " ".join(re.sub(r"\s+", "_", n) for n in names)
+        return f"net {words(c.networks)}\ndisk {words(c.disks)}\n"
 
     def _session(self) -> None:
         self._connected = False
@@ -632,7 +638,7 @@ class RemoteAgent:
                 arrival = now()
                 if not raw:
                     raise AgentError(f"The agent on {self.endpoint} closed the connection")
-                line = raw.decode("ascii", errors="replace").rstrip("\r\n")
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if line.startswith("s "):
                     self._sample(line, arrival)
                 elif line.startswith("cpu "):
@@ -643,6 +649,10 @@ class RemoteAgent:
                     self._disks(line)
                 elif line.startswith("about "):
                     self._about(line)
+                elif line.startswith("label "):
+                    parts = line.split(" ", 3)
+                    if len(parts) == 4 and parts[3].strip():
+                        self.labels[parts[1], parts[2]] = parts[3].strip()[:64]
                 elif line.startswith("have "):
                     parts = line.split()
                     if len(parts) >= 2:
@@ -756,7 +766,10 @@ class RemoteAgent:
                 links.append(-1.0)
             else:
                 links.append(float(state) * 1e6 if state.isdigit() else 0.0)
-            item.scale, item.problem = parse_scale(self.monitor.scale_for_remote(self.target, self.agent_host, name))
+            item.name = self.labels.get(("net", name), name)
+            scale = self.monitor.scale_for_remote(self.target, self.agent_host, item.name) \
+                or self.monitor.scale_for_remote(self.target, self.agent_host, name)
+            item.scale, item.problem = parse_scale(scale)
             items.append(item)
         self.links = links
         self.machine.nets = items
@@ -784,6 +797,7 @@ class RemoteAgent:
             item.detail = self.about.get(item.name, "")
             if missing:
                 item.status = self._not_found(item.name, self.have_disks)
+            item.name = self.labels.get(("disk", item.name), item.name)
             items.append(item)
         self.machine.disks = items
         self.machine.version += 1
@@ -791,7 +805,7 @@ class RemoteAgent:
 
 
 # ---------------------------------------------------------------------------
-# The sampler: this PC every tick, plus whatever the Linux machines sent
+# The sampler: this PC every tick, plus whatever the remote machines sent
 # ---------------------------------------------------------------------------
 
 class PerfMonitor:
@@ -1037,7 +1051,7 @@ class LocalPerf:
 
 
 class DemoPerf:
-    """Made-up numbers: a 16-thread PC with two adapters and two drives, and one Linux machine."""
+    """Made-up numbers: a 16-thread PC with two adapters and two drives, and two remote machines."""
 
     def __init__(self, mon: PerfMonitor) -> None:
         self.mon, self.rng = mon, random.Random()
@@ -1047,17 +1061,20 @@ class DemoPerf:
         m.disks = [Item("C:"), Item("D:")]
         m.disks[0].detail, m.disks[1].detail = "Windows", "Data"
         m.version += 1
-        r = Machine("r:demo-linux", "demo-linux")
-        r.threads, r.detail = 4, threads_text(4) + " · 10.0.0.42"
-        r.nets = [Item("enp1s0")]
-        r.disks = [Item("sda")]
-        r.disks[0].detail = "QEMU HARDDISK · 107 GB"
-        r.version += 1
-        agent = RemoteAgent("demo-linux", mon)
-        agent.machine = r
-        mon.remotes = [agent]                          # never started: samples come from here
+        mon.remotes = []                               # never started: their samples come from here
+        for name, threads, where, net, disk, about in (
+                ("demo-linux", 4, "10.0.0.42", "enp1s0", "sda", "QEMU HARDDISK · 107 GB"),
+                ("demo-windows", 8, "10.0.0.43", "Ethernet", "C:", "Windows · 512 GB")):
+            r = Machine(f"r:{name}", name)
+            r.threads, r.detail = threads, f"{threads_text(threads)} · {where}"
+            r.nets, r.disks = [Item(net)], [Item(disk)]
+            r.disks[0].detail = about
+            r.version += 1
+            agent = RemoteAgent(name, mon)
+            agent.machine = r
+            mon.remotes.append(agent)
         self.load = [self.rng.uniform(2, 20) for _ in range(16)]
-        self.rload = [self.rng.uniform(1, 10) for _ in range(4)]
+        self.rloads = [[self.rng.uniform(1, 10) for _ in range(a.machine.threads)] for a in mon.remotes]
         self.t0 = now()
 
     def retry(self) -> None:
@@ -1080,11 +1097,11 @@ class DemoPerf:
         write = max(0.0, 3e8 * max(0.0, math.sin(el / 17 + 1)) ** 6 + rng.gauss(1e6, 5e5))
         disks = [[min(100.0, write / 4e6 + rng.uniform(0, 3)), max(0.0, rng.gauss(4e6, 2e6)), write],
                  [rng.uniform(0, 2), max(0.0, rng.gauss(2e5, 1e5)), max(0.0, rng.gauss(1e5, 5e4))]]
-        rl = self._walk(self.rload, burst * 0.5)
-        rm = self.mon.remotes[0].machine
-        self.mon.add_remote(rm.id, rm.version, t - 0.004, [sum(rl) / 4] + rl,
-                            [[max(0.0, rng.gauss(1.5e5, 5e4)), max(0.0, rng.gauss(4e4, 1e4)), 1e9]],
-                            [[rng.uniform(0, 4), max(0.0, rng.gauss(5e4, 3e4)), max(0.0, rng.gauss(2e5, 1e5))]])
+        for a, loads in zip(self.mon.remotes, self.rloads):
+            rl, rm = self._walk(loads, burst * 0.5), a.machine
+            self.mon.add_remote(rm.id, rm.version, t - 0.004, [sum(rl) / len(rl)] + rl,
+                                [[max(0.0, rng.gauss(1.5e5, 5e4)), max(0.0, rng.gauss(4e4, 1e4)), 1e9]],
+                                [[rng.uniform(0, 4), max(0.0, rng.gauss(5e4, 3e4)), max(0.0, rng.gauss(2e5, 1e5))]])
         return _pack(t, cpu, nets, disks)
 
 
