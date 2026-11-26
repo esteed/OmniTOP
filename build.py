@@ -34,7 +34,7 @@ def oklch(L: float, C: float, h: float) -> tuple[int, int, int]:
         C = max(0.0, C - 0.004)
 
 
-# The icon: a ring split like the Memory & GPU tab's memory bar (in use,
+# The icon: a ring split like the Memory page's memory bar (in use,
 # kernel, modified, standby, free), around a performance graph, on a dark tile.
 ICON_RING = [((0.68, 0.15, 152), 0.40), ((0.66, 0.17, 355), 0.15), ((0.84, 0.15, 78), 0.09),
              ((0.66, 0.14, 248), 0.24), ((0.40, 0.012, 240), 0.12)]
@@ -113,8 +113,8 @@ def app_version() -> str:
 def make_version_file(path: str, version: str) -> None:
     """The exe's version resource: Properties > Details shows it."""
     nums = tuple((list(map(int, version.split("."))) + [0, 0, 0])[:4])
-    strings = {"FileDescription": "omniTop", "FileVersion": version, "InternalName": "omniTop",
-               "OriginalFilename": "omniTop.exe", "ProductName": "omniTop", "ProductVersion": version}
+    strings = {"FileDescription": "OmniTOP", "FileVersion": version, "InternalName": "omniTop",
+               "OriginalFilename": "omniTop.exe", "ProductName": "OmniTOP", "ProductVersion": version}
     table = ",\n        ".join(f"StringStruct({k!r}, {v!r})" for k, v in strings.items())
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"""VSVersionInfo(
@@ -146,6 +146,7 @@ def main() -> int:
         "--icon", icon,
         "--version-file", version_file,
         "--add-data", f"{os.path.join(HERE, 'web')}{os.pathsep}web",
+        "--add-data", f"{os.path.join(HERE, 'linux')}{os.pathsep}linux",
         "--distpath", os.path.join(HERE, "dist"),
         "--workpath", os.path.join(WORK, "work"),
         "--specpath", WORK,

@@ -1,8 +1,9 @@
 'use strict';
-// Network ports tab extras: the details bubbles for pinned ports, and the
-// port-scan alerts. Uses app.js: $, esc, ports, state, svcName, fmtRate,
-// pinned, windowSpan, loadPref, savePref, stage, activeTab, fitAround,
-// listListeners, scanListeners, tabListeners.
+// Ports page extras: the details bubbles for pinned ports, and the
+// port-scan alerts, of this PC and remote machines. Uses app.js: $, esc, ports,
+// state, svcName, fmtRate, pinned, windowSpan, loadPref, savePref, stage,
+// activeTab, fitAround, portsOf, listListeners, scanListeners, tabListeners,
+// portsListeners; and later scripts' pm, rCards, nav and viewMachine.
 // Every top-level name here starts with bub or scan, so none can clash with
 // the other scripts (they all share one global scope).
 
@@ -104,14 +105,22 @@ async function bubFetch(p) {
   const b = bubOpenNow.get(p);
   if (!b) return;
   try {
-    const res = await fetch(`/api/port?p=${p}`, { cache: 'no-store' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const of = portsOf === 'local' ? '' : `&machine=${encodeURIComponent(portsOf)}`;
+    const res = await fetch(`/api/port?p=${p}${of}`, { cache: 'no-store' });
+    if (!res.ok) {
+      const why = res.status === 503 ? (await res.json().catch(() => ({}))).error : '';
+      throw new Error(why || `HTTP ${res.status}`);
+    }
     const data = await res.json();
     if (bubOpenNow.get(p) !== b) return;   // closed meanwhile
+    if (data.error) throw new Error(data.error);
     b.data = data;
     bubProcs(p, b);
-  } catch {
-    if (!b.data) b.el.querySelector('.bub-procs').innerHTML = '<p class="faint">Couldn’t look up this port’s processes.</p>';
+  } catch (err) {
+    if (!b.data && bubOpenNow.get(p) === b) {
+      b.el.querySelector('.bub-procs').innerHTML = `<p class="faint">Couldn’t look up this port’s processes` +
+        `${portsOf !== 'local' && err.message && !/^HTTP/.test(err.message) ? `: ${esc(err.message)}` : ''}.</p>`;
+    }
   }
   if (bubOpenNow.get(p) === b) b.timer = setTimeout(() => bubFetch(p), BUB_REFRESH);
 }
@@ -200,34 +209,48 @@ function bubProcs(p, b) {
 // Port scan alerts
 // ---------------------------------------------------------------------------
 // Each scan has its own alert: one that stops and starts again is a new scan.
-// While any scan runs, the Port scan button pulses red. A new scan zooms the
-// view out so both grids fit beside its alert, and, if another tab is open,
-// makes the Network ports tab flash (a red dot stays after the scan ends,
-// until the tab is opened).
-const scanBox = $('alerts'), scanLight = $('ctl-scan'), scanTab = $('tabbtn-net');
-const scanKnown = new Map();     // scan id -> latest description from the server
-// id -> how many packets it had when dismissed; it comes back if more arrive.
+// Each machine's Ports page shows that machine's alerts. While a scan of the
+// machine shown runs, the Port scan button pulses red. A new scan zooms the
+// view out so both grids fit beside its alert, and, if its machine's Ports page
+// isn't showing, makes that page's tab flash (a red dot stays after the scan
+// ends, until the page is opened): the Ports tab, the Local tab for this PC,
+// the Remote tab and the machine's card for a remote one.
+const scanBox = $('alerts'), scanLight = $('ctl-scan'), scanTab = $('tabbtn-net'), scanTop = $('topbtn-local'),
+  scanRemoteTop = $('topbtn-remote');
+const scanKnown = new Map();     // machine|scan id -> latest description from the server, with its machine as .m
+// key -> how many packets it had when dismissed; it comes back if more arrive.
 const scanDismissed = new Map(Object.entries(loadPref('dismissedScans') || {}));
 let scanSkew = 0;                // server clock minus this one, seconds
-let scanUnseen = false;          // a scan began while another tab was open
-let scanFitDue = false;          // fit the view around the alerts when the tab is next shown
+const scanUnseen = new Set();    // machines a scan began on while their Ports page wasn't showing
+let scanFitDue = false;          // fit the view around the alerts when the page is next shown
+
+const scanKey = s => `${s.m}|${s.id}`;
+const scanShowing = id => activeTab === 'net' && portsOf === id;
 
 function scanTake(m) {
   if (m.now) scanSkew = m.now - Date.now() / 1000;
   let fresh = false;
   for (const s of m.scans || []) {
-    if (!scanKnown.has(s.id) && !s.ended) fresh = true;
-    scanKnown.set(s.id, s);
+    s.m = s.m || m.m || 'local';
+    if (!scanKnown.has(scanKey(s)) && !s.ended) {
+      if (scanShowing(s.m)) fresh = true;
+      else scanUnseen.add(s.m);
+    }
+    scanKnown.set(scanKey(s), s);
   }
   scanRender();
   if (fresh) {
     scanFitDue = true;
-    if (activeTab === 'net') requestAnimationFrame(scanFit);
-    else scanUnseen = true;
-    scanMarkTab();
+    requestAnimationFrame(scanFit);
   }
 }
 scanListeners.push(scanTake);
+portsListeners.push(id => {   // another machine's page: its own bubbles and alerts
+  for (const p of [...bubOpenNow.keys()]) bubClose(p);
+  scanUnseen.delete(id);
+  scanFitDue = [...scanKnown.values()].some(s => s.m === id && !s.ended);
+  scanRender();
+});
 
 // Scans from before this page opened (or before a reconnect).
 async function scanLoad() {
@@ -236,19 +259,37 @@ async function scanLoad() {
   } catch { /* the stream brings new ones anyway */ }
 }
 
-const scanLive = () => [...scanKnown.values()].some(s => !s.ended);
+const scanLive = id => [...scanKnown.values()].some(s => s.m === id && !s.ended);
 
+// Which tabs flash, and which machines' cards say they're being scanned.
 function scanMarkTab() {
-  const live = scanLive();
-  scanTab.classList.toggle('alarm', scanUnseen && live);
-  scanTab.classList.toggle('alarm-dot', scanUnseen && !live);
+  const shown = typeof viewMachine === 'function' ? viewMachine() : 'local';
+  const top = typeof nav !== 'undefined' ? nav.top : 'local';
+  const mark = (el, unseen, live) => {
+    el.classList.toggle('alarm', unseen && live);
+    el.classList.toggle('alarm-dot', unseen && !live);
+  };
+  mark(scanTab, scanUnseen.has(shown), scanLive(shown));
+  mark(scanTop, top !== 'local' && scanUnseen.has('local'), scanLive('local'));
+  const remote = [...scanUnseen].filter(id => id !== 'local' && !(top === 'remote' && id === shown));
+  mark(scanRemoteTop, remote.length > 0 && !(top === 'remote' && !nav.machine), remote.some(scanLive));
+  if (typeof rCards !== 'undefined') {
+    for (const [id, c] of rCards) {
+      const live = scanLive(id);
+      c.el.classList.toggle('scanned', live || scanUnseen.has(id));
+      c.el.classList.toggle('scan-live', live);
+      c.el.querySelector('.rwho').dataset.scan = live ? 'Port scan under way' : scanUnseen.has(id) ? 'Was port scanned' : '';
+    }
+  }
 }
+if (typeof perfMetaListeners !== 'undefined') perfMetaListeners.push(() => requestAnimationFrame(scanMarkTab));   // new cards
 
 tabListeners.push(name => {
-  if (name !== 'net') return;
-  scanUnseen = false;
+  if (name === 'net') {
+    scanUnseen.delete(portsOf);
+    if (scanFitDue) requestAnimationFrame(scanFit);
+  }
   scanMarkTab();
-  if (scanFitDue) requestAnimationFrame(scanFit);
 });
 
 // Zoom out so both grids fit beside the alerts.
@@ -263,9 +304,9 @@ function scanFit() {
 
 // The button brings back the newest alert, if it was dismissed, and makes room for it.
 scanLight.addEventListener('click', () => {
-  const newest = [...scanKnown.values()].sort((a, b) => b.first - a.first)[0];
+  const newest = [...scanKnown.values()].filter(s => s.m === portsOf).sort((a, b) => b.first - a.first)[0];
   if (!newest) return;
-  scanDismissed.delete(newest.id);
+  scanDismissed.delete(scanKey(newest));
   savePref('dismissedScans', Object.fromEntries(scanDismissed));
   scanRender();
   requestAnimationFrame(scanFit);
@@ -291,33 +332,44 @@ function scanDuration(s) {
   return s < 90 ? `${Math.max(1, Math.round(s))} s` : `${Math.round(s / 60)} min`;
 }
 
+const SCAN_ORDER = { up: 'in order, lowest first', down: 'in order, highest first', mixed: 'in random order' };
+
+function scanFrom(s) {
+  const one = r => `<span class="mono">${esc(r[0])}</span>${r[1] ? ` <span class="faint">(${esc(r[1])})</span>` : ''}`;
+  if (s.machines === 1) return `From ${one(s.remotes[0])}`;
+  const some = s.remotes.slice(0, 6), more = s.machines - some.length;
+  return `From ${s.machines.toLocaleString()} machines together: ${some.map(one).join(', ')}` +
+    (more ? ` and ${more.toLocaleString()} more` : '');
+}
+
 function scanCard(s) {
   const tcp = s.ports.filter(x => x[1] === 'TCP').map(x => x[0]);
   const udp = s.ports.filter(x => x[1] === 'UDP').map(x => x[0]);
   const open = s.ports.filter(x => x[2] === 'open').map(x => `${x[1]} ${x[0]}`);
-  const n = new Set(s.ports.map(x => x[0])).size;
+  const n = s.total, more = n - s.ports.length;
   const phase = s.ended ? `ended ${scanTime(s.last)}` : 'in progress';
-  return `<div class="alert${s.ended ? ' ended' : ''}" data-id="${esc(s.id)}" role="alert">` +
+  return `<div class="alert${s.ended ? ' ended' : ''}" data-id="${esc(scanKey(s))}" role="alert">` +
     `<div class="al-head"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 14.5 13.5h-13z"/><path d="M8 6v3.6M8 11.4v.1"/></svg>` +
     `<b>Port scan detected</b><span class="al-state">${phase}</span>` +
     `<button type="button" class="al-x" aria-label="Dismiss" title="Dismiss">✕</button></div>` +
-    `<div class="al-from">From <span class="mono">${esc(s.remote)}</span>${s.name ? ` <span class="faint">(${esc(s.name)})</span>` : ''}</div>` +
-    `<div class="al-stats">${n.toLocaleString()} port${n === 1 ? '' : 's'} probed · ${s.probes.toLocaleString()} packets · ` +
+    `<div class="al-from">${scanFrom(s)}</div>` +
+    `<div class="al-stats">${n.toLocaleString()} port${n === 1 ? '' : 's'} probed ${SCAN_ORDER[s.order]} · ${s.probes.toLocaleString()} packets · ` +
     `over ${scanDuration(s.last - s.first)} · since ${scanTime(s.first)}</div>` +
     (open.length ? `<div class="al-open">Answered (open here): ${esc(open.join(', '))}</div>` : '') +
     `<div class="al-ports">` +
     (tcp.length ? `<div><span class="al-k">TCP</span> ${scanRanges(tcp)}</div>` : '') +
     (udp.length ? `<div><span class="al-k">UDP</span> ${scanRanges(udp)}</div>` : '') +
+    (more > 0 ? `<div>and ${more.toLocaleString()} more</div>` : '') +
     `</div></div>`;
 }
 
 function scanRender() {
   const show = [...scanKnown.values()]
-    .filter(s => !scanDismissed.has(s.id) || s.probes > scanDismissed.get(s.id))
+    .filter(s => s.m === portsOf && (!scanDismissed.has(scanKey(s)) || s.probes > scanDismissed.get(scanKey(s))))
     .sort((a, b) => b.first - a.first);
   scanBox.innerHTML = show.map(scanCard).join('');
   stage.classList.toggle('has-alert', show.length > 0);
-  const live = scanLive();
+  const live = scanLive(portsOf);
   scanLight.classList.toggle('on', live);
   scanLight.setAttribute('aria-pressed', String(live));
   scanLight.title = live ? 'A port scan is under way. Click to show its alert.'

@@ -35,7 +35,8 @@ const state = {
   side: 'both', proto: 'all', max: 1e9, paused: false, hideOwn: false,
   mode: null, connected: false, services: {}, hover: null, pins: [], mouse: null,
   focus: null,                        // port whose details bubble the pointer is on
-  dyn: { start: 49152, end: 65535 },  // this PC's ephemeral port range, from /api/info
+  dyn: { start: 49152, end: 65535 },  // the ephemeral port range of the machine shown
+  os: 'windows',                      // and its system
 };
 const isDyn = p => p >= state.dyn.start && p <= state.dyn.end;
 // port -> { c, hist, proc, rate, base, own, target, btarget, h, hb }
@@ -49,6 +50,7 @@ let tickNo = 0;
 const $ = id => document.getElementById(id);
 const stage = $('stage'), cv = $('cv'), ctx = cv.getContext('2d'), tip = $('tip');
 const sysListeners = [];              // memory.js: called with each memory/GPU sample
+const rmemListeners = [];             // memory.js: and with each remote machine's
 const perfListeners = { perf: [], perfmeta: [] };   // perf.js
 const listListeners = [];             // watch.js: called after the busiest-ports list redraws
 const scanListeners = [];             // watch.js: called with each port scan update
@@ -56,7 +58,7 @@ const tabListeners = [];              // watch.js: called with the tab's name wh
 const probeLit = new Map();           // port -> when (s, page clock) its scan-probe light goes out
 const procJump = new Map();           // process name -> { avg, hot, seen } for traffic jumps
 let jumpClock = 0, jumpWarm = JUMP.warm, totalAvg = 0;
-let activeTab = 'net';
+let activeTab = '';                   // the page showing (shell.js)
 
 // Settings that survive a restart. Storage can be off; then they just don't.
 const PREF = 'portTraffic.';
@@ -332,6 +334,7 @@ function resetJumps() {
 
 // A scanning address probed these ports: light their squares for a second.
 function onProbe(m) {
+  if ((m.m || 'local') !== portsOf) return;
   const until = performance.now() / 1000 + PROBE_LIGHT;
   for (const p of m.h || []) if (p >= 1 && p <= 65535) probeLit.set(p, until);
 }
@@ -438,7 +441,7 @@ function ephemeralNote(g) {
   font(g, size, 600);
   const w = g.measureText(head).width;
   text(g, head, 0, dy, size, T.ink2, 'left', 600);
-  text(g, '  ·  Windows assigns them to outgoing connections', w, dy, size, T.muted);
+  text(g, `  ·  ${state.os === 'linux' ? 'Linux' : 'Windows'} assigns them to outgoing connections`, w, dy, size, T.muted);
   g.restore();
 }
 
@@ -831,7 +834,7 @@ function showTip() {
     html += `<div class="faint">As local port ${r(loc)} · as remote ${r(rem)}</div>`;
   }
   if (e && e.own > 0) {
-    html += `<div class="faint"><span class="sw own"></span>This app's own traffic ${fmtRate(e.own)}${state.hideOwn ? ' (hidden)' : ''}</div>`;
+    html += `<div class="faint"><span class="sw own"></span>${portsOwnName()} ${fmtRate(e.own)}${state.hideOwn ? ' (hidden)' : ''}</div>`;
   }
   if (!e || (e.rate <= 0 && e.own <= 0)) {
     html += `<div class="faint">No traffic in the last ${+windowSpan().toFixed(1)} s</div>`;
@@ -889,7 +892,7 @@ function tputBar(id, bps) {
 function listRow(p, e) {
   const rate = e ? e.rate : 0;
   const t = norm(rate), tb = e && e.base > 0 ? Math.min(t, norm(e.base)) : 0;
-  const who = e && e.proc ? e.proc : e && e.base <= 0 && e.own > 0 ? 'this app' : '';
+  const who = e && e.proc ? e.proc : e && e.base <= 0 && e.own > 0 ? (portsOf === 'local' ? 'this app' : 'its agent') : '';
   const ownBar = t - tb > 0.001 ? `<i class="own" style="width:${((t - tb) * 100).toFixed(1)}%"></i>` : '';
   const cls = [pinned(p) ? 'pin' : '', e && flashing(e) ? 'jump' : ''].join(' ').trim();
   return `<li data-port="${p}" class="${cls}">` +
@@ -973,7 +976,7 @@ $('ctl-rate').addEventListener('change', async ev => {
 
 function renderOwn() {
   $('ctl-own').checked = state.hideOwn;
-  $('own-text').textContent = state.hideOwn ? "This app's own traffic: hidden" : "This app's own traffic";
+  $('own-text').textContent = state.hideOwn ? `${portsOwnName()}: hidden` : portsOwnName();
 }
 $('ctl-own').addEventListener('change', ev => {
   state.hideOwn = ev.target.checked;
@@ -1004,102 +1007,74 @@ function renderStatus() {
 }
 
 // ---------------------------------------------------------------------------
-// Tabs
+// Which machine the page shows: this PC ('local') or a remote one, by its id
 // ---------------------------------------------------------------------------
-const tabButtons = [...document.querySelectorAll('.tab')];
+let portsOf = 'local';
+const portsPins = new Map();          // machine -> its pinned ports
+const portsListeners = [];            // watch.js: called with the machine when it changes
+const portsLocal = { dyn: { start: 49152, end: 65535 } };   // this PC's, from /api/info
 
-function showTab(name) {
-  activeTab = ['net', 'mem', 'perf'].includes(name) ? name : 'net';
-  for (const b of tabButtons) {
-    const on = b.dataset.tab === activeTab;
-    b.classList.toggle('on', on);
-    b.setAttribute('aria-selected', String(on));
-    b.tabIndex = on ? 0 : -1;
-  }
-  for (const t of ['net', 'mem', 'perf']) $('tab-' + t).hidden = activeTab !== t;
-  state.hover = null;
-  tip.hidden = true;
-  savePref('tab', activeTab);
-  for (const f of tabListeners) f(activeTab);
-}
-document.querySelector('.tabs').addEventListener('click', ev => {
-  const b = ev.target.closest('.tab');
-  if (b) showTab(b.dataset.tab);
-});
-document.querySelector('.tabs').addEventListener('keydown', ev => {
-  if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
-  const i = tabButtons.findIndex(b => b.dataset.tab === activeTab);
-  const next = tabButtons[(i + (ev.key === 'ArrowRight' ? 1 : tabButtons.length - 1)) % tabButtons.length];
-  showTab(next.dataset.tab);
-  next.focus();
-});
+const portsOwnName = () => portsOf === 'local' ? "This app's own traffic" : "Its agent's own traffic";
 
-// ---------------------------------------------------------------------------
-// Startup
-// ---------------------------------------------------------------------------
-async function loadInfo() {
-  try {
-    const info = await (await fetch('/api/info', { cache: 'no-store' })).json();
-    state.mode = info.mode;
-    state.services = info.services || {};
-    if (info.dynamic) {   // the grid's ephemeral band follows this PC's range
-      state.dyn = { start: info.dynamic.start, end: info.dynamic.end };
-      layersDirty = true;
-    }
-    if (info.tick > 0) setTick(info.tick);
-    document.title = `omniTop · ${info.host}`;
-    if (info.version) {   // top right of the tab bar, beside the Live / Demo data light
-      $('version').textContent = `omniTop ${info.version}`;
-      $('version').title = `omniTop version ${info.version}`;
-      $('version').hidden = false;
-    }
-    // Put back the sample rate chosen last time.
-    const want = loadPref('rate');
-    if (!rateRestored && RATES.includes(want) && Math.round(1 / info.tick) !== want) {
-      $('ctl-rate').value = String(want);
-      postRate(want).catch(() => { $('ctl-rate').value = String(Math.round(1 / tick)); });
-    }
-    rateRestored = true;
-  } catch {
-    // The stream's reconnect will retry; names just stay blank meanwhile.
-  }
-  renderStatus();
+function portsInfo(id = portsOf) {
+  const s = id !== 'local' && typeof pm !== 'undefined' ? pm.get(id) : null;
+  return s && s.info;
 }
 
-function connect() {
-  const es = new EventSource('/events');
-  es.onopen = () => {
-    state.connected = true;
-    if (!state.mode) loadInfo();
-    renderStatus();
-  };
-  es.onmessage = ev => onTick(JSON.parse(ev.data));
-  es.addEventListener('probe', ev => onProbe(JSON.parse(ev.data)));
-  es.addEventListener('scan', ev => {
-    const m = JSON.parse(ev.data);
-    for (const f of scanListeners) f(m);
-  });
-  es.addEventListener('sys', ev => {
-    const m = JSON.parse(ev.data);
-    for (const f of sysListeners) f(m);
-  });
-  // perf.js: CPU, disk & network samples and the description of what's sampled
-  for (const kind of ['perf', 'perfmeta']) {
-    es.addEventListener(kind, ev => {
-      const m = JSON.parse(ev.data);
-      for (const f of perfListeners[kind]) f(m);
-    });
+// The machine's ephemeral range, and what the page says about it.
+function portsLook() {
+  const info = portsInfo();
+  const dyn = portsOf === 'local' ? portsLocal.dyn
+    : info && info.ports.dynamic ? { start: info.ports.dynamic[0], end: info.ports.dynamic[1] }
+      : info && info.os === 'linux' ? { start: 32768, end: 60999 } : { start: 49152, end: 65535 };
+  const os = portsOf === 'local' ? 'windows' : info ? info.os : 'linux';
+  if (dyn.start !== state.dyn.start || dyn.end !== state.dyn.end || os !== state.os) {
+    state.dyn = dyn;
+    state.os = os;
+    layersDirty = true;
   }
-  es.onerror = () => { state.connected = false; renderStatus(); };
+  const note = $('ports-note');
+  let say = '';
+  if (portsOf !== 'local') {
+    if (!info) say = 'Waiting for this machine…';
+    else if (info.state === 'down') say = `Connection Issues: ${info.status || 'no answer'}`;
+    else if (info.state !== 'ok') say = 'Connecting…';
+    else if (!info.ports.can) say = info.ports.note || 'Its agent doesn’t send port traffic.';
+    else if (info.ports.error) say = `Its agent can’t watch the network: ${info.ports.error}`;
+  }
+  note.textContent = say;
+  note.hidden = !say;
 }
 
-showTab(loadPref('tab'));
+// Start the page afresh for another machine: nothing of the last one's traffic carries over.
+function portsShow(id) {
+  if (id === portsOf) { portsLook(); return; }
+  portsPins.set(portsOf, state.pins);
+  portsOf = id;
+  state.pins = portsPins.get(id) || [];
+  ports.clear();
+  dts.length = 0;
+  dirHist.length = 0;
+  probeLit.clear();
+  procJump.clear();
+  jumpWarm = JUMP.warm;
+  totalAvg = 0;
+  state.hover = state.focus = null;
+  $('ctl-rate').closest('label').hidden = id !== 'local';   // remote machines send at a set pace
+  portsLook();
+  renderOwn();
+  for (const f of portsListeners) f(id);
+  refresh();
+}
+addEventListener('DOMContentLoaded', () => perfMetaListeners.push(() => { if (portsOf !== 'local') portsLook(); }));
+
+// ---------------------------------------------------------------------------
+// Startup (shell.js connects to the server once everything is loaded)
+// ---------------------------------------------------------------------------
 state.hideOwn = loadPref('hideOwn') === true;
 renderOwn();
 readTheme();
 darkQuery.addEventListener('change', () => { readTheme(); layersDirty = true; });
 new ResizeObserver(layout).observe(stage);
 layout();
-loadInfo();
-connect();
 requestAnimationFrame(frame);

@@ -1,4 +1,4 @@
-"""omniTop server.
+"""OmniTOP server.
 
 Counts TCP/UDP bytes per port on this machine using the
 Microsoft-Windows-Kernel-Network ETW provider (needs administrator rights)
@@ -36,15 +36,17 @@ from urllib.request import urlopen
 
 import netwatch
 import perfmon
+import settings as app_settings
 import sysmon
 
 # The app's version, shown in the tab bar. Raise it for each release; build.py
 # reads it from here and stamps it into the exe's file properties.
-VERSION = "1.9.0"
+VERSION = "2.1.0"
 
 # In the packaged exe the web files are unpacked next to the bundled modules.
 HERE = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web")
+LINUX_AGENT = os.path.join(HERE, "linux", "omnitop-agent.py")
 DEFAULT_PORT = 8787
 RATES = (20, 10, 5, 2, 1)   # samples a second the view can choose from
 DEFAULT_RATE = 20
@@ -252,11 +254,13 @@ INVALID_PROCESSTRACE_HANDLE = 0xFFFFFFFFFFFFFFFF
 KERNEL_NETWORK_GUID = GUID.parse("7DD42A49-5329-4832-8DFD-43D979153A88")
 # Microsoft-Windows-TCPIP, for port scans: event 1214 is a packet the transport
 # layer dropped, such as a probe of a port nothing listens on that Windows
-# Firewall discarded.
+# Firewall discarded. Event 1002 is this machine starting a TCP connection,
+# whatever becomes of it: the answers aren't probes.
 TCPIP_GUID = GUID.parse("2F07E2EE-15DB-40F1-90EF-9D7BA282188A")
 TCPIP_DATA1 = 0x2F07E2EE
 KW_TCPIP_DROPPED = 0x0000010000000000
-TCPIP_EVENTS = (1214,)
+KW_TCPIP_CONNECT = 0x0000000400000000
+TCPIP_EVENTS = (1214, 1002)
 EVENT_FILTER_TYPE_EVENT_ID = 0x80000200
 ENABLE_TRACE_PARAMETERS_VERSION_2 = 2
 SESSION_GUID = GUID.parse("5C3E6F0B-8A41-4F0E-9B6D-2D7A1E4C9F31")
@@ -278,7 +282,7 @@ def _sockaddr(data: bytes, off: int, length: int) -> tuple[str, int]:
 def check_layouts() -> None:
     """Fail fast if this Python's struct layouts don't match the Windows SDK."""
     if struct.calcsize("P") != 8:
-        raise SystemExit("omniTop needs 64-bit Python.")
+        raise SystemExit("OmniTOP needs 64-bit Python.")
     expected = {EVENT_TRACE_PROPERTIES: 120, EVENT_TRACE_LOGFILEW: 448, EVENT_RECORD: 112,
                 TRACE_LOGFILE_HEADER: 280, EVENT_HEADER: 80}
     for cls, size in expected.items():
@@ -314,14 +318,21 @@ class EtwCapture:
     EVENTS = {10: (TCP, True, 4), 11: (TCP, False, 4), 26: (TCP, True, 16), 27: (TCP, False, 16),
               42: (UDP, True, 4), 43: (UDP, False, 4), 58: (UDP, True, 16), 59: (UDP, False, 16)}
 
-    # Kernel-Network's TCP accepts (IPv4, IPv6) and TCPIP's drops: the events
-    # a port scan shows up in.
-    PROBE_EVENTS = frozenset((15, 31) + TCPIP_EVENTS)
+    # Kernel-Network's TCP accepts (IPv4, IPv6) and TCPIP's drops, the events a
+    # port scan shows up in, and the connections this machine makes.
+    PROBE_EVENTS = frozenset((15, 31, 12, 28) + TCPIP_EVENTS)
+
+    # Enough for scans alone: connections made and accepted, and UDP sent (what comes back isn't a probe).
+    PROBES_ONLY = (12, 15, 28, 31, 42, 58)
 
     def __init__(self, acc: Accumulator, own_port: int = 0, owner_pid: int | None = None,
-                 scans: netwatch.ScanWatch | None = None) -> None:
+                 scans: netwatch.ScanWatch | None = None, session: tuple[str, GUID] | None = None,
+                 events: tuple[int, ...] | None = None) -> None:
+        """session: (name, GUID) of a session of its own (the agent's), and events: only these of Kernel-Network's."""
         self.acc = acc
         self.scans = scans
+        self.session_name, self.session_guid = session or (SESSION_NAME, SESSION_GUID)
+        self.events = events
         self.probe_log = None   # debugging: called with every probe event before filtering
         self.adv = _advapi()
         self.session: int | None = None
@@ -330,6 +341,7 @@ class EtwCapture:
         self._halt = threading.Event()
         self._callback = EVENT_RECORD_CALLBACK(self._on_event)
         self._logfile = None
+        self.scans_error = ""
         self.names = ProcessNames().get
         # This app's own traffic: its web server's port, and the processes it
         # runs as (this one, plus the window and its browser engine).
@@ -343,7 +355,7 @@ class EtwCapture:
         p.Wnode.BufferSize = ctypes.sizeof(tp)
         p.Wnode.Flags = WNODE_FLAG_TRACED_GUID
         p.Wnode.ClientContext = 1
-        p.Wnode.Guid = SESSION_GUID
+        p.Wnode.Guid = self.session_guid
         p.BufferSize = 64
         p.MinimumBuffers = 8
         p.MaximumBuffers = 64
@@ -356,26 +368,33 @@ class EtwCapture:
 
     def _stop_session(self) -> int:
         tp = self._props()
-        return self.adv.ControlTraceW(0, SESSION_NAME, ctypes.byref(tp), EVENT_TRACE_CONTROL_STOP)
+        return self.adv.ControlTraceW(0, self.session_name, ctypes.byref(tp), EVENT_TRACE_CONTROL_STOP)
 
     def start(self) -> None:
         handle = ULONG64()
         tp = self._props()
-        rc = self.adv.StartTraceW(ctypes.byref(handle), SESSION_NAME, ctypes.byref(tp))
+        rc = self.adv.StartTraceW(ctypes.byref(handle), self.session_name, ctypes.byref(tp))
         if rc == ERROR_ALREADY_EXISTS:  # left over from a run that didn't shut down cleanly
             stop_rc = self._stop_session()
             if stop_rc == 5:  # ERROR_ACCESS_DENIED: not elevated, so say that instead
                 rc = stop_rc
             else:
                 tp = self._props()
-                rc = self.adv.StartTraceW(ctypes.byref(handle), SESSION_NAME, ctypes.byref(tp))
+                rc = self.adv.StartTraceW(ctypes.byref(handle), self.session_name, ctypes.byref(tp))
         if rc:
             raise OSError(rc, f"Couldn't start the trace session: {ctypes.FormatError(rc).strip()}")
         self.session = handle.value
 
-        rc = self.adv.EnableTraceEx2(self.session, ctypes.byref(KERNEL_NETWORK_GUID),
-                                     EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE,
-                                     0xFFFFFFFFFFFFFFFF, 0, 0, None)
+        rc = 1
+        if self.events:
+            self._network_filter = self._event_filter(self.events)
+            rc = self.adv.EnableTraceEx2(self.session, ctypes.byref(KERNEL_NETWORK_GUID),
+                                         EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE,
+                                         0xFFFFFFFFFFFFFFFF, 0, 0, ctypes.byref(self._network_filter[0]))
+        if rc:   # all of them: what isn't wanted is left out in the callback
+            rc = self.adv.EnableTraceEx2(self.session, ctypes.byref(KERNEL_NETWORK_GUID),
+                                         EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE,
+                                         0xFFFFFFFFFFFFFFFF, 0, 0, None)
         if rc:
             self.stop()
             raise OSError(rc, f"Couldn't enable the network provider: {ctypes.FormatError(rc).strip()}")
@@ -383,7 +402,7 @@ class EtwCapture:
             self._enable_tcpip()
 
         log = EVENT_TRACE_LOGFILEW()
-        log.LoggerName = SESSION_NAME
+        log.LoggerName = self.session_name
         log.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD
         log.EventRecordCallback = self._callback
         self._logfile = log
@@ -396,27 +415,32 @@ class EtwCapture:
         threading.Thread(target=self._pump, name="etw", daemon=True).start()
         threading.Thread(target=self._watch_own, name="own-pids", daemon=True).start()
 
+    @staticmethod
+    def _event_filter(ids) -> tuple:
+        """(ENABLE_TRACE_PARAMETERS, what it points to) that let only these event IDs through."""
+        raw = struct.pack(f"<BBH{len(ids)}H", 1, 0, len(ids), *ids)   # EVENT_FILTER_EVENT_ID, FilterIn
+        data = ctypes.create_string_buffer(raw, len(raw))
+        desc = EVENT_FILTER_DESCRIPTOR(ctypes.addressof(data), len(raw), EVENT_FILTER_TYPE_EVENT_ID)
+        params = ENABLE_TRACE_PARAMETERS(Version=ENABLE_TRACE_PARAMETERS_VERSION_2,
+                                         EnableFilterDesc=ctypes.pointer(desc), FilterDescCount=1)
+        return params, data, desc
+
     def _enable_tcpip(self) -> None:
-        """Add the TCPIP provider, limited to the drop events port scans cause.
+        """Add the TCPIP provider, limited to the events that tell port scans.
 
         Scan detection is extra: if the provider can't be added, capture carries on without it.
         """
-        ids = TCPIP_EVENTS
-        raw = struct.pack(f"<BBH{len(ids)}H", 1, 0, len(ids), *ids)   # EVENT_FILTER_EVENT_ID, FilterIn
-        self._filter_data = ctypes.create_string_buffer(raw, len(raw))
-        desc = EVENT_FILTER_DESCRIPTOR(ctypes.addressof(self._filter_data), len(raw),
-                                       EVENT_FILTER_TYPE_EVENT_ID)
-        params = ENABLE_TRACE_PARAMETERS(Version=ENABLE_TRACE_PARAMETERS_VERSION_2,
-                                         EnableFilterDesc=ctypes.pointer(desc), FilterDescCount=1)
+        self._tcpip_filter = self._event_filter(TCPIP_EVENTS)
         rc = self.adv.EnableTraceEx2(self.session, ctypes.byref(TCPIP_GUID),
                                      EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE,
-                                     KW_TCPIP_DROPPED, 0, 0, ctypes.byref(params))
-        if rc:   # no event ID filtering here: all the drops, sorted out in the callback
+                                     KW_TCPIP_DROPPED | KW_TCPIP_CONNECT, 0, 0, ctypes.byref(self._tcpip_filter[0]))
+        if rc:   # no event ID filtering here: all of both kinds, sorted out in the callback
             rc = self.adv.EnableTraceEx2(self.session, ctypes.byref(TCPIP_GUID),
                                          EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE,
-                                         KW_TCPIP_DROPPED, 0, 0, None)
+                                         KW_TCPIP_DROPPED | KW_TCPIP_CONNECT, 0, 0, None)
         if rc:
-            print(f"Port scan detection is off: {ctypes.FormatError(rc).strip()}", flush=True)
+            self.scans_error = ctypes.FormatError(rc).strip()
+            print(f"Port scan detection is off: {self.scans_error}", flush=True)
 
     def _watch_own(self) -> None:
         """Keep the set of this app's processes current (the browser engine starts its own)."""
@@ -454,40 +478,51 @@ class EtwCapture:
             own = pid in self.own_pids or (alen == 4 and data[8] == 127
                                            and self.own_port in (sport, dport))
             self.acc.add(sport, dport, size, proto, outbound, pid, own)
+            if outbound and proto == UDP and self.scans is not None:
+                self.scans.sending(sport)
         except Exception:  # never let an exception escape into ETW's thread
             pass
 
     def _on_probe(self, rec: int, eid: int) -> None:
-        """Pass what may be one probe of a port scan to the scan watcher."""
+        """Pass what may be one probe of a port scan, or tells what isn't one, to the scan watcher."""
         n = ctypes.c_uint16.from_address(rec + OFF_USER_LEN).value
         data = ctypes.string_at(ctypes.c_void_p.from_address(rec + OFF_USER_DATA).value, n)
-        if eid in (15, 31):
-            # Kernel-Network accept: same layout as the data events above
-            alen = 4 if eid == 15 else 16
+        if eid < 1000:
+            # Kernel-Network accept or connect: same layout as the data events above
+            alen = 4 if eid in (12, 15) else 16
             if n < 12 + 2 * alen:
                 return
-            remote = netwatch._ip(data[8:8 + alen], netwatch.AF_INET if alen == 4 else netwatch.AF_INET6)
-            dport, sport = struct.unpack_from(">HH", data, 8 + 2 * alen)
+            family = netwatch.AF_INET if alen == 4 else netwatch.AF_INET6
+            remote, local = (netwatch._ip(data[o:o + alen], family) for o in (8, 8 + alen))
+            rport, lport = struct.unpack_from(">HH", data, 8 + 2 * alen)
             if self.probe_log:
-                self.probe_log(eid, 6, "", sport, remote, dport, 0)
-            if not netwatch.ignorable(remote):
-                self.scans.probe(remote, sport, TCP, "open", dport)
+                self.probe_log(eid, 6, local, lport, remote, rport, 0)
+            if eid in (12, 28):
+                self.scans.connecting(remote, rport, lport)
+            elif not netwatch.ignorable(remote):
+                self.scans.probe(remote, lport, TCP, "open", rport, local)
             return
         if ctypes.c_uint32.from_address(rec + OFF_PROVIDER).value != TCPIP_DATA1:
             return
         # 1214: proto, family, local len, local sockaddr, remote len, remote sockaddr, reason, count
-        proto, _family, llen = struct.unpack_from("<III", data, 0)
+        # 1002: connection (a pointer), local len, local sockaddr, remote len, remote sockaddr, ...
         lo = 12
+        llen, = struct.unpack_from("<I", data, lo - 4)
         local, lport = _sockaddr(data, lo, llen)
         rlen, = struct.unpack_from("<I", data, lo + llen)
         ro = lo + llen + 4
         remote, rport = _sockaddr(data, ro, rlen)
-        reason, = struct.unpack_from("<I", data, ro + rlen)
-        if self.probe_log:
-            self.probe_log(eid, proto, local, lport, remote, rport, reason)
-        if proto not in (6, 17) or netwatch.ignorable(remote, local):
+        if eid == 1002:
+            if self.probe_log:
+                self.probe_log(eid, 6, local, lport, remote, rport, 0)
+            self.scans.connecting(remote, rport, lport)
             return
-        self.scans.probe(remote, lport, TCP if proto == 6 else UDP, "closed", rport, (eid, reason))
+        proto, = struct.unpack_from("<I", data, 0)
+        if self.probe_log:
+            self.probe_log(eid, proto, local, lport, remote, rport, struct.unpack_from("<I", data, ro + rlen)[0])
+        if proto not in (6, 17) or not lport or netwatch.ignorable(remote, local):
+            return
+        self.scans.probe(remote, lport, TCP if proto == 6 else UDP, "closed", rport, local)
 
     def stop(self) -> None:
         self._stopping = True
@@ -719,7 +754,7 @@ class Hub:
         self.last_change = time.monotonic()  # when a viewer last connected or left
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=160)  # ~3 s of port ticks and CPU samples at the fastest rates
+        q: queue.Queue = queue.Queue(maxsize=400)  # seconds of ticks and samples, and memory from many machines
         with self._lock:
             self._subs.add(q)
             self.last_change = time.monotonic()
@@ -808,9 +843,13 @@ def fmt_bits(bps: float) -> str:
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/index.html": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/disk.js": ("disk.js", "text/javascript; charset=utf-8"),
           "/dimm.js": ("dimm.js", "text/javascript; charset=utf-8"),
           "/memory.js": ("memory.js", "text/javascript; charset=utf-8"),
           "/perf.js": ("perf.js", "text/javascript; charset=utf-8"),
+          "/remote.js": ("remote.js", "text/javascript; charset=utf-8"),
+          "/shell.js": ("shell.js", "text/javascript; charset=utf-8"),
+          "/views.js": ("views.js", "text/javascript; charset=utf-8"),
           "/watch.js": ("watch.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
@@ -831,11 +870,12 @@ class CountingWriter:
 
 
 def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None, perf=None,
-                 details=None, scans=None, system=None):
+                 details=None, scans=None, system=None, settings=None):
     """on_write(bytes, client_port) is called for everything sent, when no capture sees it.
 
     details(port) describes the processes on a port (GET /api/port?p=N); scans
-    lists the port scans seen recently (GET /api/scans).
+    lists the port scans seen recently (GET /api/scans); settings holds the
+    remote machines (GET and POST /api/machines).
     """
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     allowed_origins = {f"http://{h}" for h in allowed_hosts}
@@ -867,24 +907,47 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
             if path == "/events":
                 self._events()
             elif path == "/api/port" and details is not None:
+                # ?p=N for this PC, and &machine=<id> for a remote one: its agent is asked.
+                query = parse_qs(urlsplit(self.path).query)
                 try:
-                    p = int(parse_qs(urlsplit(self.path).query).get("p", ["0"])[0])
+                    p = int(query.get("p", ["0"])[0])
                     if not 1 <= p <= 65535:
                         raise ValueError(p)
                 except ValueError:
                     self.send_error(400)
                     return
+                mid = query.get("machine", ["local"])[0]
                 try:
-                    body = json.dumps(details(p), separators=(",", ":")).encode()
+                    d = details(p) if mid == "local" or perf is None else perf.remote_port(mid, p)
+                    body = json.dumps(d, separators=(",", ":")).encode()
+                except KeyError:
+                    self.send_error(404)
+                    return
+                except perfmon.AgentError as exc:
+                    self._send(503, "application/json", json.dumps({"error": str(exc)}).encode())
+                    return
                 except Exception:
                     traceback.print_exc()
                     self.send_error(500)
                     return
                 self._send(200, "application/json", body)
             elif path == "/api/scans" and scans is not None:
-                body = json.dumps({"scans": scans.views(), "now": round(time.time(), 1)},
+                # This PC's scans, and remote machines', which say which ("m").
+                found = scans.views() + (perf.remote_scans.views() if perf is not None else [])
+                body = json.dumps({"scans": found, "now": round(time.time(), 1)},
                                   separators=(",", ":")).encode()
                 self._send(200, "application/json", body)
+            elif path == "/api/machines" and settings is not None:
+                body = json.dumps({"machines": settings.list(), "problem": settings.problem}).encode()
+                self._send(200, "application/json", body)
+            elif path == "/api/rmem" and perf is not None:
+                self._send(200, "application/json", json.dumps(perf.memory_now(), separators=(",", ":")).encode())
+            elif path == "/omnitop-agent.py":
+                try:
+                    with open(LINUX_AGENT, "rb") as f:
+                        self._send(200, "text/x-python", f.read(), download="omnitop-agent.py")
+                except OSError:
+                    self.send_error(404)
             elif path == "/api/info":
                 body = json.dumps({**info, "tick": rate.seconds}).encode()
                 self._send(200, "application/json", body)
@@ -906,12 +969,18 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
             # POST /api/perf {"interval": 250} or {"source": "utility"} does the
             # same for the CPU, disk & network tab, and POST /api/sys
             # {"interval": 250} and/or {"address": n or null} (a physical
-            # address to look up) for the Memory & GPU tab.
+            # address to look up) for the Memory tab. POST /api/view
+            # {"machine": id or null, "numbers": bool, "page": name} says which remote
+            # machine is being looked at closely, on which page, and whether the
+            # others are only numbers; and
+            # POST /api/machines changes the list of them.
             if not self._ours():
                 return
             path = self.path.split("?", 1)[0]
-            if (path not in ("/api/rate", "/api/perf", "/api/sys") or (path == "/api/perf" and perf is None)
-                    or (path == "/api/sys" and system is None)):
+            if (path not in ("/api/rate", "/api/perf", "/api/sys", "/api/view", "/api/machines")
+                    or (path in ("/api/perf", "/api/view") and perf is None)
+                    or (path == "/api/sys" and system is None)
+                    or (path == "/api/machines" and (perf is None or settings is None))):
                 self.send_error(404)
                 return
             origin = self.headers.get("Origin")
@@ -921,7 +990,7 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if not 0 < length <= 256:
+                if not 0 < length <= (2048 if path == "/api/machines" else 256):
                     raise ValueError("bad length")
                 body = json.loads(self.rfile.read(length))
                 if path == "/api/rate":
@@ -935,6 +1004,13 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
                     if "address" in body:
                         system.set_address(body["address"])
                     reply = {"interval": system.interval, "address": system.address}
+                elif path == "/api/view":
+                    perf.set_focus(None if body["machine"] is None else str(body["machine"]),
+                                   bool(body["numbers"]) if "numbers" in body else None,
+                                   str(body["page"])[:16] if body.get("page") else None)
+                    reply = {"machine": perf.focus, "numbers": perf.numbers, "page": perf.page}
+                elif path == "/api/machines":
+                    reply = self._machines(body)
                 else:
                     if not isinstance(body, dict) or not ({"interval", "source"} & body.keys()):
                         raise ValueError("nothing to set")
@@ -946,9 +1022,38 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
                 return
             self._send(200, "application/json", json.dumps(reply).encode())
 
-        def _send(self, code: int, ctype: str, body: bytes) -> None:
+        def _machines(self, body: dict) -> dict:
+            """Add, change, move, remove or test a remote machine. {"error", "field"} says what's wrong with a form."""
+            action = body["action"]
+            try:
+                if action == "test":
+                    m = app_settings.clean(body)
+                    if perf.mode == "demo":
+                        return {"ok": True, "host": m["name"] or m["address"], "os": m["os"] or "linux",
+                                "system": "Simulated machine", "cpus": "8", "agent": VERSION, "memory": True}
+                    return perfmon.test_agent(m["address"], m["port"])
+                if action == "add":
+                    reply = {"machine": settings.add(body)}
+                elif action == "update":
+                    reply = {"machine": settings.update(str(body["id"]), body)}
+                elif action == "move":
+                    settings.move(str(body["id"]), int(body["by"]))
+                    reply = {}
+                elif action == "remove":
+                    settings.remove(str(body["id"]))
+                    reply = {}
+                else:
+                    raise ValueError(action)
+            except app_settings.Invalid as exc:
+                return {"error": exc.args[1], "field": exc.args[0]}
+            perf.apply_settings()
+            return {**reply, "machines": settings.list()}
+
+        def _send(self, code: int, ctype: str, body: bytes, download: str = "") -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            if download:
+                self.send_header("Content-Disposition", f'attachment; filename="{download}"')
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -1125,9 +1230,16 @@ class Server:
     """
 
     def __init__(self, mode: str, port: int, exact_port: bool = False,
-                 owner_pid: int | None = None) -> None:
-        """owner_pid: the window's process, when capture runs in a separate helper."""
+                 owner_pid: int | None = None, settings_path: str | None = None) -> None:
+        """owner_pid: the window's process, when capture runs in a separate helper.
+
+        settings_path: the window's settings file, as the helper may run as another user.
+        """
         self.mode = mode
+        if mode == "demo":
+            self.settings = app_settings.Settings(None, perfmon.DEMO_MACHINES)
+        else:
+            self.settings = app_settings.Settings(settings_path or app_settings.PATH)
         self.port = port if exact_port else free_port(port)
         self.acc = Accumulator()
         self.hub = Hub()
@@ -1151,8 +1263,8 @@ class Server:
             self.demo_scans.start()
         self.done = threading.Event()
         # CPU, disk & network tab (CPU Graph's sampler), at its own rate
-        self.perf = perfmon.PerfMonitor(self.hub, mode)
-        # Memory, GPU and CPU for the Memory & GPU tab, at its own rate
+        self.perf = perfmon.PerfMonitor(self.hub, mode, self.settings)
+        # Memory, GPU and CPU for the Memory page, at its own rate
         self.sysmon = sysmon.SystemMonitor(self.hub, mode, ProcessNames().get)
         try:
             info = {"mode": mode, "rates": list(RATES), "host": socket.gethostname(),
@@ -1160,7 +1272,7 @@ class Server:
             self.httpd = ThreadingHTTPServer(
                 ("127.0.0.1", self.port),
                 make_handler(self.hub, info, self.port, self.rate, on_write, self.perf,
-                             self.details, self.scans, self.sysmon))
+                             self.details, self.scans, self.sysmon, self.settings))
         except BaseException:
             self.source.stop()
             self.scans.stop()
@@ -1209,7 +1321,7 @@ def serve(args, mode: str) -> int:
     srv = Server(mode, args.port, exact_port=args.elevated)
     install_close_handler(srv.stop_capture)
     label = "simulated traffic" if mode == "demo" else "live capture of this machine's TCP and UDP traffic"
-    print(f"omniTop: {label}\nServing {srv.url}  (Ctrl+C or close this window to stop)", flush=True)
+    print(f"OmniTOP: {label}\nServing {srv.url}  (Ctrl+C or close this window to stop)", flush=True)
     if not args.no_browser and not args.elevated:
         threading.Timer(0.3, webbrowser.open, (srv.url,)).start()
     try:

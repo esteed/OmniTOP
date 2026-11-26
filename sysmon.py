@@ -1,4 +1,4 @@
-"""System memory, GPU and CPU sampling for the Memory & GPU tab.
+"""System memory, GPU and CPU sampling for the Memory page.
 
 - System memory: how much RAM is in use, modified, standby and free, and what
   the memory in use holds, from the performance counters Resource Monitor
@@ -1026,8 +1026,10 @@ class CompressionStore:
 # ---------------------------------------------------------------------------
 
 class LiveSystem:
-    def __init__(self, names) -> None:
+    def __init__(self, names, address_map: bool = True) -> None:
+        """address_map: read the page database, if there are the rights, to say what each address holds."""
         self.names = names
+        self.address_map = address_map
         self.parts = 1   # memory-map parts: samples a second
         self.ram = self.gpu = self.memc = None
         self.ram_err = self.gpu_err = self.memc_err = None
@@ -1048,7 +1050,7 @@ class LiveSystem:
         self.address = address
 
     def _ensure(self, now: float) -> None:
-        if self.ram is None and now >= self._ram_retry:
+        if self.address_map and self.ram is None and now >= self._ram_retry:
             try:
                 self.ram, self.ram_err = RamMap(), None
                 self.ram.set_parts(self.parts)
@@ -1062,7 +1064,7 @@ class LiveSystem:
         if self.gpu is None and now >= self._gpu_retry:
             try:
                 self.gpu, self.gpu_err = GpuMonitor(self.names), None
-            except OSError as exc:
+            except Exception as exc:  # noqa: BLE001 - whatever the driver does, memory goes on
                 self.gpu_err, self._gpu_retry = str(exc), now + 60
 
     def set_rate(self, per_second: int) -> None:
@@ -1114,7 +1116,7 @@ class LiveSystem:
         if self.gpu:
             try:
                 out["gpu"] = self.gpu.sample()
-            except OSError as exc:
+            except Exception as exc:  # noqa: BLE001
                 out["gpuErr"] = str(exc)
         return out
 
@@ -1149,12 +1151,18 @@ DEMO_PHYS = [[0x1000, 0xA0000], [0x100000, int(3.25 * GB)], [4 * GB, int(32.75 *
 
 
 class DemoSystem:
-    """Plausible made-up numbers: 32 GB of RAM with the usual gap below 4 GB, a 24 GB GPU."""
+    """Plausible made-up numbers: 32 GB of RAM with the usual gap below 4 GB, a 24 GB GPU.
+
+    remote: a made-up remote machine's number instead, with as much as an agent sends;
+    linux: what the Linux agent sends.
+    """
 
     SLICE = 128 << 20
 
-    def __init__(self) -> None:
+    def __init__(self, remote: int | None = None, linux: bool = False) -> None:
         self.rng = rng = random.Random()
+        self.remote, self.linux = remote, linux
+        self.size = 32 * GB if remote is None else (8, 64, 16, 32)[remote % 4] * GB
         self.t0 = time.monotonic()
         self.level = 0.5                                             # share of usable RAM in use
         self.mix = [0.50, 0.03, 0.20, 0.06, 0.06, 0.05, 0.02, 0.08]   # what the memory in use holds
@@ -1169,6 +1177,7 @@ class DemoSystem:
         self.address = self.looked = None
         self.vram_used = 7.5 * GB
         self.cpu = 15.0
+        self.swap = 0.3 * GB
         self.commit_extra = 6 * GB    # committed but not (yet) using RAM
         self.commit_peak = 0
 
@@ -1207,10 +1216,35 @@ class DemoSystem:
             cells.append(cell)
         return cells
 
+    def _linux(self, w: float) -> dict:
+        """What omnitop-agent.py sends."""
+        rng, total = self.rng, int(self.size * 0.978)
+        self.level = min(0.8, max(0.2, self.level + rng.gauss(0, 0.004) * w))
+        inuse = total * self.level
+        dirty = int(total * rng.uniform(0.001, 0.006))
+        cache = int((total - inuse) * 0.7)
+        free = int(total - inuse - dirty - cache)
+        shares = (("proc", 0.70), ("shared", 0.07), ("slab", 0.08), ("ptables", 0.03), ("kernel", 0.12))
+        names = ("postgres", "java", "node", "nginx", "dockerd", "systemd-journald", "sshd", "python3", "redis-server", "cron")
+        left, top = inuse * 0.70, []
+        for n in names:
+            b = int(left * rng.uniform(0.28, 0.32))
+            left -= b
+            top.append([n, b, int(b * 1.3), 0, rng.choice((1, 1, 2, 4))])
+        self.swap = min(2 * GB, max(0, self.swap + rng.gauss(0, 0.01) * w * GB))
+        return {"ram": {"installed": self.size, "total": total, "avail": cache + free, "err": None, "countersErr": None,
+                        "lists": {"free": free, "modified": dirty, "standby": [0, cache, 0]},
+                        "uses": [[n, int(inuse * f)] for n, f in shares], "kernel": [], "pagedAll": 0,
+                        "progs": {"top": top, "other": [int(left), 90, 61], "total": int(inuse * 0.70)}},
+                "commit": None, "swap": {"total": 4 * GB, "used": int(self.swap)},
+                "cpu": round(max(1.0, rng.gauss(12, 3)), 1), "gpu": None, "gpuErr": None}
+
     def sample(self, dt: float = 1.0) -> dict:
+        if self.linux:
+            return self._linux(math.sqrt(max(0.01, min(1.0, dt))))
         # Random walks step by sqrt(dt), so they wander as fast at any sample rate.
         rng, t, w = self.rng, time.monotonic() - self.t0, math.sqrt(max(0.01, min(1.0, dt)))
-        usable = int(31.8 * GB)
+        usable = int(self.size - 0.2 * GB)
         self.level = min(0.85, max(0.25, self.level + rng.gauss(0, 0.004) * w))
         inuse = usable * self.level
         modified = usable * (0.015 + 0.005 * math.sin(t / 11))
@@ -1221,7 +1255,7 @@ class DemoSystem:
         mix = [m / sum(self.mix) for m in self.mix]
         names = ("proc", "comp", "mapped", "shared", "paged", "nonpaged", "ptables", "kernel")
         kernel = inuse * mix[7]
-        ram = {"installed": 32 * GB, "total": usable, "avail": int(cached + free), "err": None, "countersErr": None,
+        ram = {"installed": self.size, "total": usable, "avail": int(cached + free), "err": None, "countersErr": None,
                "lists": {"free": int(free), "modified": int(modified),
                          "standby": [int(cached * 0.02), int(cached * 0.9), int(cached * 0.08)]},
                "uses": [[n, int(inuse * f)] for n, f in zip(names, mix)],
@@ -1239,14 +1273,14 @@ class DemoSystem:
                         "other": [int(sum(r[1] for r in rest)), sum(r[2] for r in rest), len(rest)],
                         "total": int(sum(r[1] for r in rows))}
         now = time.monotonic()
-        detail = now >= self.map_at
-        if self.address is not None and (detail or self.address != self.looked):
+        detail = self.remote is None and now >= self.map_at
+        if self.remote is None and self.address is not None and (detail or self.address != self.looked):
             ram["page"] = self._page()
         self.looked = self.address
         if detail:
             self.map_at = now + MAP_EVERY
             ram["map"] = {"slice": self.SLICE, "cells": self._cells(w)}
-        if now >= self.dimms_at:
+        if now >= self.dimms_at and self.remote is None:
             ram["dimms"], ram["phys"], self.dimms_at = DEMO_DIMMS, DEMO_PHYS, now + DIMMS_EVERY
         used = inuse + modified
         self.vram_used = min(23 * GB, max(3 * GB, self.vram_used + rng.gauss(0, 0.15) * w * GB))
@@ -1263,7 +1297,7 @@ class DemoSystem:
             "commit": {"used": committed, "limit": usable + pagefile, "peak": self.commit_peak,
                        "files": [["C:\\pagefile.sys", pagefile, int(0.6 * GB), int(1.4 * GB)]]},
             "cpu": round(self.cpu, 1),
-            "gpu": {"name": "Simulated GPU", "vram": 24 * GB, "used": int(self.vram_used), "shared": int(0.4 * GB),
+            "gpu": None if self.remote is not None and self.remote % 4 != 1 else {"name": "Simulated GPU", "vram": 24 * GB, "used": int(self.vram_used), "shared": int(0.4 * GB),
                     "engines": [["3D", round(g3d, 1)], ["Copy", round(max(0, rng.gauss(4, 2)), 1)],
                                 ["Compute", round(max(0, rng.gauss(2, 1.5)), 1)],
                                 ["Video decode", round(12 + 10 * math.sin(t / 3), 1)],

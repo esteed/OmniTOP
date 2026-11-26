@@ -2,7 +2,7 @@
 
     omniTop.exe          live capture (Windows asks for administrator rights)
     omniTop.exe --demo   simulated traffic
-    omniTop.exe --agent  no window: lets omniTop on other PCs watch this one (see agent.py);
+    omniTop.exe --agent  no window: lets OmniTOP on other PCs watch this one (see agent.py);
                          --install-agent and --uninstall-agent make it start with Windows or not
 
 The window runs with your normal rights. Capture needs administrator rights,
@@ -31,10 +31,11 @@ from ctypes import wintypes
 
 import agent
 import server
+import settings
 
-TITLE = "omniTop"
-# The app was called Port traffic before; its windows count as this app's too.
-TITLES = (TITLE, "Port traffic")
+TITLE = "OmniTOP"
+# The app was called omniTop and Port traffic before; their windows count as this app's too.
+TITLES = (TITLE, "omniTop", "Port traffic")
 FROZEN = getattr(sys, "frozen", False)
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(), "PortTrafficViz")
 ERROR_FILE = os.path.join(APP_DIR, "capture-error.txt")
@@ -183,13 +184,14 @@ def helper_command(port: int) -> tuple[str, str]:
     drive letters mounted in the user's session (Google Drive, mapped drives).
     """
     os.makedirs(APP_DIR, exist_ok=True)
-    args = f"--capture --port {port} --parent {os.getpid()}"
+    args = f'--capture --port {port} --parent {os.getpid()} --settings "{settings.PATH}"'
     if FROZEN:
         return local_copy(sys.executable, os.path.join(APP_DIR, os.path.basename(sys.executable))), args
     here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("desktop.py", "agent.py", "server.py", "sysmon.py", "perfmon.py", "netwatch.py"):
+    for name in ("desktop.py", "agent.py", "server.py", "settings.py", "sysmon.py", "perfmon.py", "netwatch.py"):
         local_copy(os.path.join(here, name), os.path.join(APP_DIR, name))
-    shutil.copytree(server.WEB_DIR, os.path.join(APP_DIR, "web"), dirs_exist_ok=True)
+    for name in ("web", "linux"):
+        shutil.copytree(os.path.join(here, name), os.path.join(APP_DIR, name), dirs_exist_ok=True)
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     exe = pyw if os.path.exists(pyw) else sys.executable
     return exe, f'"{os.path.join(APP_DIR, "desktop.py")}" {args}'
@@ -237,9 +239,9 @@ def describe(exc: BaseException) -> str:
 # Elevated capture helper (no window)
 # ---------------------------------------------------------------------------
 
-def run_capture(port: int, parent_pid: int) -> int:
+def run_capture(port: int, parent_pid: int, settings_path: str) -> int:
     try:
-        srv = server.Server("live", port, exact_port=True, owner_pid=parent_pid or None)
+        srv = server.Server("live", port, exact_port=True, owner_pid=parent_pid or None, settings_path=settings_path)
     except BaseException as exc:  # noqa: BLE001 - reported to the window
         try:
             os.makedirs(APP_DIR, exist_ok=True)
@@ -314,7 +316,7 @@ def manage_agent(action: str, port: int) -> int:
                 pass
         return int(code.value)                    # it has said what went wrong, if anything did
     try:
-        text = agent.install(sys.executable, port) if action == "install" else agent.uninstall()
+        text = agent.install(sys.executable, port, server.VERSION) if action == "install" else agent.uninstall()
     except (OSError, subprocess.SubprocessError) as exc:
         raise SystemExit(str(exc) or type(exc).__name__) from None
     user32.MessageBoxW(None, text, TITLE, MB_ICONINFORMATION)
@@ -348,26 +350,10 @@ button:first-child {{ font-weight: 600 }}
 BUTTONS = ('<div class="row"><button onclick="pywebview.api.try_live()">Try again</button>'
            '<button onclick="pywebview.api.show_demo()">Show simulated traffic</button></div>')
 
-# A starting settings.ini, in CPU Graph's format, for a PC that doesn't have one
-SETTINGS_TEMPLATE = """\
-# Read by CPU Graph and by omniTop's CPU, disk & network tab.
-# Changes to adapters, drives and scales apply within a second.
-
-# Network adapters to graph, separated by ; - their connection names (or words from
-# their description) - or auto for the connected network cards, or none. Up to 6.
-networks=auto
-# Axis per adapter: scale.<adapter>=link (its link speed), auto (fit to the traffic),
-# or a fixed rate such as 100M, 2.5G or 125MB/s.
-
-# Drives to graph: letters such as C:,D:, or auto for every fixed drive, or none. Up to 6.
-disks=auto
-
-# Remote machines to show, up to 6, separated by ; - Windows PCs running omniTop's agent
-# (omniTop.exe --install-agent) or Linux machines running cpugraph-agent: host names or IP
-# addresses, each optionally with :port (default 7820). A [section] named like the
-# machine can choose its networks= and disks= (by the names that machine uses).
-remotes=
-"""
+def show_file(path: str) -> None:
+    """Open the file's folder with the file selected."""
+    explorer = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "explorer.exe")
+    subprocess.Popen(f'"{explorer}" /select,"{path}"')
 
 
 class App:
@@ -384,7 +370,7 @@ class App:
         self.window = webview.create_window(
             TITLE, html=self.page("Starting…"), width=1380, height=900, min_size=(760, 560),
             background_color="#1a1a19" if self.dark else "#fcfcfb")
-        self.window.expose(self.try_live, self.show_demo, self.set_on_top, self.edit_perf_settings)
+        self.window.expose(self.try_live, self.show_demo, self.set_on_top, self.save_linux_agent, self.show_program)
         self.window.events.shown += lambda: dark_title_bar(self.dark)
         # Not private mode, so the page's settings (sample rate, hiding own
         # traffic) are still there next time.
@@ -420,7 +406,7 @@ class App:
     def show_demo(self) -> None:
         threading.Thread(target=self.start_here, args=("demo",), daemon=True).start()
 
-    # The CPU, disk & network tab's T and E keys.
+    # The T key.
     def set_on_top(self, on) -> None:
         """Keep the window above others. Called from the page on a pywebview worker thread.
 
@@ -448,17 +434,25 @@ class App:
         else:
             apply()
 
-    def edit_perf_settings(self) -> None:
-        """Open CPU Graph's settings.ini (which that tab reads) in Notepad."""
-        path = server.perfmon.SETTINGS_PATH
+    # Add machine's instructions: the files the other machine needs.
+    def save_linux_agent(self) -> dict:
+        """Put omnitop-agent.py in the Downloads folder and show it there. {"path"} or {"error"}."""
         try:
-            if not os.path.exists(path):
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(SETTINGS_TEMPLATE)
-            subprocess.Popen(["notepad.exe", path])
-        except OSError:
-            pass
+            path = os.path.join(agent.known_folder(agent.DOWNLOADS), "omnitop-agent.py")
+            shutil.copyfile(server.LINUX_AGENT, path)
+            show_file(path)
+        except OSError as exc:
+            return {"error": describe(exc)}
+        return {"path": path}
+
+    def show_program(self) -> dict:
+        """Show this program in its folder, to copy from there."""
+        path = sys.executable if FROZEN else os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist", "omniTop.exe")
+        try:
+            show_file(path)
+        except OSError as exc:
+            return {"error": describe(exc)}
+        return {"path": path}
 
     def start_here(self, mode: str) -> None:
         with self.busy:
@@ -471,7 +465,7 @@ class App:
                 self.window.load_url(self.srv.url)
             except Exception as exc:  # noqa: BLE001 - shown in the window
                 self.srv = None
-                self.show("omniTop couldn't start.", describe(exc), buttons=mode == "live")
+                self.show("OmniTOP couldn't start.", describe(exc), buttons=mode == "live")
 
     def start_helper(self) -> None:
         if not self.busy.acquire(blocking=False):
@@ -520,30 +514,31 @@ class App:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Live isometric view of per-port network traffic.")
+    ap = argparse.ArgumentParser(description="Live view of this PC and of remote machines.")
     ap.add_argument("--demo", action="store_true", help="show simulated traffic")
     ap.add_argument("--capture", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--port", type=int, default=server.DEFAULT_PORT, help=argparse.SUPPRESS)
     ap.add_argument("--parent", type=int, default=0, help=argparse.SUPPRESS)
-    ap.add_argument("--agent", action="store_true", help="let omniTop on other PCs watch this one")
+    ap.add_argument("--settings", default=settings.PATH, help=argparse.SUPPRESS)
+    ap.add_argument("--agent", action="store_true", help="let OmniTOP on other PCs watch this one")
     ap.add_argument("--install-agent", action="store_true", help="start the agent with Windows")
     ap.add_argument("--uninstall-agent", action="store_true", help="remove the agent")
     ap.add_argument("--agent-cleanup", action="store_true", help=argparse.SUPPRESS)   # run by --uninstall-agent
-    ap.add_argument("--agent-port", type=int, default=server.perfmon.AGENT_PORT, help="the agent's TCP port (default 7820)")
+    ap.add_argument("--agent-port", type=int, default=0, help="the agent's TCP port (default 7820, or the one it was installed with)")
     ap.add_argument("--listen", default="", help="an address for --agent to listen on (default all)")
     args = ap.parse_args()
 
-    if not 0 < args.agent_port < 65536:
+    if not 0 <= args.agent_port < 65536:
         raise SystemExit("--agent-port must be between 1 and 65535.")
     if args.agent_cleanup:
         return agent.cleanup(os.path.join(APP_DIR, "agent.log"))
     if args.agent:
-        return run_agent(args.listen, args.agent_port)
+        return run_agent(args.listen, args.agent_port or server.perfmon.AGENT_PORT)
     if args.install_agent or args.uninstall_agent:
         return manage_agent("install" if args.install_agent else "uninstall", args.agent_port)
     server.check_layouts()
     if args.capture:
-        return run_capture(args.port, args.parent)
+        return run_capture(args.port, args.parent, args.settings)
     if already_running():
         return 0
     return App(args.demo).run()

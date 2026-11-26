@@ -1,7 +1,7 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// Pictures of memory modules for the Memory & GPU tab, with what the firmware
+// Pictures of memory modules for the Memory page, with what the firmware
 // says about each one made part of the picture: engraved in a heat spreader,
 // printed on a bare circuit board, or etched on soldered chips. The firmware
 // doesn't describe a module's looks, so the product line in its part number

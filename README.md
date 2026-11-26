@@ -1,23 +1,169 @@
-# omniTop
+# OmniTOP
 
-A live isometric view of this Windows machine's network traffic, one bar per port,
-a map of everything in its memory and GPU memory, plus real-time graphs of CPU,
-network and disk activity for this PC and other machines on your network. The views
-are tabs along the top of the window: **Network ports**, **Memory & GPU** and
-**CPU, disk & network**. The app remembers which tab you had open. Its version is at
-the top right of the tab bar, and in the exe's file properties (Details).
+A dashboard of what a Windows PC, and any number of other Windows and Linux machines,
+are doing: CPU, memory, network, disks and graphics card, live, plus a map of this
+PC's network traffic port by port.
 
-Everything comes from the PC it runs on: memory size, memory modules and slots, the
-graphics card, the ephemeral port range and so on are read when it starts, not
-assumed.
+- **Local** shows this PC: [Overview, CPU, Disk, Network](#overview-cpu-disk-and-network),
+  [Memory](#memory) and [Ports](#ports).
+- **Remote** lists the [other machines](#remote-machines) you watch. Click one's icon
+  for its own Overview, CPU, Disk, Network and Memory.
 
-## Network ports
+The app opens on this PC's overview. **Esc**, or the logo, goes back there from any
+page of this PC or of a remote machine. The version is at the top right, and in the
+exe's file properties (Details).
+
+Everything comes from the machines themselves: memory size, memory modules and slots,
+the graphics card, drives and adapters, the ephemeral port range and so on are read,
+not assumed.
+
+## Overview, CPU, Disk and Network
+
+- **Overview**: the CPU's average use, the network adapters, and the memory bar with
+  its labels.
+- **CPU**: a small graph per thread, or one of their average (C).
+- **Disk**: a panel per drive letter on Windows, and per whole disk on Linux.
+  - **The graph** has eight lines, each with a line to its label: throughput, IOPS,
+    latency and busy time, reads solid and writes dashed. Each measure has its own scale,
+    named along the top. The lines are smoothed over a second. Point at a label to make
+    its line stand out.
+  - **The bars** are the average I/O size and queue depth over the last 5 seconds.
+  - Latency is how long an operation took, waiting included. The queue depth is how many
+    were waiting or under way. Reads and writes overlap, so the time the disk was busy is
+    shared out between them by how long each took.
+  - On Windows, letters that Windows keeps no figures for, such as network drives and
+    cloud storage, are named at the bottom. On Linux, partitions, LVM, RAID, loop devices
+    and optical drives aren't shown: the disks under them are.
+- **Network**: a graph per adapter. Green is received (↓) and coral is sent (↑), in bits
+  per second. The axis runs to the link's speed, or fits the traffic for adapters whose
+  link speed means nothing, such as VPNs.
+  - Network cards are shown while they have a link.
+  - Virtual adapters, such as a VPN's, are added once they carry real traffic: about 64
+    kb/s for a second or more.
+  - One that loses its link fades in and out for 10 seconds, and goes if it isn't back
+    by then.
+
+All graphs share one time axis, sampled 20 times a second by default. Every number is a
+3-second average; the lines show the samples. The amber line is the 3-second average.
+Hover a graph to read its value at that moment. At 20 samples/s the graphs show a third
+of the chosen time span, so individual samples stay distinguishable.
+
+| Key | Action |
+|---|---|
+| Esc | Back to this PC's overview |
+| Space | Pause / resume the graphs (sampling continues) |
+| Up / Down | Faster / slower sampling: 20, 10, 4, 2, 1 per second |
+| Left / Right | Shorter / longer time span |
+| C | On CPU: a graph per thread ↔ their average |
+| M | On this PC's CPU: CPU time ↔ Processor utility (matches Task Manager) |
+| A | Show / hide the 3-second average line |
+| T | Always on top (desktop app) |
+
+## Remote machines
+
+The **Remote** tab lists the machines with each one's operating system, average CPU use,
+network adapters and memory. From 12 machines up the graphs are smaller, and as many
+machines go to a row as fit. From 100 up it's only numbers: the CPU, and the busiest disk.
+**Show** picks one of these whatever the number. Click a machine for everything: the same
+pages as for this PC, Ports included.
+
+A machine that can't be reached gets a red X over its icon and **Connection Issues** under
+it, says why, and reconnects by itself.
+
+**Add machine** asks for the machine's host name or IP address, the agent's TCP port,
+its operating system, and a name if you want another than its own. **Test connection**
+tries it before you add it. The same form has the steps to install the agent, with the
+commands filled in. Point at a machine in the list for the buttons that move, edit and
+remove it.
+
+Each machine runs an agent that streams its numbers:
+
+- **Windows PCs**: the agent is part of `omniTop.exe`. Copy that to the PC and run
+  `omniTop.exe --install-agent`. Windows asks for administrator rights, then it:
+  - copies itself to `Program Files\omniTop agent`
+  - adds a scheduled task, **omniTop agent**, that starts with Windows and runs as
+    LOCAL SERVICE, an account with few rights; no one needs to be signed in
+  - opens TCP port 7820 for it in Windows Firewall, on private and domain networks
+
+  Run it again with a newer `omniTop.exe` to upgrade. `omniTop.exe --uninstall-agent`
+  removes all of it. `omniTop.exe --agent` runs the agent without installing anything,
+  until it's closed.
+- **Linux machines**: the agent is one Python file,
+  [omnitop-agent.py](linux/omnitop-agent.py), for Python 3.6 or later. Copy it there and
+  run `sudo python3 omnitop-agent.py --install`. It:
+  - copies itself to `/usr/local/lib/omnitop-agent`
+  - adds a systemd service, **omnitop-agent**, that runs as a throwaway account with no
+    rights of its own
+  - adds a second one, **omnitop-agent-ports**, for the Ports page (see below)
+  - opens TCP port 7820 in firewalld or ufw, if one is running
+
+  `--replace` stops CPU Graph's cpugraph-agent if it has the port, and `--uninstall`
+  removes all of it. Without systemd, start `python3 omnitop-agent.py` your own way.
+
+`--agent-port 7821` (Windows) or `--port 7821` (Linux) uses another port, and `--listen
+192.168.1.20` one address only.
+
+**Upgrading an agent** is the same command again; it keeps its port. It's all or nothing:
+if the new version doesn't answer, the one that was there runs again. On Linux it's also
+tried out first, before anything changes.
+
+**Agents seldom need upgrading.** Since version 2.1 they don't decide what's worth showing:
+besides the usual samples they send whatever raw figures OmniTOP asks for, and OmniTOP makes
+sense of them. On Linux that's files of figures under `/proc` and `/sys`, filesystem sizes
+and `nvidia-smi`'s columns; on Windows performance counters, drives' totals and sizes. Only
+figures: serial numbers, hardware addresses, command lines and people's files aren't among
+them, whoever asks. The same goes for ports: the agents send traffic per port and the
+packets that may be probes, and which of those make a port scan is decided in OmniTOP. So
+OmniTOP's scan rules can change without touching the agents. OmniTOP goes on working with
+agents from 2.0 on, and says on the page when one can't send what that page needs.
+
+Older agents work too: CPU Graph's own cpugraph-agent, and version 1.9's on Windows. They
+send no memory, only throughput and busy time of disks, and no ports.
+
+**Ports of remote machines.** A remote machine's Ports page is this PC's, for that machine:
+the grids, the busiest ports, the bubbles about the processes on a pinned port, and port
+scan alerts. Its traffic comes 5 times a second, and only while its Ports page is open. Scan
+detection runs all the time for every connected machine, whatever page is open. A scan of a
+remote machine shows on that machine's Ports page. Until you've seen it, the machine's card
+in the list says so, and the Remote tab and its Ports tab flash. White is the agent's own
+traffic: the stream to OmniTOP. What it takes on each system:
+
+- **Windows**: the agent watches the network the way OmniTOP does on this PC, with an ETW
+  session of its own, and needs no more rights for it. The session runs only while some
+  viewer wants ports or probes, and without ports wanted it only takes the events that
+  tell probes. Details of processes it can't open (other accounts') come from what Windows
+  tells any program: their path, start time and memory, but not their user.
+- **Linux**: watching ports takes root: the packet headers that show UDP traffic and probes,
+  and which process has which socket. So that the agent itself needn't run as root, a
+  second service, **omnitop-agent-ports**, does that and nothing else. It runs the same
+  file with only the rights it needs (`CAP_NET_RAW`, `CAP_SYS_PTRACE`,
+  `CAP_DAC_READ_SEARCH`), a read-only system, and no network port: it listens on a unix
+  socket, `/run/omnitop-agent/ports`, and answers only root and the omnitop-agent service.
+  It captures only while the agent asks. TCP traffic comes from the kernel's socket
+  statistics (`sock_diag`), UDP and probes from a packet socket with a filter that keeps
+  only UDP headers and the first packet of each TCP connection. If it isn't running, the
+  rest of the agent works as before, and the Ports page says why.
+
+The agents only read and run no commands. The connection isn't encrypted or authenticated:
+anyone who can reach the port can read the machine's CPU, memory, network and disk activity,
+the names of its programs, adapters and drives, and which programs talk to which addresses
+on which ports. To limit that, restrict the firewall rule to your PC's address.
+
+The app connects to the agents only while its window is open. The machine you're
+looking at sends at the chosen rate. The others send up to 4 samples a second, or fewer
+the more of them there are. Shown as numbers, they send no memory either.
+
+The machines are kept in `%LOCALAPPDATA%\PortTrafficViz\settings.json`, which the app
+writes. The first time, it takes over the machines in CPU Graph's `settings.ini`.
+
+## Ports
 
 - Ports 1–1024 are a 32 × 32 block of 5 px bars in front.
 - Ports 1025–65535 are a 256 × 252 field of 2 px bars behind it, 256 ports per row.
   The darker band is the ephemeral range: the short-lived local ports Windows
   assigns to outgoing connections. It's read from Windows when the app starts
-  (49152–65535 by default; `netsh int ipv4 show dynamicport tcp` shows it).
+  (49152–65535 by default; `netsh int ipv4 show dynamicport tcp` shows it). A
+  remote machine's agent says its own (on Linux, 32768–60999 by default).
 - Bar height shows traffic on a log scale, from 100 b/s up to the scale you pick.
   On the big field, color runs from blue for light traffic through violet to red
   for heavy traffic. Ports 1–1024 run from amber to red instead.
@@ -25,7 +171,7 @@ assumed.
 - White is traffic the app causes itself, stacked on top of everything else on that
   port. **Hide own traffic** leaves it out of the bars, the totals and the list.
 - Traffic is sampled 20 times a second by default. **Samples** changes that to 10, 5,
-  2 or 1 a second. Each bar shows the average over about the last half second, or
+  2 or 1 a second (this PC only: remote machines send 5 a second). Each bar shows the average over about the last half second, or
   over one sample at 2 or 1 a second.
 - The **Busiest ports** list updates once a second. Click a port there to pin it:
   pinned ports stay at the top of the list and are outlined on the grid until you
@@ -48,26 +194,41 @@ assumed.
   minute or two.
 - **In** and **Out** in the header are bars on the grid's log scale, up to
   1 Gb/s, colored like the big field's bars as traffic rises.
-- **Port scans.** When one address probes 10 or more different ports of this
-  machine within 30 seconds, it's a scan:
+- **Port scans.** A scan is a methodical search through this machine's ports. A
+  machine that probes a handful of them isn't scanning, and raises no alert. These
+  do:
+
+  | Who | How | Ports probed | Within |
+  |---|---|---|---|
+  | One machine | In any order | 25 | 1 minute |
+  | One machine | In any order, slowly | 40 | 15 minutes |
+  | One machine | In order, up or down, at most 8 apart | 15 | 5 minutes |
+  | Several machines together | In order, up or down, at most 8 apart | 20 | 5 minutes |
+  | Several machines together | In any order, each probing 5 or more that the others don't | 40, or 100 | 1 minute, or 15 |
+
+  Only different ports count, and at least half must be closed or blocked ones.
+
   - **Alert.** An alert opens at the bottom right of the grid area. It shows who
-    is scanning, when it started, whether it's still going, and every port
-    probed, with the ones that answered (open here) called out.
+    is scanning (one machine, or several in one alert), in what order, when it
+    started, whether it's still going, and every port probed, with the ones that
+    answered (open here) called out.
   - **View.** The view zooms out so both grids fit beside the alert.
   - **Port scan button.** The button next to All | TCP | UDP pulses bright red
     while the scan runs. Click it to bring back the latest alert.
   - **Grid.** Each probed port's square lights up red for a second.
-  - **Other tabs.** If another tab is open, the Network ports tab flashes red.
-    After the scan, a red dot stays on it until you open it.
+  - **Other tabs.** If another page is open, the Ports tab flashes red, and so does
+    Local if Remote is open. After the scan, a red dot stays until you open Ports.
+    For a remote machine, the Remote tab flashes and its card in the list says so.
 
-  A scan is over once no probe has come for about 3 seconds, or up to 10 for a
-  slow one. If the same address starts again after that, it's a new scan with
-  its own alert. Dismiss an alert with **×**.
+  A scan is over once no probe has come for about 3 seconds, or 30 if several
+  machines are making it, or up to 2 minutes for a slow one. If it starts again
+  after that, it's a new scan with its own alert. Dismiss an alert with **×**.
 - Scroll the mouse wheel over the grid to zoom in and out around the pointer, and
   drag with the left button to move around. **Reset view** goes back to the start.
 - The sample rate and the Hide own traffic setting are remembered between runs.
+- Each machine has its own pinned ports while the app runs.
 
-## Memory & GPU
+## Memory
 
 - **System memory**: all of RAM as one bar, from 0 on the left to the installed
   size on the right, with a scale sized to the memory found. It's split into what
@@ -110,14 +271,14 @@ assumed.
     holds: the list it's on, what it's used for, its priority, and for process memory
     the virtual address it's mapped at. **Esc** in the box clears it.
 - **GPU memory**: the graphics card's own memory as one bar, split by the apps using
-  it, memory not owned by one app, and free.
+  it, memory not owned by one app, and free. A machine without a graphics card that has
+  its own memory shows nothing about one.
 - Hover anything for details: what each kind of memory is, the standby priorities,
   how much of the paged pool is in the page file, what "other kernel memory" holds,
   the page files, each program, each module, and each address slice's use.
-- The tab scrolls when it's taller than the window.
-- **Samples** sets how often everything on this tab updates, with the same choices
-  as the CPU, disk & network tab: 20, 10, 4, 2 or 1 a second. **Up** and **Down**
-  change it too. It's remembered between runs. The bars and charts follow every
+- The page scrolls when it's taller than the window.
+- **Samples** sets how often everything on this page updates: 20, 10, 4, 2 or 1 a
+  second. **Up** and **Down** change it too. It's remembered between runs. The bars and charts follow every
   sample; the numbers and lists redraw at most 4 times a second, so they stay
   readable.
 - **Utilization**: GPU 3D and CPU over the last 60 seconds, like Task Manager.
@@ -133,85 +294,13 @@ assumed.
 - The finer split of memory in use and the physical address map need
   administrator rights, which live mode already has. Without them, the bar splits
   memory in use into programs, compressed, file cache, the pools and drivers, and
-  the address bar shows where RAM is, without what each address holds.
-
-## CPU, disk & network
-
-This tab is [CPU Graph 2.0](https://github.com/esteed/CpuGraph) brought into the app.
-It has one row per machine: **This PC** first, then each remote machine, Windows or
-Linux, running an agent. Each row has three columns:
-
-- **CPU threads**: one small graph per logical processor. The row title shows the
-  machine's name, thread count and total CPU use.
-- **Network adapters**: one strip per adapter. Green is received (↓) and coral is
-  sent (↑), in bits per second. The axis runs to the adapter's link speed, or fits
-  the traffic for adapters that don't report a speed.
-- **Disk devices**: one strip per disk. Violet is read (R) and pink is written (W),
-  in bytes per second, with how busy the disk was. The axis fits the larger of the
-  two, in 1-2-5 steps from 1 MB/s.
-
-All graphs share one time axis, sampled 20 times a second by default. Every number
-is a 3-second average; the lines show the samples. The amber line is the 3-second
-average. Hover a graph to read its value at that moment. At 20 samples/s the graphs
-show a third of the chosen time span, so individual samples stay distinguishable.
-
-The header has the same controls as CPU Graph, and so do its keys, which work while
-the tab is open:
-
-| Key | Action |
-|---|---|
-| Space | Pause / resume the graphs (sampling continues) |
-| Up / Down | Faster / slower sampling: 20, 10, 4, 2, 1 per second |
-| Left / Right | Shorter / longer time span |
-| R / N / D | Show / hide the remote machines, the network column, the disk column |
-| M | This PC's total: CPU time ↔ Processor utility (matches Task Manager) |
-| C | A graph per CPU thread ↔ one graph of all threads per machine |
-| A | Show / hide the 3-second average line |
-| T | Always on top (desktop app) |
-| E | Open settings.ini in Notepad (desktop app) |
-
-**Choosing adapters, drives and remote machines.** The tab reads CPU Graph's own
-settings file, `%LOCALAPPDATA%\CpuGraph\settings.ini`, so both apps show the same
-things. It never writes to that file, apart from creating a starting one if you press
-E on a PC that doesn't have one. The file's lines are explained in
-[CPU Graph's README](https://github.com/esteed/CpuGraph#settings-choosing-machines-adapters-and-disks):
-
-- `networks=`, `disks=` and `scale.<adapter>=` choose this PC's adapters, drives and
-  network scales.
-- `remotes=` lists remote machines (up to six).
-- A machine's `[section]` picks its adapters and disks.
-
-Changes apply within a couple of seconds. Without the file, the tab shows the
-connected network cards, every fixed drive, and no remote machines.
-
-**Remote machines** run an agent that streams their numbers. A machine that can't be
-reached says why across its row and reconnects by itself. The app connects to the
-agents only while its window is open.
-
-- **Windows PCs** run omniTop's own agent. Copy `omniTop.exe` to the PC and run
-  `omniTop.exe --install-agent`. Windows asks for administrator rights, then it:
-  - copies itself to `Program Files\omniTop agent`
-  - adds a scheduled task, **omniTop agent**, that starts with Windows and runs as
-    LOCAL SERVICE, an account with few rights; no one needs to be signed in
-  - opens TCP port 7820 for it in Windows Firewall, on private and domain networks
-
-  It then shows what to add to `remotes=` on the PC you watch from. Run
-  `--install-agent` again with a newer `omniTop.exe` to upgrade it.
-  `omniTop.exe --uninstall-agent` removes all of it. `omniTop.exe --agent` runs the
-  agent without installing anything, until it's closed.
-  - `--agent-port 7821` uses another port (then write `host:7821` in `remotes=`), and
-    with `--agent`, `--listen 192.168.1.20` listens on one address only.
-  - In the machine's `[section]`, write adapters by the names Windows shows and disks
-    as drive letters: `networks=Wi-Fi;Realtek 2.5GbE` and `disks=C:,D:`.
-- **Linux machines** run `cpugraph-agent` from the CPU Graph repository; its README
-  explains how to build and install it. Agents 2.0 and later send every CPU thread,
-  the chosen adapters and the chosen disks. Older agents send only the total CPU, and
-  their row says so.
-
-The agents only read counters and run no commands. The connection isn't encrypted or
-authenticated: anyone who can reach the port can read the machine's CPU, network and
-disk activity and its adapter and drive names. To limit that, restrict the firewall
-rule to your PC's address.
+  the address bar shows where RAM is, without what each address holds. That's also what
+  remote Windows PCs show.
+- Remote Linux machines show the kinds of memory Linux has: process memory, shared
+  memory, huge pages, kernel slab, page tables, other kernel memory, dirty, page cache
+  and free, with swap in place of committed memory. They show programs, but not modules
+  or addresses, which only root can read. Graphics cards are NVIDIA's (from `nvidia-smi`)
+  and AMD's.
 
 ## Run it
 
@@ -222,7 +311,7 @@ build it yourself (see below).
 | | |
 |---|---|
 | `omniTop.exe` | The desktop app. Windows asks for administrator rights, then the view opens in its own window. Close the window to stop. |
-| `omniTop.exe --demo` | Simulated traffic, with a port scan now and then, no administrator rights needed. |
+| `omniTop.exe --demo` | Simulated machines and traffic, with a port scan now and then, no administrator rights needed. |
 | `start.cmd`, `start-demo.cmd` | The same view in your browser instead, run from source (needs Python). |
 
 The exe needs nothing installed. It uses the Edge WebView2 runtime that comes with Windows 11.
@@ -235,8 +324,7 @@ If you decline the administrator prompt, the window offers **Try again** or
 Run `build.cmd`. It needs 64-bit Python 3.10 or later and, the first time, an
 internet connection: it sets up pywebview, PyInstaller and Pillow in
 `%LOCALAPPDATA%\PortTrafficViz\build` (outside Google Drive) and writes
-`dist\omniTop.exe`. Rebuild after editing anything in `web\`, `server.py`,
-`sysmon.py`, `perfmon.py`, `netwatch.py` or `desktop.py`.
+`dist\omniTop.exe`. Rebuild after editing anything in `web\`, `linux\` or a `.py`.
 
 The version is `VERSION` in `server.py`; raise it for each release. The build
 stamps it into the exe's file properties. It also draws the icon: a ring split like
@@ -278,16 +366,35 @@ at both ports, **Local** only at 52814, and **Remote** only at 443.
   event 1214. That's a packet the transport layer dropped, such as a probe of a
   port nothing listens on that Windows Firewall discarded. It also counts
   accepted connections (Kernel-Network's accept events) for the ports that
-  answer. Broadcast, multicast and loopback packets don't count.
-- **Late packets**: some drops are just late, a server answering a connection
-  this machine already closed. Those are left out: packets from a server's
-  well-known port (below 1024), and packets from an address to a local port this
-  machine had a connection on with it in the last 3 minutes.
-- **Without Windows Firewall**: Windows answers probes of closed ports with a
-  reset instead of dropping them, so scans of closed ports aren't seen.
+  answer.
+- **What isn't a probe**: much of what Windows drops isn't aimed at finding ports,
+  and is left out.
+  - Anything to or from an address that isn't one machine's: broadcast, including
+    the subnet's, multicast and loopback, and this PC's own addresses. A scan of this
+    PC from itself doesn't count, so test with another machine.
+  - Replies to this PC. Resets from a service that refuses its connections, late
+    packets of connections it closed, and answers to UDP it sent all arrive at ports
+    of its own. Capture reports every TCP connection it starts (event 1002,
+    whether or not it succeeds) and every port it sends UDP from, and the
+    connection tables fill in what was there before. They're remembered for 15 and 5
+    minutes. Packets from a well-known port (below 1024) to a higher one are replies
+    too, and so are ones that all come from the same service port.
+  - Traceroutes (UDP 33434–33534).
+- **In order** means the longest run of ports, each probed after the one before and
+  at most 8 from it, so a few out of place don't hide it. Most of the machine's
+  ports must belong to the run.
+- **Several machines**: machines that look for the same services probe the same
+  ports, and keep doing it. Machines sharing out a scan hardly ever probe the same
+  one. A scan that comes from many made-up addresses at once (decoys) probes the same
+  ports from each, and gets one alert.
+- **Not seen**: scans too slow for the table above, and half-open probes of ports
+  that are open. The closed ports give the scan away.
+- **Without Windows Firewall**: Windows answers probes of closed ports with a reset
+  instead of ignoring them. On loopback they're reported as dropped all the same;
+  that hasn't been tested with another machine.
 
-`sysmon.py` samples memory, the GPU and the CPU at the rate chosen in the Memory &
-GPU tab and sends the result on the same stream.
+`sysmon.py` samples memory, the GPU and the CPU at the rate chosen on the Memory page
+and sends the result on the same stream.
 
 - **System memory totals**: modified, standby (by priority), free, the pools and
   driver memory come from the `Memory` performance counters Resource Monitor reads.
@@ -325,31 +432,46 @@ GPU tab and sends the result on the same stream.
 - **CPU**: from `GetSystemTimes`.
 - **Committed memory**: total, limit and peak come from `GetPerformanceInfo`.
 
-`perfmon.py` is CPU Graph's sampler, ported to Python. It reads everything for This
-PC each tick, on its own clock, at the rate chosen in the CPU, disk & network tab.
+`perfmon.py` started as [CPU Graph](https://github.com/esteed/CpuGraph)'s sampler, ported
+to Python. It reads everything for this PC each tick, on its own clock, at the rate
+chosen on its pages.
 - **CPU threads**: all of them come from one `NtQuerySystemInformation` call.
 - **Network**: each adapter's counters and link speed come from one `GetIfEntry2` call.
-- **Disks**: from the `LogicalDisk` performance counters.
+  `NetTracker` picks the ones to show, for this PC and for remote machines alike.
+- **Disks**: each drive letter's running totals, from `IOCTL_DISK_PERFORMANCE`, which the
+  `LogicalDisk` performance counters are made from. `DiskRates` works out everything from
+  running totals, for this PC, for remote Windows PCs (the same call) and for remote Linux
+  machines (`/proc/diskstats`).
 
 Each remote machine has its own thread, which connects to its agent, reads samples
 and reconnects every 5 s after a failure. Agent timestamps are mapped onto the app's
 clock using the fastest network trip seen so far, so all rows line up.
 
-`agent.py` is the Windows agent. It speaks the same protocol as `cpugraph-agent`
-(version 2) with the readers `perfmon.py` uses for This PC, so it needs no rights of its
-own. Names in the protocol are single words, so `Realtek 2.5GbE` travels as
-`Realtek_2.5GbE`, with a `label` line carrying the real name. Each of up to 8 viewers
-has its own readings and sample rate. At 20 samples a second it uses about 1% of one
-core; with no one watching, none. It keeps a short log in
+`agent.py` is the Windows agent and `linux/omnitop-agent.py` the Linux one. They speak
+`cpugraph-agent`'s protocol (version 2), with additions that `agent.py` describes: every
+adapter and disk, memory, feeds of raw figures, and ports. For a remote machine's scans,
+the agent leaves out what only it can tell isn't a probe (replies to connections it made,
+and to UDP it sent; `netwatch.ProbeFilter` on Windows), and the app runs a `ScanWatch` for
+each machine on what's left. The Windows agent uses the
+readers `perfmon.py` and `sysmon.py` use for this PC, and needs no rights of its own; the
+Linux one reads `/proc` and `/sys`. Names in the protocol are single words, so `Realtek
+2.5GbE` travels as `Realtek_2.5GbE`, with a `label` line carrying the real name. Each of
+up to 16 viewers has its own readings and sample rate. With no one watching, they use no
+CPU. The Windows agent keeps a short log in
 `%LOCALAPPDATA%\PortTrafficViz\agent.log` (installed, under LOCAL SERVICE's profile:
 `C:\Windows\ServiceProfiles\LocalService`).
+
+`settings.py` keeps the list of remote machines. The page is `web/`: `shell.js` has the
+tabs, `perf.js` the graphs, `disk.js` the disk panels, `views.js` the pages of one machine,
+`remote.js` the list of machines and the form, `memory.js` and `dimm.js` memory, `app.js`
+and `watch.js` the ports.
 
 The server only listens on 127.0.0.1 and refuses requests whose `Host` header
 isn't its own address.
 
 ## Notes
 
-- omniTop was called Port traffic until version 1.5. It keeps that version's settings,
+- OmniTOP was called Port traffic until version 1.5. It keeps that version's settings,
   and still uses its folder, `%LOCALAPPDATA%\PortTrafficViz`.
 - For live capture, the program copies itself to `%LOCALAPPDATA%\PortTrafficViz`
   and runs the elevated copy from there, because elevated processes can't always

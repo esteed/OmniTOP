@@ -1,16 +1,17 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// Memory & GPU tab: all of RAM as one bar from 0 to the installed size, split
-// by what each part holds and labelled on leader lines; memory by program;
-// the memory modules, and what each physical address holds; GPU memory by
-// process; and charts of utilization and committed memory. Uses the theme and
-// helpers from app.js (T, oklch, rgb, rgba, esc, $, loadPref, savePref,
-// activeTab, darkQuery) and the module pictures from dimm.js.
+// Memory: all of RAM as one bar from 0 to the installed size, split by what
+// each part holds and labelled on leader lines; memory by program; the memory
+// modules, and what each physical address holds; GPU memory by process; and
+// charts of utilization and committed memory. The Memory page shows one machine,
+// this PC or a remote one, and drawMemBar puts any machine's bar on another
+// canvas. Uses the theme and helpers from app.js (T, oklch, rgb, rgba, esc, $,
+// loadPref, savePref, activeTab, darkQuery) and the module pictures from dimm.js.
 // ---------------------------------------------------------------------------
 const GiB = 1073741824, MiB = 1048576;
 const HISTORY_S = 60;                              // seconds of samples kept for the charts
-const M_INTERVALS = [50, 100, 250, 500, 1000];     // ms: 20, 10, 4, 2, 1 samples a second, as on the CPU tab
+const M_INTERVALS = [50, 100, 250, 500, 1000];     // ms: 20, 10, 4, 2, 1 samples a second, as for the graphs
 const M_TEXT_MS = 250;                             // numbers and lists redraw at most 4 times a second
 const M_TAU = 0.25;                                // seconds for the bars to catch up with a sample
 
@@ -46,7 +47,21 @@ const KINDS = {
   avail: { name: 'Available', color: 'standby', tip: 'Memory programs can get right away: standby and free.' },
   hw: { name: 'Hardware reserved', tip: "Set aside by the firmware for devices such as graphics. Windows can't use it." },
 };
-const IN_USE = new Set(['proc', 'apps', 'comp', 'mapped', 'cache', 'shared', 'paged', 'nonpaged', 'ptables', 'kernel', 'drivers']);
+// What Linux calls them, and the kinds only it has
+const LINUX_KINDS = {
+  proc: { name: 'Process memory', tip: "Programs' private memory: their data, heaps and stacks (AnonPages)." },
+  shared: { name: 'Shared memory', tip: 'Memory programs share, and files in tmpfs (Shmem).' },
+  huge: { name: 'Huge pages', color: 'comp', tip: 'Memory set aside as huge pages, used or not.' },
+  slab: { name: 'Kernel slab', color: 'nonpaged', tip: "The kernel's own objects that it can't give back (SUnreclaim)." },
+  ptables: { name: 'Page tables', tip: "The tables that translate each program's addresses to physical memory." },
+  kernel: { name: 'Other kernel memory', tip: 'Kernel stacks, per-CPU data, drivers, and whatever else the kernel uses.' },
+  modified: { name: 'Dirty', tip: 'Changed file data waiting to be written to disk.' },
+  standby: { name: 'Page cache', tip: 'File data and kernel caches kept in case they are needed again. The kernel gives this memory up as soon as programs want it.' },
+  free: { name: 'Free', tip: 'Memory holding nothing.' },
+  hw: { name: 'Reserved', tip: 'RAM the firmware and the kernel itself set aside at start-up.' },
+};
+const IN_USE = new Set(['proc', 'apps', 'comp', 'mapped', 'cache', 'shared', 'paged', 'nonpaged', 'ptables', 'kernel',
+  'drivers', 'huge', 'slab']);
 
 // OKLCH; checked for color-vision deficiencies between neighbours on the bar
 const MPAL = {
@@ -66,11 +81,15 @@ const MPAL = {
   },
 };
 let MC = {};                                       // palette name -> css color
-const kindOf = k => KINDS[k] || { name: k, tip: '' };
+const kindOf = k => (mem.os === 'linux' && LINUX_KINDS[k]) || KINDS[k] || { name: k, tip: '' };
 const kindColor = k => MC[kindOf(k).color || k] || MC.hw;
 
-const mstage = $('mstage'), mcv = $('mcv'), mctx = mcv.getContext('2d'), mtip = $('mtip');
-const mem = {
+const mstage = $('mstage'), mcv = $('mcv'), mtip = $('mtip');
+let mctx = mcv.getContext('2d');
+const newMem = id => ({
+  id,                    // 'local', or a remote machine's
+  os: 'windows',
+  easedAt: 0,            // when the bars last moved
   last: null,            // latest sample from the server
   segs: [], psegs: [], gsegs: [],   // RAM, programs and GPU bars: [{ key, bytes, shown }], left to right
   map: null,             // latest address map: { slice, cells }
@@ -88,8 +107,16 @@ const mem = {
   commit: 0,             // committed bytes, eased like the bars
   kindsKey: '',          // the kinds in the legend
   hover: null, mouse: null, hits: [],
-};
+});
+const mems = new Map();                            // machine id -> its memory
+function memFor(id) {
+  let m = mems.get(id);
+  if (!m) mems.set(id, m = newMem(id));
+  return m;
+}
+let mem = memFor('local');                         // the one the page shows, or drawMemBar draws
 let mdpr = 1, mW = 0, mH = 0, UC = {}, ML = null;
+let mEdge = MPAD - 6;                              // how far labels may reach past the bar's ends
 
 function fmtGB(b) {
   const g = b / GiB;
@@ -137,7 +164,7 @@ function progParts(r, p) {
   const inUse = msum(r.uses.map(u => u[1]));
   out.push({ key: 'r:shared', name: 'Shared and system', bytes: Math.max(0, inUse - p.total), tone: 'paged' },
     { key: 'r:idle', name: 'Not in use', bytes: Math.max(0, r.total - inUse), tone: 'free' },
-    { key: 'r:hw', name: 'Hardware reserved', bytes: Math.max(0, r.installed - r.total), tone: 'hw', hatch: true });
+    { key: 'r:hw', name: kindOf('hw').name, bytes: Math.max(0, r.installed - r.total), tone: 'hw', hatch: true });
   return out;
 }
 
@@ -157,9 +184,9 @@ function retarget(old, parts) {
   return parts.map(p => ({ ...p, shown: was.has(p.key) ? was.get(p.key) : (old.length ? 0 : p.bytes) }));
 }
 
-function onSys(m) {
+function takeSys(m) {   // a sample, into mem
   mem.last = m;
-  syncRate(m.iv);
+  mem.os = m.os || 'windows';
   const ram = m.ram, gpu = m.gpu;
   const shape = () => [!!mem.map, !!mem.phys, !!mem.dimms, mem.dimms ? mem.dimms.modules.length : 0,
     mem.psegs.length > 0, mem.gsegs.length > 0].join();
@@ -176,7 +203,8 @@ function onSys(m) {
   mem.segs = ram && ram.uses ? retarget(mem.segs, ramParts(ram)) : [];
   mem.psegs = ram && ram.uses && ram.progs ? retarget(mem.psegs, progParts(ram, ram.progs)) : [];
   mem.gsegs = gpu ? retarget(mem.gsegs, gpuParts(gpu)) : [];
-  if (!mem.commit && m.commit) mem.commit = m.commit.used;
+  const promised = m.commit || m.swap;
+  if (!mem.commit && promised) mem.commit = promised.used;
 
   const inUse = msum(mem.segs.filter(s => IN_USE.has(s.key)).map(s => s.bytes));
   const g3d = gpu ? (gpu.engines.find(e => e[0] === '3D') || [])[1] : undefined;
@@ -187,13 +215,25 @@ function onSys(m) {
                   commit: m.commit ? m.commit.used : null, ram: ram && ram.uses ? inUse : null });
   while (mem.hist.length && mem.hist[0].t < t - HISTORY_S) mem.hist.shift();
   mem.commitLimit = m.commit ? m.commit.limit : 0;
+  return { inUse, reshaped: before !== shape(), kinds: mem.segs.map(s => s.key).join(',') + '|' + shape() };
+}
 
-  const kinds = mem.segs.map(s => s.key).join(',') + '|' + shape();
+function onMem(id, m) {
+  const page = mem;
+  mem = memFor(id);
+  let got;
+  try { got = takeSys(m); } finally { mem = page; }
+  if (page.id === id) showSys(got);
+}
+sysListeners.push(m => { syncRate(m.iv); onMem('local', m); });
+rmemListeners.push(m => onMem(m.id, m));
+
+function showSys({ inUse, reshaped, kinds }) {   // the page's machine has a new sample
   if (kinds !== mem.kindsKey) {
     mem.kindsKey = kinds;
     renderLegend();
   }
-  if (!ML || before !== shape()) mlayout();
+  if (!ML || reshaped) mlayout();
   // Bars and charts follow every sample; text redraws less often so it stays readable.
   const now = performance.now();
   if (now - mem.textAt >= M_TEXT_MS) {
@@ -203,12 +243,38 @@ function onSys(m) {
     renderMemMsg();
     if (mem.hover && mem.mouse) showMemTip();
   }
+  if (activeTab === 'mem') drawCharts();
+}
+
+// Show another machine on the Memory page.
+function setMemMachine(id) {
+  if (mem.id === id) return;
+  mem.hover = mem.mouse = null;
+  mtip.hidden = true;
+  mem = memFor(id);
+  mem.kindsKey = '';
+  mem.textAt = 0;
+  $('mctl-rate-box').hidden = $('mctl-addr-box').hidden = id !== 'local';
+  mstage.scrollTop = 0;
+  if (mem.last) showSys({ inUse: msum(mem.segs.filter(s => IN_USE.has(s.key)).map(s => s.bytes)), reshaped: true,
+                          kinds: mem.segs.map(s => s.key).join(',') + '|' });
+  else {
+    $('mlegend').innerHTML = '';
+    for (const x of ['ms-ram', 'ms-commit', 'ms-vram', 'ms-3d', 'ms-cpu', 'key-3d', 'key-cpu', 'key-commit', 'key-ramuse', 'key-limit']) $(x).textContent = '–';
+    showGpu(false);
+    renderMemMsg();
+    mlayout();
+  }
   drawCharts();
 }
-sysListeners.push(onSys);
+
+// Forget a machine that isn't watched any more.
+function dropMem(id) {
+  mems.delete(id);
+}
 
 // ---------------------------------------------------------------------------
-// Sample rate: the same choices as the CPU tab, kept between runs
+// Sample rate: the same choices as for the graphs, kept between runs
 // ---------------------------------------------------------------------------
 function syncRate(iv) {
   if (!M_INTERVALS.includes(iv)) return;
@@ -239,6 +305,7 @@ $('mctl-rate').addEventListener('change', ev => setMemRate(Number(ev.target.valu
 document.addEventListener('keydown', ev => {
   if (activeTab !== 'mem' || ev.ctrlKey || ev.altKey || ev.metaKey) return;
   if (ev.target.closest && ev.target.closest('input, select, textarea')) return;
+  if (mem.id !== 'local') return;
   const i = M_INTERVALS.indexOf(mem.interval);
   if (ev.key === 'ArrowUp' && i > 0) setMemRate(M_INTERVALS[i - 1]);           // faster
   else if (ev.key === 'ArrowDown' && i < M_INTERVALS.length - 1) setMemRate(M_INTERVALS[i + 1]);   // slower
@@ -461,7 +528,7 @@ function placeLabels(list, sides, label) {
     const [name, value] = label(g.s);
     return { g, name, value, ax: (g.x0 + g.x1) / 2, w: Math.ceil(Math.max(mwidth(name, 12, 600), mwidth(value, 11))) + 2 };
   });
-  const lo = ML.x0 - MPAD + 6, hi = ML.x1 + MPAD - 6;
+  const lo = ML.x0 - mEdge, hi = ML.x1 + mEdge;
   const mid = (ML.x0 + ML.x1) / 2, half = ML.w / 2;
   const bySide = sides.map(() => []);
   items.forEach((it, i) => bySide[i % sides.length].push(it));
@@ -579,7 +646,7 @@ function moutline(x0, x1, bar) {
 
 // A dimension line under the bar: |—— text ——|, for kinds that add up.
 function drawDim(x0, x1, y, name, value, color, key, over) {
-  const lo = ML.x0 - MPAD + 4, hi = ML.x1 + MPAD - 4;
+  const lo = ML.x0 - mEdge, hi = ML.x1 + mEdge;
   const end = Math.min(x1, over ? hi - 6 : x1);
   const hot = mem.hover && mem.hover.kind === 'dim' && mem.hover.key === key;
   mctx.strokeStyle = hot ? T.hl : color;
@@ -604,24 +671,30 @@ function drawDim(x0, x1, y, name, value, color, key, over) {
   else if (end + 8 + tw <= hi) tx = end + 8;
   else tx = Math.max(lo, x0 - 8 - tw);
   if (tx > x0 && tx + tw < end) {   // cut the line under the text
+    const alpha = mctx.globalAlpha;
+    mctx.globalAlpha = 1;
     mctx.fillStyle = T.bg;
     mctx.fillRect(tx - 5, y - 8, tw + 10, 16);
+    mctx.globalAlpha = alpha;
   }
   mtext(name, tx, y, 12, T.ink, 'left', 600);
   mtext(value, tx + nw + 6, y, 12, T.ink2);
   hit(Math.min(x0, tx), y - 9, Math.max(end, tx + tw), y + 9, { kind: 'dim', key });
 }
 
-function drawRam() {
+const ramSubtitle = r => `${capacity(r.installed)} GB installed · ${(r.total / GiB).toFixed(1)} GB usable by ${mem.os === 'linux' ? 'Linux' : 'Windows'}`;
+
+function drawRam(look = 'full') {
   const m = mem.last, r = m.ram, sec = ML.ram, bar = { x: ML.x0, ...sec.bar };
   const usable = r.lists ? 'by what it holds' : 'in use and available';
-  drawHead(sec.headY, 'System memory',
-    `${capacity(r.installed)} GB installed · ${(r.total / GiB).toFixed(1)} GB usable by Windows · ${usable}`);
+  if (sec.headY != null) drawHead(sec.headY, 'System memory', `${ramSubtitle(r)} · ${usable}`);
   const list = geom(mem.segs, ML.x0, ML.w);
   const hk = mem.hover && mem.hover.kind === 'seg' ? mem.hover.key : null;
   drawSegments(list, bar, s => kindColor(s.key), hk, 'seg');
+  if (look === 'bar') return;
   const placed = placeLabels(list, ['up', 'down'], s => [kindOf(s.key).name, `${fmtSize(s.bytes)} · ${share(s.bytes, r.installed)}`]);
-  mdrawLabels(placed, bar, MRISE, hk, 'seg');
+  mdrawLabels(placed, bar, sec.rise || MRISE, hk, 'seg');
+  if (look !== 'full') return;
 
   // Dimension lines: in use, available, cached (Task Manager's words), committed
   const at = key => list.find(g => g.s.key === key);
@@ -641,7 +714,7 @@ function drawRam() {
   drawDim(ML.x0, usedEnd, sec.dimY[0], 'In use', fmtSize(inUse), MC.proc, 'inuse');
   if (r.lists) {
     const mod = at('modified'), sb = at('standby'), fr = at('free');
-    drawDim(sb.x0, fr.x1, sec.dimY[0], 'Available', fmtSize(r.lists.free + msum(r.lists.standby)), MC.standby, 'avail');
+    drawDim(sb.x0, fr.x1, sec.dimY[0], mem.os === 'linux' ? 'Cache and free' : 'Available', fmtSize(r.lists.free + msum(r.lists.standby)), MC.standby, 'avail');
     drawDim(mod.x0, sb.x1, sec.dimY[1], 'Cached', fmtSize(r.lists.modified + msum(r.lists.standby)), MC.modified, 'cached');
   } else {
     const av = at('avail');
@@ -651,6 +724,9 @@ function drawRam() {
     const x = ML.x0 + ML.w * mem.commit / r.installed;
     drawDim(ML.x0, x, sec.dimY[2], 'Committed',
       `${fmtSize(m.commit.used)} of ${capacity(m.commit.limit)} GB`, UC.commit, 'commit', x > ML.x1);
+  } else if (m.swap && m.swap.total) {
+    const x = ML.x0 + ML.w * mem.commit / r.installed;
+    drawDim(ML.x0, x, sec.dimY[2], 'Swap in use', `${fmtSize(m.swap.used)} of ${fmtSize(m.swap.total)}`, UC.commit, 'swap', x > ML.x1);
   }
   drawAxis(sec.axisY, r.installed, ML.x0, ML.w);
   if (mem.hover && mem.hover.kind === 'dim') {   // what a dimension line adds up
@@ -661,12 +737,81 @@ function drawRam() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The bar on another canvas: the overview, and each machine in the list
+// ---------------------------------------------------------------------------
+// Its looks: full, with the heading, dimension lines and axis; labels, smaller and with only
+// the labels; or bar, the bar alone. And the heights of the first two.
+const MEMBAR_FULL = MHEAD_H + 2 * (MRISE + MLBL_H) + MBAR_H + 8 + 3 * MDIM_H + 4 + MAXIS_H;
+const MEMBAR_RISE = 18, MEMBAR_BAR = 34, MEMBAR_LABELS = 2 * (MEMBAR_RISE + MLBL_H) + MEMBAR_BAR;
+
+// Draw a machine's memory bar on ctx, with the top left at x, y and w wide (barH high, in the
+// bar look). hover: { kind, key } as memBarAt returned it. Returns the places that can be
+// hovered over, or null if there's nothing to draw yet.
+function drawMemBar(ctx, id, x, y, w, look, hover, { edge = 0, barH = 16 } = {}) {
+  const own = memFor(id);
+  if (!own.last || !own.segs.length) return null;
+  const was = { mem, mctx, ML, mEdge, hover: own.hover, hits: own.hits };
+  mem = own;
+  mctx = ctx;
+  mEdge = edge;
+  own.hover = hover;
+  own.hits = [];
+  easeMem();
+  const full = look === 'full', bar = look === 'bar', rise = full ? MRISE : MEMBAR_RISE;
+  const h = full ? MBAR_H : bar ? barH : MEMBAR_BAR;
+  const zone = bar ? 0 : rise + MLBL_H, top = y + (full ? MHEAD_H : 0) + zone;
+  ML = { x0: x, x1: x + w, w, ram: {
+    headY: full ? y + 9 : null, rise, bar: { y: top, h },
+    dimY: [0, 1, 2].map(i => top + h + zone + 8 + i * MDIM_H + MDIM_H / 2),
+    axisY: top + h + zone + 8 + 3 * MDIM_H + 4 } };
+  let hits;
+  try {
+    drawRam(look);
+    hits = own.hits;
+  } finally {
+    own.hover = was.hover;
+    own.hits = was.hits;
+    mem = was.mem;
+    mctx = was.mctx;
+    ML = was.ML;
+    mEdge = was.mEdge;
+  }
+  return hits;
+}
+
+function memBarAt(hits, mx, my) {
+  for (let i = hits.length - 1; i >= 0; i--) {
+    const h = hits[i];
+    if (mx >= h.x0 && mx <= h.x1 && my >= h.y0 && my <= h.y1) return { kind: h.kind, key: h.key };
+  }
+  return null;
+}
+
+function memBarTip(id, hover) {
+  const was = mem;
+  mem = memFor(id);
+  try {
+    return !mem.last || !mem.last.ram ? '' : hover.kind === 'seg' ? segTip(hover.key) : hover.kind === 'dim' ? dimTip(hover.key) : '';
+  } finally { mem = was; }
+}
+
+// Move the bars of mem towards its latest sample.
+function easeMem() {
+  const now = performance.now(), dt = Math.min(0.25, (now - mem.easedAt) / 1000);
+  mem.easedAt = now;
+  const k = 1 - Math.exp(-dt / M_TAU);
+  for (const list of [mem.segs, mem.psegs, mem.gsegs]) for (const s of list) s.shown += (s.bytes - s.shown) * k;
+  const promised = mem.last && (mem.last.commit || mem.last.swap);
+  if (promised) mem.commit += (promised.used - mem.commit) * k;
+}
+
 // Memory by program: the biggest programs, the rest, and what no one program owns.
 function drawProgs() {
   const r = mem.last.ram, p = r.progs, sec = ML.progs, bar = { x: ML.x0, ...sec.bar };
   const count = p.top.length + p.other[2];
   drawHead(sec.headY, 'Memory by program',
-    `the ${p.top.length} biggest of ${count} programs, by private working set · on the same scale as the bar above`);
+    `the ${p.top.length} biggest of ${count} programs, by ${mem.os === 'linux' ? 'memory of their own' : 'private working set'} · on the same scale as the bar above`);
   const list = geom(mem.psegs, ML.x0, ML.w);
   const hk = mem.hover && mem.hover.kind === 'pseg' ? mem.hover.key : null;
   drawSegments(list, bar, s => MC[s.tone], hk, 'pseg');
@@ -801,7 +946,7 @@ function drawPhys() {
   }
   drawAddrAxis(p.axisY);
   const note = mem.pin != null ? pinText() : mem.map ? 'What each physical address holds. Gaps have no RAM.'
-    : 'Where RAM is. What each address holds needs administrator rights.';
+    : mem.id === 'local' ? 'Where RAM is. What each address holds needs administrator rights.' : 'Where RAM is.';
   mtext(fitText(note, ML.w, 11.5), ML.x0, p.noteY, 11.5, mem.pin != null ? T.ink : T.muted);
   if (mem.pin != null) drawPin(p, addrX(mem.pin));
 }
@@ -957,7 +1102,7 @@ function mdraw() {
   mem.hits = [];
   const m = mem.last;
   if (!ML || !m || !mem.segs.length) {
-    mtext(m ? '' : 'Waiting for the first sample…', mW / 2, mH / 2, 13, T.muted, 'center');
+    mtext(m ? '' : memNote() || 'Waiting for the first sample…', mW / 2, mH / 2, 13, T.muted, 'center');
     return;
   }
   drawRam();
@@ -966,17 +1111,20 @@ function mdraw() {
   if (ML.gpu && m.gpu && mem.gsegs.length) drawGpu();
 }
 
-let mLast = performance.now();
-function mframe(t) {
-  const dt = Math.min(0.1, (t - mLast) / 1000);
-  mLast = t;
+function mframe() {
   requestAnimationFrame(mframe);
   if (activeTab !== 'mem') return;
   if ((window.devicePixelRatio || 1) !== mdpr) mlayout();
-  const k = 1 - Math.exp(-dt / M_TAU);
-  for (const list of [mem.segs, mem.psegs, mem.gsegs]) for (const s of list) s.shown += (s.bytes - s.shown) * k;
-  if (mem.last && mem.last.commit) mem.commit += (mem.last.commit.used - mem.commit) * k;
+  easeMem();
   mdraw();
+}
+
+// Why a remote machine has no memory to show, if there's a reason.
+function memNote() {
+  const s = mem.id === 'local' ? null : pm.get(mem.id), info = s && s.info;
+  if (!info) return '';
+  if (info.state !== 'ok') return info.status;
+  return info.memory ? '' : info.note;
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,12 +1162,16 @@ function segTip(key) {
       .map(([i, b]) => `<div class="sub">${esc(USE_NAMES[i])} ${fmtSize(b)}</div>`).join('');
   }
   if (key === 'hw') html += `<div class="sub">${fmtGB(r.installed)} GB installed, ${fmtGB(r.total)} GB usable</div>`;
-  if (key === 'apps' && r.err) html += `<div class="faint desc">A finer split needs the memory map: ${esc(r.err)}</div>`;
+  if (key === 'apps' && r.err && mem.id === 'local') html += `<div class="faint desc">A finer split needs the memory map: ${esc(r.err)}</div>`;
   return html;
 }
 
 function dimTip(key) {
   const m = mem.last, r = m.ram;
+  if (key === 'swap') {
+    return tipHead(UC.commit, 'Swap in use', `${fmtSize(m.swap.used)} of ${fmtSize(m.swap.total)}`) +
+      tipDesc('Memory moved out to disk, to make room in RAM or because it had gone unused.');
+  }
   if (key === 'commit') {
     const c = m.commit;
     let html = tipHead(UC.commit, 'Committed', `${fmtSize(c.used)} of ${fmtSize(c.limit)}`) +
@@ -1034,18 +1186,22 @@ function dimTip(key) {
   if (key === 'inuse') {
     const total = msum(uses.map(s => s.bytes));
     return tipHead(MC.proc, 'In use', fmtSize(total)) +
-      tipDesc('Memory programs, drivers and Windows are using.') +
+      tipDesc(`Memory programs, drivers and ${mem.os === 'linux' ? 'the kernel' : 'Windows'} are using.`) +
       [...uses].sort((a, b) => b.bytes - a.bytes).map(s =>
         `<div class="sub">${swatch(kindColor(s.key))}${esc(kindOf(s.key).name)} ${fmtSize(s.bytes)}</div>`).join('');
   }
   if (key === 'avail') {
     const total = r.lists ? r.lists.free + msum(r.lists.standby) : r.avail;
+    if (mem.os === 'linux') {
+      return tipHead(MC.standby, 'Cache and free', fmtSize(total)) +
+        tipDesc(`Page cache plus free. Linux reckons programs can get ${fmtSize(r.avail)} of it without swapping (MemAvailable).`);
+    }
     return tipHead(MC.standby, 'Available', fmtSize(total)) +
       tipDesc('Standby plus free: memory programs can get right away.');
   }
   const total = r.lists.modified + msum(r.lists.standby);
   return tipHead(MC.modified, 'Cached', fmtSize(total)) +
-    tipDesc('Modified plus standby: what Task Manager calls Cached.');
+    tipDesc(mem.os === 'linux' ? 'Page cache, including what is still to be written to disk.' : 'Modified plus standby: what Task Manager calls Cached.');
 }
 
 function cellTip(a) {
@@ -1089,11 +1245,18 @@ function psegTip(key) {
     return html + `<div class="sub">${s.count} more programs, ${s.procs} processes</div>` +
       tipDesc('The private working sets of every program not shown on its own.');
   }
+  if (key === 'r:shared' && mem.os === 'linux') {
+    return html + tipDesc("Memory in use that no one program owns: memory programs share, tmpfs, and the kernel's own.");
+  }
   if (key === 'r:shared') {
     return html + tipDesc("Memory in use that no one program owns: files mapped into memory, memory programs share, and Windows' own memory (pools, page tables, drivers).");
   }
-  if (key === 'r:idle') return html + tipDesc('Modified, standby and free memory: see the bar at the top.');
-  if (key === 'r:hw') return html + tipDesc(KINDS.hw.tip);
+  if (key === 'r:idle') return html + tipDesc('Cached and free memory: see the bar at the top.');
+  if (key === 'r:hw') return html + tipDesc(kindOf('hw').tip);
+  if (mem.os === 'linux') {
+    return html + `<div class="sub">${s.procs} process${s.procs === 1 ? '' : 'es'} · resident ${fmtSize(s.ws)}</div>` +
+      tipDesc("RAM only this program's processes use: resident memory, less what's backed by files or shared.");
+  }
   html += `<div class="sub">${s.procs} process${s.procs === 1 ? '' : 'es'} · working set ${fmtSize(s.ws)} · committed ${fmtSize(s.commit)}</div>`;
   return html + tipDesc("Private working set: RAM only this program's processes use, as in Task Manager's Memory column. The working set adds memory it shares with other programs; committed is what it has been promised, in RAM or the page file.");
 }
@@ -1201,7 +1364,7 @@ function clearPin() {
 
 $('mctl-addr').addEventListener('keydown', ev => {
   if (ev.key === 'Enter') { if (ev.target.value.trim()) pinAddress(ev.target.value); else clearPin(); }
-  else if (ev.key === 'Escape') clearPin();
+  else if (ev.key === 'Escape' && (ev.target.value || mem.pin != null)) clearPin();   // and the next one leaves the page
   else return;
   ev.preventDefault();
 });
@@ -1214,16 +1377,26 @@ function renderMemStats(inUse) {
   const m = mem.last, h = mem.hist[mem.hist.length - 1];
   const r = m.ram && m.ram.uses ? m.ram : null;
   $('ms-ram').textContent = r ? `${fmtGB(inUse)} / ${capacity(r.installed)} GB` : '–';
+  showGpu(!!m.gpu);
   $('ms-vram').textContent = m.gpu ? `${fmtGB(m.gpu.used)} / ${capacity(m.gpu.vram)} GB` : '–';
   const g3d = h.g3d != null ? pct(h.g3d / 100) : '–', cpu = h.cpu != null ? pct(h.cpu / 100) : '–';
   $('ms-3d').textContent = $('key-3d').textContent = g3d;
   $('ms-cpu').textContent = $('key-cpu').textContent = cpu;
   const c = m.commit;
-  $('ms-commit').textContent = c ? `${fmtGB(c.used)} / ${capacity(c.limit)} GB` : '–';
+  const swap = !c && m.swap && m.swap.total ? m.swap : null;
+  $('ms-commit').textContent = c ? `${fmtGB(c.used)} / ${capacity(c.limit)} GB` : swap ? `${fmtGB(swap.used)} / ${fmtGB(swap.total)} GB` : '–';
+  $('ms-commit-k').textContent = c || !swap ? 'Committed' : 'Swap';
+  $('commit-title').firstChild.textContent = c ? 'Committed memory ' : 'Memory in use ';
+  $('key-commit').parentElement.hidden = $('key-limit').parentElement.hidden = !c;
   $('key-commit').textContent = c ? `${fmtGB(c.used)} GB` : '–';
   $('key-ramuse').textContent = r ? `${fmtGB(inUse)} GB` : '–';
   $('key-limit').textContent = c ? `${capacity(c.limit)} GB` : '–';
   $('ms-commit').parentElement.title = c ? `Peak since Windows started: ${fmtGB(c.peak)} GB` : '';
+}
+
+// A machine without a graphics card with its own memory shows nothing about one.
+function showGpu(on) {
+  for (const el of document.querySelectorAll('#tab-mem [data-gpu]')) el.hidden = !on;
 }
 
 function renderLegend() {
@@ -1255,10 +1428,11 @@ function renderMeters() {
 }
 
 function renderMemMsg() {
-  const m = mem.last;
+  const m = mem.last || {}, note = memNote();
   let text = '';
-  if (m.err) text = `Memory and GPU readings aren't available: ${m.err}`;
-  else if (m.ram && m.ram.err && !mem.map) text = `${m.ram.err} Showing totals from the performance counters, without where in physical memory each kind sits.`;
+  if (note && mem.last) text = note;   // what's shown is from before the connection was lost
+  else if (m.err) text = `Memory readings aren't available: ${m.err}`;
+  else if (mem.id === 'local' && m.ram && m.ram.err && !mem.map) text = `${m.ram.err} Showing totals from the performance counters, without where in physical memory each kind sits.`;
   $('mmsg').textContent = text;
   $('mmsg').hidden = !text;
 }
@@ -1401,7 +1575,7 @@ class LineChart {
     const h = mem.hist[i], ago = now - h.t;
     this.hover = h.t;   // a time, so the marker stays on its sample as new ones arrive
     this.draw();
-    const rows = [...cfg.series].reverse().map(s =>
+    const rows = [...cfg.series].filter(s => !s.hide || !s.hide()).reverse().map(s =>
       `<div><i class="ln ${s.cls}"></i> ${s.label} ${h[s.key] == null ? '–' : cfg.fmt(h[s.key])}</div>`);
     const ref = cfg.ref && cfg.ref();
     const when = ago < mem.interval / 2000 ? 'Now' : ago < 10 ? `${ago.toFixed(1)} s ago` : `${Math.round(ago)} s ago`;
@@ -1415,7 +1589,7 @@ class LineChart {
 }
 
 const utilChart = new LineChart('ucv', 'utip', {
-  series: [{ key: 'cpu', label: 'CPU', cls: 'cpu' }, { key: 'g3d', label: 'GPU 3D', cls: 'g3d' }],
+  series: [{ key: 'cpu', label: 'CPU', cls: 'cpu' }, { key: 'g3d', label: 'GPU 3D', cls: 'g3d', hide: () => !(mem.last && mem.last.gpu) }],
   max: () => 100,
   ticks: () => [0, 50, 100],
   axis: v => `${v}%`,
@@ -1425,15 +1599,17 @@ const utilChart = new LineChart('ucv', 'utip', {
 // Committed memory: what programs have been promised, backed by RAM or the
 // page file, against the limit (RAM plus page file). In use (RAM) for scale.
 function commitScale() {
-  const top = Math.max(mem.commitLimit || 0, ...mem.hist.map(h => Math.max(h.commit || 0, h.ram || 0)));
-  const step = top > 64 * GiB ? 32 * GiB : 8 * GiB;
+  const ram = mem.last && mem.last.ram ? mem.last.ram.total : 0;
+  const top = Math.max(mem.commitLimit || ram, ...mem.hist.map(h => Math.max(h.commit || 0, h.ram || 0)));
+  const step = top > 64 * GiB ? 32 * GiB : top > 8 * GiB ? 8 * GiB : 2 * GiB;
   return Math.max(step, Math.ceil(top * 1.02 / step) * step);
 }
 const commitChart = new LineChart('ccv', 'ctip', {
-  series: [{ key: 'ram', label: 'In use (RAM)', cls: 'ram' }, { key: 'commit', label: 'Committed', cls: 'commit' }],
+  series: [{ key: 'ram', label: 'In use (RAM)', cls: 'ram' },
+    { key: 'commit', label: 'Committed', cls: 'commit', hide: () => !mem.commitLimit }],
   max: commitScale,
   ticks: () => { const m = commitScale(); return [0, m / 2, m]; },
-  axis: v => `${Math.round(v / GiB)} GB`,
+  axis: v => `${+(v / GiB).toFixed(1)} GB`,
   fmt: v => `${fmtGB(v)} GB`,
   ref: () => (mem.commitLimit ? { value: mem.commitLimit, label: `Limit ${capacity(mem.commitLimit)} GB` } : null),
 });
@@ -1448,7 +1624,9 @@ function drawCharts() {
 // ---------------------------------------------------------------------------
 readMemColors();
 // The tab may open before a resize notice arrives: lay out then too.
-tabListeners.push(name => { if (name === 'mem') { mlayout(); drawCharts(); } });
+tabListeners.push(name => { if (name === 'mem') { setMemMachine(viewMachine()); mlayout(); drawCharts(); renderMemMsg(); } });
 darkQuery.addEventListener('change', () => { readMemColors(); drawCharts(); });
+// What the other machines had before this page opened
+fetch('/api/rmem', { cache: 'no-store' }).then(r => r.json()).then(list => { for (const m of list) onMem(m.id, m); }).catch(() => { /* they come anyway */ });
 new ResizeObserver(mlayout).observe(mstage);
 requestAnimationFrame(mframe);

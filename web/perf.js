@@ -1,47 +1,81 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// CPU, disk & network tab: a port of CPU Graph 2.0 (github.com/esteed/CpuGraph).
-// One row per machine (This PC, then each remote machine running cpugraph-agent)
-// with three columns: a small graph per CPU thread, a strip per network adapter
-// and a strip per disk. All graphs share one time axis. Every number is a
-// 3-second average; the lines show the samples. Uses the theme and helpers from
-// app.js (T, $, esc, loadPref, savePref, activeTab, perfListeners).
+// CPU, network and disk graphs, first ported from CPU Graph 2.0
+// (github.com/esteed/CpuGraph): small graphs per CPU thread or one of them all, a
+// strip per network adapter and one per disk. All graphs share one time axis.
+// Every number is a 3-second average; the lines show the samples. Here are the
+// samples and the drawing; views.js and remote.js put the graphs on pages. Uses
+// the theme and helpers from app.js (T, $, esc, loadPref, savePref, perfListeners).
 // ---------------------------------------------------------------------------
 const P_INTERVALS = [50, 100, 250, 500, 1000];   // ms: 20, 10, 4, 2, 1 samples a second
 const P_SPANS = [15, 30, 60, 120, 300];          // seconds (at 20 a second the graphs show a third)
 const P_AVG = 3;                                 // seconds averaged for the amber line and every number
 const P_CAP = 8192;                              // samples kept per machine: 409 s at 20 a second
 const P_GRID = [1, 2, 3, 5, 10, 15, 20, 30, 60, 120, 300];
-const PL = { top: 28, title: 24, rowGap: 12, margin: 12, colGap: 14, stripGap: 4, cellGap: 3,
-             minBody: 44, cpuWeight: 0.8, aspect: 1.6 };
+const PL = { stripGap: 4, cellGap: 3, aspect: 1.6 };
+const P_LOST_FADE = 1.6;                         // seconds for a lost adapter's graph to fade out and in
 
-const pstage = $('pstage'), pcv = $('pcv'), pctx = pcv.getContext('2d'), ptip = $('ptip');
 const pp = {
-  meta: null, tEnd: 0, paused: false, started: performance.now(), plots: [], hover: null,
-  span: 60, threads: true, avg: true, remotes: true, net: true, disk: true, onTop: false,
-  restored: false, desktop: false,
+  meta: null, tEnd: 0, paused: false, started: performance.now(),
+  span: 60, threads: true, avg: true, onTop: false, restored: false, desktop: false,
 };
-const pm = new Map();   // machine id -> { v, cpu, nets, disks, info, lastLink }
-let PC = {}, pW = 0, pH = 0, pdpr = 1, pQueued = false;
+const pm = new Map();   // machine id -> { v, info, cpu, nets, disks, lastLink }, the last three by item key
+let PC = {};
 
-// A ring of samples: time plus a fixed number of channels.
+// The canvas being drawn on: { cv, ctx, dpr, w, h, plots, hover, fading }
+let PS = null, pctx = null, pAlpha = 1, pDim = 1;   // pDim: 0.4 while a machine that's away is drawn
+function makeSurface(canvas) {
+  return { cv: canvas, ctx: canvas.getContext('2d'), dpr: 1, w: 0, h: 0, plots: [], hover: null, fading: false };
+}
+function startSurface(S, w, h) {   // size it, clear it, and draw on it from here
+  PS = S;
+  pctx = S.ctx;
+  pAlpha = pDim = 1;
+  S.w = w;
+  S.h = h;
+  S.dpr = window.devicePixelRatio || 1;
+  S.plots = [];
+  S.fading = false;
+  const cw = Math.round(w * S.dpr), ch = Math.round(h * S.dpr);
+  if (S.cv.width !== cw || S.cv.height !== ch) {
+    S.cv.width = cw;
+    S.cv.height = ch;
+    S.cv.style.width = w + 'px';
+    S.cv.style.height = h + 'px';
+  }
+  pctx.setTransform(S.dpr, 0, 0, S.dpr, 0, 0);
+  pctx.clearRect(0, 0, w, h);
+}
+
+// A ring of samples: time plus a fixed number of channels. It starts small and grows
+// until it holds P_KEEP seconds, or P_CAP samples, so hundreds of machines fit.
+const P_KEEP = 330;
 class PRing {
   constructor(channels) {
     this.ch = channels;
-    this.t = new Float64Array(P_CAP);
-    this.v = Array.from({ length: channels }, () => new Float32Array(P_CAP));
+    this.cap = 256;
+    this.t = new Float64Array(this.cap);
+    this.v = Array.from({ length: channels }, () => new Float32Array(this.cap));
     this.start = 0;
     this.n = 0;
   }
+  grow() {
+    const order = a => { const b = new a.constructor(this.cap * 2); b.set(a.subarray(this.start)); b.set(a.subarray(0, this.start), this.cap - this.start); return b; };
+    this.t = order(this.t);
+    this.v = this.v.map(order);
+    this.cap *= 2;
+    this.start = 0;
+  }
   push(t, vals) {
-    const i = (this.start + this.n) % P_CAP;
+    if (this.n === this.cap && this.cap < P_CAP && t - this.T(0) < P_KEEP) this.grow();
+    const i = (this.start + this.n) % this.cap;
     this.t[i] = t;
     for (let c = 0; c < this.ch; c++) this.v[c][i] = vals[c] || 0;
-    if (this.n < P_CAP) this.n++; else this.start = (this.start + 1) % P_CAP;
+    if (this.n < this.cap) this.n++; else this.start = (this.start + 1) % this.cap;
   }
-  T(k) { return this.t[(this.start + k) % P_CAP]; }
-  V(c, k) { return this.v[c][(this.start + k) % P_CAP]; }
+  T(k) { return this.t[(this.start + k) % this.cap]; }
+  V(c, k) { return this.v[c][(this.start + k) % this.cap]; }
   after(t) {   // first sample later than t
     let lo = 0, hi = this.n;
     while (lo < hi) { const m = (lo + hi) >> 1; if (this.T(m) > t) hi = m; else lo = m + 1; }
@@ -62,6 +96,7 @@ class PRing {
 const pPct = v => `${v.toFixed(1)}%`;
 const pNum = v => (v >= 100 ? v.toFixed(0) : v.toFixed(1));
 const pBits = b => (b >= 1e9 ? `${pNum(b / 1e9)} Gb/s` : b >= 1e6 ? `${pNum(b / 1e6)} Mb/s` : `${pNum(b / 1e3)} Kb/s`);
+const pBitsTiny = b => (b >= 1e9 ? `${pNum(b / 1e9)}G` : b >= 1e6 ? `${pNum(b / 1e6)}M` : `${Math.round(b / 1e3)}K`);
 const pBytes = b => (b >= 1e9 ? `${pNum(b / 1e9)} GB/s` : b >= 1e6 ? `${pNum(b / 1e6)} MB/s` : `${pNum(b / 1e3)} KB/s`);
 const trim2 = v => String(+v.toFixed(2));
 const pAxisBits = v => (v >= 1e12 ? `${trim2(v / 1e12)} Tb/s` : v >= 1e9 ? `${trim2(v / 1e9)} Gb/s`
@@ -84,28 +119,32 @@ const pRate = () => { const n = Math.max(1, 1000 / pInterval()); return `${n} ${
 // ---------------------------------------------------------------------------
 function pStore(id) {
   let s = pm.get(id);
-  if (!s) { s = { v: -1, cpu: null, nets: [], disks: [], info: null, lastLink: [] }; pm.set(id, s); }
+  if (!s) { s = { v: -1, info: null, cpu: null, nets: new Map(), disks: new Map(), lastLink: new Map() }; pm.set(id, s); }
   return s;
+}
+
+function pushRing(map, key, channels, t, values) {
+  let ring = map.get(key);
+  if (!ring || ring.ch !== channels) map.set(key, ring = new PRing(channels));
+  if (ring.n && t <= ring.T(ring.n - 1)) return;   // a reconnected machine's clock, placed a little differently
+  ring.push(t, values);
 }
 
 function onPerf(msg) {
   for (const [id, [v, samples]] of Object.entries(msg.m)) {
-    const s = pStore(id);
-    if (s.v !== v) { s.v = v; s.cpu = null; s.nets = []; s.disks = []; s.lastLink = []; }   // new layout or clock
+    const s = pStore(id), info = s.info;
+    if (!info || info.v !== v) continue;           // its description is on the way
     for (const [t, cpu, nets, disks] of samples) {
-      if (!s.cpu || s.cpu.ch !== cpu.length || s.nets.length !== nets.length || s.disks.length !== disks.length) {
-        s.cpu = new PRing(cpu.length);
-        s.nets = nets.map(() => new PRing(3));
-        s.disks = disks.map(() => new PRing(3));
-      }
-      s.cpu.push(t, cpu);
-      nets.forEach((x, i) => s.nets[i].push(t, x));
-      disks.forEach((x, i) => s.disks[i].push(t, x));
+      if (nets.length !== info.nets.length || disks.length !== info.disks.length) continue;
+      if (!s.cpu || s.cpu.ch !== cpu.length) s.cpu = new PRing(cpu.length);
+      if (!s.cpu.n || t > s.cpu.T(s.cpu.n - 1)) s.cpu.push(t, cpu);
+      nets.forEach((x, i) => pushRing(s.nets, info.nets[i].key, 3, t, x));
+      disks.forEach((x, i) => pushRing(s.disks, info.disks[i].key, x.length, t, x));
     }
   }
   const local = msg.m.local && msg.m.local[1].length ? msg.m.local[1][msg.m.local[1].length - 1][0] : msg.t;
   if (!pp.paused) pp.tEnd = local;   // shared clock: every graph ends at this PC's newest sample
-  pInvalidate();
+  for (const f of perfDrawers) f();
 }
 
 function onPerfMeta(meta) {
@@ -113,7 +152,20 @@ function onPerfMeta(meta) {
   pp.meta = meta;
   const ids = new Set(meta.machines.map(m => m.id));
   for (const id of pm.keys()) if (!ids.has(id)) pm.delete(id);
-  for (const m of meta.machines) pStore(m.id).info = m;
+  for (const m of meta.machines) {
+    const s = pStore(m.id);
+    if (s.info && s.info.address !== m.address) {   // a different machine now
+      pm.delete(m.id);
+      pStore(m.id).info = m;
+      continue;
+    }
+    s.info = m;
+    const nets = new Set(m.nets.map(i => i.key)), disks = new Set(m.disks.map(i => i.key));
+    if (m.state === 'ok') {   // keep what a machine that's away showed
+      for (const k of s.nets.keys()) if (!nets.has(k)) s.nets.delete(k);
+      for (const k of s.disks.keys()) if (!disks.has(k)) s.disks.delete(k);
+    }
+  }
   $('pctl-rate').value = String(meta.interval);
   for (const b of $('pctl-source').querySelectorAll('button')) b.classList.toggle('on', b.dataset.v === meta.source);
   fillSpans();
@@ -125,8 +177,11 @@ function onPerfMeta(meta) {
     if ((src === 'cputime' || src === 'utility') && src !== meta.source) want.source = src;
     if (Object.keys(want).length) postPerf(want);
   }
-  pInvalidate();
+  for (const f of perfMetaListeners) f(meta);
+  for (const f of perfDrawers) f();
 }
+const perfDrawers = [];          // views.js, remote.js: draw what's showing
+const perfMetaListeners = [];    // remote.js: the machines changed
 perfListeners.perf.push(onPerf);
 perfListeners.perfmeta.push(onPerfMeta);
 
@@ -150,12 +205,6 @@ function readPerfColors() {
          write: v('--p-write'), plot: v('--panel'), border: v('--border-strong'), warn: v('--warn'), bg: v('--bg') };
 }
 
-function pInvalidate() {
-  if (pQueued || activeTab !== 'perf') return;
-  pQueued = true;
-  requestAnimationFrame(() => { pQueued = false; if (activeTab === 'perf') pdraw(); });
-}
-
 function pFont(size, weight = 400) { pctx.font = `${weight} ${size}px ${T.font}`; }
 function pText(str, x, y, size, color, weight = 400, align = 'left', maxW = 0) {
   pFont(size, weight);
@@ -171,102 +220,28 @@ function pText(str, x, y, size, color, weight = 400, align = 'left', maxW = 0) {
 }
 function pWidth(str, size, weight = 400) { pFont(size, weight); return pctx.measureText(str).width; }
 
-function visibleMachines() {
-  if (!pp.meta) return [];
-  return pp.meta.machines.filter(m => m.id === 'local' || pp.remotes).map(m => pStore(m.id));
-}
-
-function bodyLayout(rows) {
-  const fixed = PL.top + rows * PL.title + (rows - 1) * PL.rowGap + PL.margin;
-  return Math.max(PL.minBody, (pH - fixed) / rows);
-}
-
-function pdraw() {
-  const r = pstage.getBoundingClientRect();
-  if (!r.width || !r.height) return;
-  readPerfColors();
-  const machines = visibleMachines();
-  const rows = Math.max(1, machines.length);
-  pW = pstage.clientWidth;
-  pH = r.height;
-  const body = bodyLayout(rows);
-  const contentH = Math.max(pH, PL.top + rows * (PL.title + body) + (rows - 1) * PL.rowGap + PL.margin);
-  pdpr = window.devicePixelRatio || 1;
-  if (pcv.width !== Math.round(pW * pdpr) || pcv.height !== Math.round(contentH * pdpr)) {
-    pcv.width = Math.round(pW * pdpr);
-    pcv.height = Math.round(contentH * pdpr);
-    pcv.style.width = pW + 'px';
-    pcv.style.height = contentH + 'px';
-  }
-  const g = pctx;
-  g.setTransform(pdpr, 0, 0, pdpr, 0, 0);
-  g.clearRect(0, 0, pW, contentH);
-  pp.plots = [];
-  const left = PL.margin, right = pW - PL.margin, span = pVisible();
-  drawTopBar(left, right, span);
-  if (!machines.length) {
-    pText('Waiting for the first sample…', pW / 2, pH / 2, 13, T.muted, 400, 'center');
-    return;
-  }
-  const showNet = pp.net, showDisk = pp.disk;
-  const columns = 1 + showNet + showDisk;
-  const weights = PL.cpuWeight + showNet + showDisk;
-  const usable = right - left - (columns - 1) * PL.colGap;
-  const cpuW = usable * PL.cpuWeight / weights, otherW = usable / weights;
-  let y = PL.top;
-  for (const s of machines) {
-    const info = s.info;
-    const bodyTop = y + PL.title;
-    let x = left;
-    drawCpuTitle(s, x, y, cpuW);
-    drawCpuGrid(s, { x, y: bodyTop, w: cpuW, h: body }, span);
-    x += cpuW + PL.colGap;
-    if (showNet) {
-      pText('Network adapters', x, bodyTop - 7, 12.5, T.ink2);
-      drawStrips(s, 'net', { x, y: bodyTop, w: otherW, h: body }, span);
-      x += otherW + PL.colGap;
-    }
-    if (showDisk) {
-      pText('Disk devices', x, bodyTop - 7, 12.5, T.ink2);
-      drawStrips(s, 'disk', { x, y: bodyTop, w: otherW, h: body }, span);
-    }
-    if (info.id !== 'local' && info.status) veil(info.status, { x: left, y: bodyTop, w: right - left, h: body });
-    y = bodyTop + body + PL.rowGap;
-  }
-  drawCrosshair(span);
-}
-
-// "20 samples/s · last 20 s · CPU time · numbers are 3-second averages"  ...  note
-function drawTopBar(left, right, span) {
-  const meta = pp.meta, base = PL.top - 9;
-  const source = meta && meta.source === 'utility' ? 'Processor utility' : 'CPU time';
-  const info = `${pRate()}  ·  last ${pSpanLabel(span)}  ·  ${source}  ·  numbers are 3-second averages`;
-  let note = '', color = PC.warn;
-  if (pp.paused) note = 'PAUSED  –  press Space to resume';
-  else if (meta && meta.sourceNote) note = meta.sourceNote;
-  else if (performance.now() - pp.started < 20000) {
-    note = 'Keys: Space  ↑ ↓  ← →  R  N  D  M  C  A' + (pp.desktop ? '  T  E' : '');
-    color = T.muted;
-  }
+// "20 samples/s · last 20 s · numbers are 3-second averages"  ...  note
+function drawTopBar(left, right, base, span, extra = '', note = '', noteColor = '') {
+  const info = [pRate(), `last ${pSpanLabel(span)}`, extra, 'numbers are 3-second averages'].filter(Boolean).join('  ·  ');
+  if (pp.paused) { note = 'PAUSED  –  press Space to resume'; noteColor = PC.warn; }
   const noteW = note ? Math.min(pWidth(note, 12.5), (right - left) * 0.6) : 0;
-  if (note) pText(note, right, base, 12.5, color, 400, 'right', noteW);
+  if (note) pText(note, right, base, 12.5, noteColor || PC.warn, 400, 'right', noteW);
   const room = right - left - noteW - 24;
   if (room > 40) pText(info, left, base, 12.5, T.ink2, 400, 'left', room);
 }
 
-// "tinker9  2 threads · 10.1.0.13"  ...  "23.4%"
-function drawCpuTitle(s, x, y, w) {
-  const info = s.info, base = y + PL.title - 7;
+// "server1  2 threads · 192.168.1.30"  ...  "23.4%"
+const pLive = s => s.info.id === 'local' || s.info.state === 'ok';   // no stale figures while disconnected
+function drawCpuTitle(s, x, base, w, name, detail, size = 15) {
   const total = s.cpu ? s.cpu.avg(0, pp.tEnd) : null;
-  const live = total != null && (info.id === 'local' || !info.status);   // no stale figure while disconnected
-  const value = live ? pPct(total) : '--';
-  const vw = pWidth(value, 15, 600);
-  pText(value, x + w, base, 15, PC.line, 600, 'right');
+  const value = total != null && pLive(s) ? pPct(total) : '--';
+  const vw = pWidth(value, size, 600);
+  pText(value, x + w, base, size, PC.line, 600, 'right');
   const room = w - vw - 12;
-  const nw = Math.min(pWidth(info.name, 15, 600), room);
-  pText(info.name, x, base, 15, T.ink, 600, 'left', room);
+  const nw = Math.min(pWidth(name, size, 600), room);
+  pText(name, x, base, size, T.ink, 600, 'left', room);
   const detailRoom = room - nw - 8;
-  if (info.detail && detailRoom > 30) pText(info.detail, x + nw + 8, base, 12.5, T.ink2, 400, 'left', detailRoom);
+  if (detail && detailRoom > 30) pText(detail, x + nw + 8, base, 12.5, T.ink2, 400, 'left', detailRoom);
 }
 
 // Columns and rows for `cells` graphs in a w x h area, each near the preferred shape.
@@ -382,10 +357,10 @@ function drawSeries(ring, c, from, to, p, span, yMax, color, fill) {
     g.lineTo(lx, p.y + p.h);
     g.lineTo(fx, p.y + p.h);
     g.closePath();
-    g.globalAlpha = 0.17;
+    g.globalAlpha = 0.17 * pAlpha;
     g.fillStyle = color;
     g.fill();
-    g.globalAlpha = 1;
+    g.globalAlpha = pAlpha;
   }
 }
 
@@ -398,15 +373,15 @@ function clipTo(p) {
 
 // One small graph per logical processor (or one for the total), each the per-pixel
 // mean of its samples, with the 3-second average on top.
-function drawCpuGrid(s, area, span) {
-  const cpu = s.cpu, info = s.info;
-  const threads = pp.threads && cpu ? cpu.ch - 1 : 0;
+function drawCpuGrid(s, area, span, perThread, labels = true) {
+  const cpu = s.cpu;
+  const threads = perThread && cpu ? cpu.ch - 1 : 0;
   const cells = Math.max(1, threads), gap = PL.cellGap;
   const [cols, rows] = gridShape(cells, area.w + gap, area.h + gap);
   const cw = (area.w - (cols - 1) * gap) / cols, ch = (area.h - (rows - 1) * gap) / rows;
   if (cw < 4 || ch < 4) { pframe(area, 1, span, false); border(area); return; }
   const from = cpu ? Math.max(0, cpu.after(pp.tEnd - span) - 1) : 0, to = cpu ? cpu.after(pp.tEnd) : 0;
-  const label = cw >= 26 && ch >= 18;
+  const label = labels && cw >= 26 && ch >= 18;
   for (let i = 0; i < cells; i++) {
     const p = { x: area.x + (i % cols) * (cw + gap), y: area.y + Math.floor(i / cols) * (ch + gap), w: cw, h: ch };
     pframe(p, ch >= 30 ? 2 : 1, span, false);
@@ -424,44 +399,41 @@ function drawCpuGrid(s, area, span) {
     }
     border(p);
     if (label) pText(threads > 0 ? String(i) : 'all threads', p.x + 3, p.y + 11, 10.5, T.muted);
-    pp.plots.push({ ...p, kind: 'cpu', s, channel, thread: threads > 0 ? i : null });
-  }
-  if (info.id !== 'local' && !info.status && info.note) {   // an old agent: say so over the graph
-    pText(info.note, area.x + 8, area.y + area.h - 8, 12, PC.warn, 400, 'left', area.w - 16);
+    PS.plots.push({ ...p, kind: 'cpu', s, channel, thread: threads > 0 ? i : null });
   }
 }
 
-// Stacked strips: one per adapter (received filled, sent) or per disk (read filled, written).
-function drawStrips(s, kind, area, span) {
+// Strips, one per adapter (received filled, sent) or per disk (read filled, written),
+// stacked in as many columns as asked for.
+function drawStrips(s, kind, area, span, cols = 1) {
   const info = s.info, items = kind === 'net' ? info.nets : info.disks;
   if (!items.length) {
-    const why = info.id !== 'local' && info.status ? ''
-      : info.id !== 'local' && info.note ? info.note
-      : info.id !== 'local' && !s.cpu ? 'Connecting…'
-      : kind === 'net' ? `No network adapters selected${pp.desktop ? ' – press E to choose' : ''}`
-      : `No disks selected${pp.desktop ? ' – press E to choose' : ''}`;
+    const why = !pLive(s) ? '' : !s.cpu ? 'Waiting for the first sample…'
+      : info.note && info.threads === 0 ? info.note
+      : kind === 'net' ? 'No network adapter has a link' : 'No disks to show';
     pframe(area, 1, span, false);
     border(area);
     if (why) pText(why, area.x + 10, area.y + Math.min(area.h - 6, 22), 12.5, T.ink2, 400, 'left', area.w - 20);
     return;
   }
-  const gap = PL.stripGap, h = (area.h - (items.length - 1) * gap) / items.length;
+  const gap = PL.stripGap, colGap = 14, rows = Math.ceil(items.length / cols);
+  const h = (area.h - (rows - 1) * gap) / rows, w = (area.w - (cols - 1) * colGap) / cols;
   items.forEach((item, i) => {
-    const p = { x: area.x, y: area.y + i * (h + gap), w: area.w, h };
-    const ring = (kind === 'net' ? s.nets : s.disks)[i];
-    if (kind === 'net') drawNetStrip(s, item, ring, i, p, span); else drawDiskStrip(s, item, ring, p, span);
-    pp.plots.push({ ...p, kind, s, item, ring });
+    const p = { x: area.x + (i % cols) * (w + colGap), y: area.y + Math.floor(i / cols) * (h + gap), w, h };
+    const ring = (kind === 'net' ? s.nets : s.disks).get(item.key);
+    if (kind === 'net') drawNetStrip(s, item, ring, p, span); else drawDiskStrip(s, item, ring, p, span);
+    PS.plots.push({ ...p, kind, s, item, ring });
   });
 }
 
-// Top of a network strip's axis: the link speed (kept while the link is down),
-// a fixed rate, or the traffic on screen rounded up to 1-2-5 (at least 1 Mb/s).
-function netCeiling(s, item, ring, i, from, to) {
-  if (item.scale.mode === 'fixed') return item.scale.bps;
-  if (item.scale.mode === 'link' && ring && ring.n) {
+// Top of a network strip's axis: the link speed (kept while the link is down), or,
+// if it has none that means anything, the traffic on screen rounded up to 1-2-5 (at
+// least 1 Mb/s).
+function netCeiling(s, item, ring, from, to) {
+  if (!item.virtual && ring && ring.n) {
     const link = ring.V(2, ring.n - 1);
-    if (link > 0) s.lastLink[i] = link;
-    if (s.lastLink[i] > 0) return s.lastLink[i];
+    if (link > 0) s.lastLink.set(item.key, link);
+    if (s.lastLink.get(item.key) > 0) return s.lastLink.get(item.key);
   }
   let peak = 0;
   for (let k = from; k < to; k++) peak = Math.max(peak, ring.V(0, k), ring.V(1, k));
@@ -469,12 +441,22 @@ function netCeiling(s, item, ring, i, from, to) {
 }
 
 function stripLive(s, item, ring) {
-  return ring && ring.n > 0 && !item.status && (s.info.id === 'local' || !s.info.status);
+  return ring && ring.n > 0 && !item.status && pLive(s);
 }
 
-function drawNetStrip(s, item, ring, i, p, span) {
+const stillMotion = matchMedia('(prefers-reduced-motion: reduce)');
+function fadeNow() {   // 1 to 0.15 and back, every P_LOST_FADE seconds
+  if (stillMotion.matches) return 0.45;
+  return 0.575 + 0.425 * Math.cos(performance.now() / 1000 / P_LOST_FADE * 2 * Math.PI);
+}
+
+function drawNetStrip(s, item, ring, p, span, labels = true) {
   const from = ring ? Math.max(0, ring.after(pp.tEnd - span) - 1) : 0, to = ring ? ring.after(pp.tEnd) : 0;
-  const yMax = ring ? netCeiling(s, item, ring, i, from, to) : 1e6;
+  const yMax = ring ? netCeiling(s, item, ring, from, to) : 1e6;
+  if (item.lost) {   // its link went down a moment ago: fade out and in until it's back or gone
+    PS.fading = true;
+    pctx.globalAlpha = pAlpha = fadeNow() * pDim;
+  }
   pframe(p, 2, span, true);
   if (ring && to - from >= 2 && p.h > 2) {
     clipTo(p);
@@ -483,14 +465,21 @@ function drawNetStrip(s, item, ring, i, p, span) {
     pctx.restore();
   }
   border(p);
-  const live = stripLive(s, item, ring);
+  if (!labels) {
+    pctx.globalAlpha = pAlpha = pDim;
+    return;
+  }
+  const live = stripLive(s, item, ring) && !item.lost;
   const link = ring && ring.n ? ring.V(2, ring.n - 1) : 0;
-  const axis = item.status ? '' : item.scale.mode === 'link' && ring && ring.n && (link !== 0 || s.lastLink[i] > 0)
-    ? pLink(link) : `scale ${pAxisBits(yMax)}`;
+  const axis = item.status ? '' : item.lost ? 'disconnected'
+    : !item.virtual && ring && ring.n && (link !== 0 || s.lastLink.get(item.key) > 0) ? pLink(link) : `scale ${pAxisBits(yMax)}`;
   stripLabels(p, item.name, axis, `↓ ${live ? pBits(ring.avg(0, pp.tEnd)) : '--'}`, PC.rx,
               `↑ ${live ? pBits(ring.avg(1, pp.tEnd)) : '--'}`, PC.tx, null);
-  stripProblems(p, item.status, item.problem);
+  stripProblems(p, item.status, null);
+  pctx.globalAlpha = pAlpha = pDim;
 }
+
+const pBytesSize = b => (b >= 1e12 ? `${trim2(Math.round(b / 1e11) / 10)} TB` : b >= 1e9 ? `${Math.round(b / 1e9)} GB` : `${Math.round(b / 1e6)} MB`);
 
 function drawDiskStrip(s, item, ring, p, span) {
   const from = ring ? Math.max(0, ring.after(pp.tEnd - span) - 1) : 0, to = ring ? ring.after(pp.tEnd) : 0;
@@ -506,7 +495,8 @@ function drawDiskStrip(s, item, ring, p, span) {
   }
   border(p);
   const live = stripLive(s, item, ring);
-  const axis = `scale ${pAxisBytes(yMax)}${item.detail ? `  ·  ${item.detail}` : ''}`;
+  const full = item.size ? `${pBytesSize(item.used)} of ${pBytesSize(item.size)} used (${Math.round(100 * item.used / item.size)}%)` : '';
+  const axis = [`scale ${pAxisBytes(yMax)}`, item.detail, full].filter(Boolean).join('  ·  ');
   stripLabels(p, item.name, axis, `R ${live ? pBytes(ring.avg(1, pp.tEnd)) : '--'}`, PC.read,
               `W ${live ? pBytes(ring.avg(2, pp.tEnd)) : '--'}`, PC.write,
               live ? `${pPct(ring.avg(0, pp.tEnd))} busy` : null);
@@ -556,11 +546,12 @@ function veil(text, row) {
 
 // The hovered moment, marked in every graph.
 function drawCrosshair(span) {
-  const hv = pp.hover;
-  if (!hv) return;
+  const hv = PS.hover;
+  if (!hv || hv.t == null) return;
   const g = pctx;
   g.beginPath();
-  for (const p of pp.plots) {
+  for (const p of PS.plots) {
+    if (p.kind === 'disklabel') continue;
     const x = Math.round(p.x + p.w - (pp.tEnd - hv.t) * p.w / span) + 0.5;
     if (x < p.x || x > p.x + p.w) continue;
     g.moveTo(x, p.y + 1); g.lineTo(x, p.y + p.h - 1);
@@ -581,47 +572,48 @@ function nearest(ring, t) {
   return t - ring.T(k - 1) <= ring.T(k) - t ? k - 1 : k;
 }
 
-function showPerfTip(ev) {
-  const r = pcv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
-  const p = pp.plots.find(q => mx >= q.x && mx <= q.x + q.w && my >= q.y && my <= q.y + q.h);
-  if (!p) { pp.hover = null; ptip.hidden = true; pInvalidate(); return; }
-  const span = pVisible(), t = pp.tEnd - (p.x + p.w - mx) / p.w * span;
-  pp.hover = { t };
+// The graph of a surface under a point on it, or null. Marks the moment there for the crosshair.
+function plotAt(S, mx, my) {
+  const p = S.plots.find(q => mx >= q.x && mx <= q.x + q.w && my >= q.y && my <= q.y + q.h);
+  if (p && p.kind === 'disklabel') { S.hover = null; return p; }
+  S.hover = p ? { t: pp.tEnd - (p.x + p.w - mx) / p.w * pVisible() } : null;
+  return p || null;
+}
+
+function plotTip(p, t) {
+  if (p.kind === 'disk' && p.ring && p.ring.ch >= 9) return dkTip(p, t);
   const ring = p.kind === 'cpu' ? p.s.cpu : p.ring, k = nearest(ring, t);
   const name = p.s.info.name;
-  let html;
-  if (k < 0) {
-    html = `<div class="head">${esc(name)}</div><div class="faint">No samples yet</div>`;
-  } else {
-    const ago = Math.max(0, pp.tEnd - ring.T(k));
-    const when = `<div class="faint">${ago < 0.05 ? 'now' : `${ago.toFixed(ago < 10 ? 1 : 0)} s ago`}</div>`;
-    if (p.kind === 'cpu') {
-      const what = p.thread == null ? (p.s.cpu.ch > 1 ? 'all threads' : 'CPU') : `thread ${p.thread}`;
-      const avg = trailingAvg(ring, p.channel, k, k + 1)[0];
-      html = `<div class="head">${esc(name)} · ${what}</div><div>${pPct(ring.V(p.channel, k))}</div>` +
-        `<div class="faint">3 s average ${pPct(avg)}</div>${when}`;
-    } else if (p.kind === 'net') {
-      html = `<div class="head">${esc(p.item.name)} <span class="faint">${esc(name)}</span></div>` +
-        `<div><span style="color:${PC.rx}">↓ ${pBits(ring.V(0, k))}</span> &nbsp; <span style="color:${PC.tx}">↑ ${pBits(ring.V(1, k))}</span></div>` +
-        (pLink(ring.V(2, k)) ? `<div class="faint">${pLink(ring.V(2, k))}</div>` : '') + when;
-    } else {
-      html = `<div class="head">${esc(p.item.name)} <span class="faint">${esc(name)}</span></div>` +
-        `<div><span style="color:${PC.read}">R ${pBytes(ring.V(1, k))}</span> &nbsp; <span style="color:${PC.write}">W ${pBytes(ring.V(2, k))}</span></div>` +
-        `<div class="faint">${pPct(ring.V(0, k))} busy${p.item.detail ? ` · ${esc(p.item.detail)}` : ''}</div>${when}`;
-    }
+  if (k < 0) return `<div class="head">${esc(p.item ? p.item.name : name)}</div><div class="faint">No samples yet</div>`;
+  const ago = Math.max(0, pp.tEnd - ring.T(k));
+  const when = `<div class="faint">${ago < 0.05 ? 'now' : `${ago.toFixed(ago < 10 ? 1 : 0)} s ago`}</div>`;
+  if (p.kind === 'cpu') {
+    const what = p.thread == null ? (p.s.cpu.ch > 1 ? 'all threads' : 'CPU') : `thread ${p.thread}`;
+    const avg = trailingAvg(ring, p.channel, k, k + 1)[0];
+    return `<div class="head">${esc(name)} · ${what}</div><div>${pPct(ring.V(p.channel, k))}</div>` +
+      `<div class="faint">3 s average ${pPct(avg)}</div>${when}`;
   }
-  ptip.innerHTML = html;
-  ptip.hidden = false;
-  const sr = pstage.getBoundingClientRect();
-  let x = ev.clientX - sr.left + 14, y = ev.clientY - sr.top + pstage.scrollTop + 14;
-  if (x + ptip.offsetWidth > sr.width - 8) x -= ptip.offsetWidth + 28;
-  if (ev.clientY - sr.top + 14 + ptip.offsetHeight > sr.height - 8) y -= ptip.offsetHeight + 28;
-  ptip.style.left = Math.max(4, x) + 'px';
-  ptip.style.top = Math.max(4, y) + 'px';
-  pInvalidate();
+  if (p.kind === 'net') {
+    return `<div class="head">${esc(p.item.name)} <span class="faint">${esc(name)}</span></div>` +
+      `<div><span style="color:${PC.rx}">↓ ${pBits(ring.V(0, k))}</span> &nbsp; <span style="color:${PC.tx}">↑ ${pBits(ring.V(1, k))}</span></div>` +
+      (p.item.detail ? `<div class="faint">${esc(p.item.detail)}</div>` : '') +
+      (!p.item.virtual && pLink(ring.V(2, k)) ? `<div class="faint">${pLink(ring.V(2, k))}</div>` : '') + when;
+  }
+  return `<div class="head">${esc(p.item.name)} <span class="faint">${esc(name)}</span></div>` +
+    `<div><span style="color:${PC.read}">R ${pBytes(ring.V(1, k))}</span> &nbsp; <span style="color:${PC.write}">W ${pBytes(ring.V(2, k))}</span></div>` +
+    `<div class="faint">${pPct(ring.V(0, k))} busy${p.item.detail ? ` · ${esc(p.item.detail)}` : ''}</div>` +
+    (p.item.size ? `<div class="faint">${pBytesSize(p.item.used)} of ${pBytesSize(p.item.size)} used</div>` : '') + when;
 }
-pcv.addEventListener('mousemove', showPerfTip);
-pcv.addEventListener('mouseleave', () => { pp.hover = null; ptip.hidden = true; pInvalidate(); });
+
+// Put a tip by the pointer, inside its scrolling box.
+function placeTip(tipEl, box, ev) {
+  const r = box.getBoundingClientRect();
+  let x = ev.clientX - r.left + 14, y = ev.clientY - r.top + box.scrollTop + 14;
+  if (x + tipEl.offsetWidth > r.width - 8) x -= tipEl.offsetWidth + 28;
+  if (ev.clientY - r.top + 14 + tipEl.offsetHeight > r.height - 8) y -= tipEl.offsetHeight + 28;
+  tipEl.style.left = Math.max(4, x) + 'px';
+  tipEl.style.top = Math.max(box.scrollTop + 4, y) + 'px';
+}
 
 // ---------------------------------------------------------------------------
 // Controls and keys (CPU Graph's)
@@ -632,44 +624,44 @@ function fillSpans() {
   sel.value = keep;
 }
 
+const pRedraw = () => { for (const f of perfDrawers) f(); };
 function setInterval_(ms) {
   if (!P_INTERVALS.includes(ms)) return;
   savePref('perf.interval', ms);
   if (pp.meta) { pp.meta.interval = ms; fillSpans(); }
   $('pctl-rate').value = String(ms);
   postPerf({ interval: ms });
-  pInvalidate();
+  pRedraw();
 }
 function setSpan(s) {
   if (!P_SPANS.includes(s)) return;
   pp.span = s;
   savePref('perf.span', s);
   $('pctl-span').value = String(s);
-  pInvalidate();
+  pRedraw();
 }
 function setSource(src) {
   savePref('perf.source', src);
   for (const b of $('pctl-source').querySelectorAll('button')) b.classList.toggle('on', b.dataset.v === src);
   if (pp.meta) pp.meta.source = src;
   postPerf({ source: src });
-  pInvalidate();
+  pRedraw();
 }
 function setFlag(key, on) {
   pp[key] = on;
   savePref('perf.' + key, on);
-  const box = { avg: 'pctl-avg', remotes: 'pctl-remotes', net: 'pctl-net', disk: 'pctl-disk' }[key];
-  if (box) $(box).checked = on;
+  if (key === 'avg') $('pctl-avg').checked = on;
   if (key === 'threads') for (const b of $('pctl-threads').querySelectorAll('button')) b.classList.toggle('on', (b.dataset.v === '1') === on);
-  pInvalidate();
+  pRedraw();
 }
-function togglePause() {
-  pp.paused = !pp.paused;
-  $('pctl-pause').textContent = pp.paused ? 'Resume' : 'Pause';
-  if (!pp.paused) {   // back to now
+function setPaused(on) {
+  pp.paused = on;
+  for (const id of ['pctl-pause', 'rctl-pause']) $(id).textContent = on ? 'Resume' : 'Pause';
+  if (!on) {   // back to now
     const s = pm.get('local');
     if (s && s.cpu && s.cpu.n) pp.tEnd = s.cpu.T(s.cpu.n - 1);
   }
-  pInvalidate();
+  pRedraw();
 }
 function toggleTop() {
   if (!pp.desktop) return;
@@ -679,51 +671,47 @@ function toggleTop() {
   savePref('perf.onTop', pp.onTop);
   try { window.pywebview.api.set_on_top(pp.onTop); } catch { /* not in the desktop app */ }
 }
-function editSettings() {
-  if (pp.desktop) try { window.pywebview.api.edit_perf_settings(); } catch { /* not in the desktop app */ }
-}
 const stepOf = (list, value, dir) => list[Math.max(0, Math.min(list.length - 1, list.indexOf(value) + dir))];
 
 $('pctl-rate').addEventListener('change', ev => setInterval_(Number(ev.target.value)));
 $('pctl-span').addEventListener('change', ev => setSpan(Number(ev.target.value)));
 $('pctl-source').addEventListener('click', ev => { const b = ev.target.closest('button[data-v]'); if (b) setSource(b.dataset.v); });
 $('pctl-threads').addEventListener('click', ev => { const b = ev.target.closest('button[data-v]'); if (b) setFlag('threads', b.dataset.v === '1'); });
-for (const [id, key] of [['pctl-avg', 'avg'], ['pctl-remotes', 'remotes'], ['pctl-net', 'net'], ['pctl-disk', 'disk']]) {
-  $(id).addEventListener('change', ev => setFlag(key, ev.target.checked));
-}
-$('pctl-pause').addEventListener('click', togglePause);
+$('pctl-avg').addEventListener('change', ev => setFlag('avg', ev.target.checked));
+for (const id of ['pctl-pause', 'rctl-pause']) $(id).addEventListener('click', () => setPaused(!pp.paused));
 $('pctl-top').addEventListener('click', toggleTop);
-$('pctl-edit').addEventListener('click', editSettings);
 
 document.addEventListener('keydown', ev => {
-  if (activeTab !== 'perf' || ev.ctrlKey || ev.altKey || ev.metaKey) return;
+  if (ev.ctrlKey || ev.altKey || ev.metaKey || document.querySelector('dialog[open]')) return;
   if (ev.target.closest && ev.target.closest('input, select, textarea')) return;
-  const k = ev.key;
+  const k = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+  if (k === 't') { ev.preventDefault(); toggleTop(); return; }
+  if (!['overview', 'cpu', 'disk', 'network', 'remotes'].includes(activeTab)) return;
+  if (ev.target.closest && ev.target.closest('button, [role=tablist]') && [' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(k)) return;
+  const onCpu = activeTab === 'cpu';
   const handled = {
-    ' ': togglePause,
-    ArrowUp: () => setInterval_(stepOf(P_INTERVALS, pInterval(), -1)),
-    ArrowDown: () => setInterval_(stepOf(P_INTERVALS, pInterval(), +1)),
+    ' ': () => setPaused(!pp.paused),
     ArrowLeft: () => setSpan(stepOf(P_SPANS, pp.span, -1)),
     ArrowRight: () => setSpan(stepOf(P_SPANS, pp.span, +1)),
-    r: () => setFlag('remotes', !pp.remotes), n: () => setFlag('net', !pp.net), d: () => setFlag('disk', !pp.disk),
-    m: () => setSource(pp.meta && pp.meta.source === 'utility' ? 'cputime' : 'utility'),
-    c: () => setFlag('threads', !pp.threads), a: () => setFlag('avg', !pp.avg),
-    t: toggleTop, e: editSettings,
-  }[k.length === 1 ? k.toLowerCase() : k];
+    a: () => setFlag('avg', !pp.avg),
+    // Up and Down scroll the list of machines; elsewhere they change the rate
+    ArrowUp: activeTab !== 'remotes' && (() => setInterval_(stepOf(P_INTERVALS, pInterval(), -1))),
+    ArrowDown: activeTab !== 'remotes' && (() => setInterval_(stepOf(P_INTERVALS, pInterval(), +1))),
+    c: onCpu && (() => setFlag('threads', !pp.threads)),
+    m: onCpu && viewMachine() === 'local' && (() => setSource(pp.meta && pp.meta.source === 'utility' ? 'cputime' : 'utility')),
+  }[k];
   if (!handled) return;
-  if (ev.target.closest && ev.target.closest('.tabs') && (k === 'ArrowLeft' || k === 'ArrowRight')) return;   // moving between tabs
   ev.preventDefault();
   handled();
 });
 
-// The desktop app adds Always on top (T) and opening settings.ini (E).
+// The desktop app adds Always on top (T).
 function desktopReady() {
   if (!(window.pywebview && window.pywebview.api && window.pywebview.api.set_on_top)) return;
   pp.desktop = true;
   $('pctl-top').hidden = false;
-  $('pctl-edit').hidden = false;
+  document.body.classList.add('desktop');
   if (loadPref('perf.onTop') === true) toggleTop();
-  pInvalidate();
 }
 window.addEventListener('pywebviewready', desktopReady);
 
@@ -731,12 +719,11 @@ window.addEventListener('pywebviewready', desktopReady);
 // Startup
 // ---------------------------------------------------------------------------
 pp.span = P_SPANS.includes(loadPref('perf.span')) ? loadPref('perf.span') : 60;
-for (const key of ['threads', 'avg', 'remotes', 'net', 'disk']) {
+for (const key of ['threads', 'avg']) {
   const v = loadPref('perf.' + key);
   if (typeof v === 'boolean') setFlag(key, v);
 }
 fillSpans();
 readPerfColors();
-darkQuery.addEventListener('change', pInvalidate);
-new ResizeObserver(pInvalidate).observe(pstage);
+darkQuery.addEventListener('change', () => { readPerfColors(); pRedraw(); });
 desktopReady();
