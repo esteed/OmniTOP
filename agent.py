@@ -64,6 +64,15 @@ and, when this PC lets the agent watch its network, ports:
 Probes are the ones that aren't answers to this PC (netwatch.ProbeFilter): which of them make a
 scan is for the viewer to judge. "s" is the agent's own traffic, to its viewers.
 
+and latency (can=...,echo; omnitop-agent.py the same):
+
+    viewer -> agent:  echo <ms>|off        ping each adapter's default gateway this often (100..10000)
+    agent -> viewer:  echo {"t": <now>, "g": {adapter: gateway}, "r": [[adapter, time, ms or null]...],
+                            "e": ""}       each <ms>: the round trips that ended since the last one
+
+Only the gateways, which the agent finds itself: a viewer can't have it ping anything else.
+Averages and jitter are for the viewer to work out (latency.Window).
+
 Names in the protocol are single words, so an adapter called "Realtek 2.5GbE"
 travels as Realtek_2.5GbE and drive C: as C; the labels carry the real names.
 
@@ -87,6 +96,7 @@ import threading
 import time
 from ctypes import wintypes
 
+import latency
 import netwatch
 import perfmon
 import sysmon
@@ -105,7 +115,7 @@ MIN_PORTS_MS, MAX_PORTS_MS = 100, 10000
 PORTS_IDLE = 10.0            # seconds the capture goes on after the last viewer stops wanting it
 PORTS_SESSION = "omniTop agent"                       # the ETW session: not the app's, so both can run
 PORTS_GUID = "A4855AF1-2863-4519-A126-2E4FFC65316D"
-CAN = "feed,counters,diskperf,drives"   # what feeds can hold
+CAN = "feed,counters,diskperf,drives,echo"   # what feeds can hold, and latency
 LOOK_EVERY = 1.5             # seconds between looks at which adapters there are
 DRIVES_EVERY = 3.0           # and drives
 USAGE_EVERY = 10.0           # and how full they are
@@ -467,7 +477,7 @@ class Memory:
 
 def parse_command(line: str) -> tuple[str, object] | None:
     """("interval", ms), ("mem", ms), ("net", names, "all" or None for auto), ("disk", ...), ("feed <name>", Feed or
-    None), ("ports", ms), ("probes", bool) or ("port <n>", n); None for anything else."""
+    None), ("ports", ms), ("probes", bool), ("echo", ms) or ("port <n>", n); None for anything else."""
     if line.startswith("feed "):
         return parse_feed(line)
     f = line.split()
@@ -479,6 +489,8 @@ def parse_command(line: str) -> tuple[str, object] | None:
         return "ports", 0 if f[1] == "off" or not int(f[1]) else max(MIN_PORTS_MS, min(MAX_PORTS_MS, int(f[1])))
     if len(f) == 2 and f[0] == "probes" and f[1] in ("on", "off"):
         return "probes", f[1] == "on"
+    if len(f) == 2 and f[0] == "echo" and re.fullmatch(r"off|\d{1,6}", f[1]):
+        return "echo", 0 if f[1] == "off" or not int(f[1]) else max(latency.MIN_MS, min(latency.MAX_MS, int(f[1])))
     if len(f) == 2 and f[0] == "port" and re.fullmatch(r"\d{1,5}", f[1]) and 0 < int(f[1]) < 65536:
         return "port " + f[1], int(f[1])
     if f and f[0] in ("net", "disk"):
@@ -641,6 +653,7 @@ class Viewer:
         finally:
             self.gone = True
             self.server.ports.forget(self)
+            self.server.echo.forget(self)
             self.mem_wake.set()
             if sampler:
                 sampler.close()
@@ -679,6 +692,8 @@ class Viewer:
                 self.mem_wake.set()
                 if "ports" in todo or "probes" in todo:
                     self.server.ports.want(self, todo.get("ports"), todo.get("probes"))
+                if "echo" in todo:
+                    self.server.echo.want(self, todo["echo"])
                 for k, v in todo.items():
                     if k.startswith("port "):
                         self.server.ports.ask(self, v)
@@ -724,6 +739,7 @@ class AgentServer:
                 self.sock = self._open(socket.AF_INET, ("", port), dual=False)   # IPv6 is off here
         self.port = self.sock.getsockname()[1]
         self.ports = PortWatch(self.port, log)
+        self.echo = EchoWatch()
 
     @staticmethod
     def _open(family: int, address: tuple, dual: bool) -> socket.socket:
@@ -786,6 +802,59 @@ class AgentServer:
     def stop(self) -> None:
         self.stopping.set()
         self.ports.stop()
+        self.echo.stop()
+
+
+# ---------------------------------------------------------------------------
+# Latency: round trips to each adapter's gateway
+# ---------------------------------------------------------------------------
+
+class EchoWatch:
+    """Pings the gateways of this PC's adapters for the viewers that ask, and only while one does:
+    one set of pings, as often as the most eager viewer wants, for all of them."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.wants: dict[Viewer, int] = {}        # viewer -> ms
+        self.echoes: latency.Echoes | None = None
+
+    def want(self, viewer: Viewer, ms: int) -> None:
+        with self.lock:
+            if ms:
+                self.wants[viewer] = ms
+            else:
+                self.wants.pop(viewer, None)
+            self._adjust()
+
+    def forget(self, viewer: Viewer) -> None:
+        self.want(viewer, 0)
+
+    def stop(self) -> None:
+        with self.lock:
+            self.wants.clear()
+            self._adjust()
+
+    def _adjust(self) -> None:
+        ms = min(self.wants.values()) if self.wants else 0
+        if self.echoes is not None and self.echoes.ms != ms:
+            self.echoes.stop()
+            self.echoes = None
+        if ms and self.echoes is None:
+            self.echoes = latency.Echoes(self._find, self._report, ms).start()
+
+    @staticmethod
+    def _find() -> dict[str, tuple[str, str]]:
+        words = {a["luid"]: w for w, a in adapter_words(perfmon.adapters()).items() if a["up"]}
+        return {words[luid]: target for luid, target in latency.targets(words).items()}
+
+    def _report(self, gateways: dict, done: list, error: str) -> None:
+        line = "echo " + json.dumps({"t": round(time.time(), 3), "g": gateways, "e": error,
+                                     "r": [[k, round(t, 3), None if r is None else round(r, 3)] for k, t, r in done]},
+                                    separators=(",", ":")) + "\n"
+        with self.lock:
+            viewers = list(self.wants)
+        for v in viewers:
+            v.post(line)
 
 
 # ---------------------------------------------------------------------------

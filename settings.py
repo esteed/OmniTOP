@@ -4,10 +4,13 @@ The app writes it (the Remote tab's Add and Edit forms); nobody needs to edit it
 by hand. It's JSON, in %LOCALAPPDATA%\\PortTrafficViz\\settings.json:
 
     {"machines": [{"id": "m1", "name": "File server", "address": "192.168.1.30",
-                   "port": 7820, "os": "linux"}]}
+                   "port": 7820, "os": "linux"}],
+     "discover": true, "ignored": ["192.168.1.44:7820"]}
 
 name may be empty (the machine's own host name is shown) and os is what the
 person said it runs: "windows", "linux" or "" (the agent says what it really is).
+discover says whether to look for agents on the local networks (discover.py), and
+ignored lists the ones found that aren't to be offered again.
 
 The first time, the machines in CPU Graph's settings.ini are taken over, since
 earlier versions of this app read them from there.
@@ -26,6 +29,7 @@ PATH = os.path.join(APP_DIR, "settings.json")
 CPU_GRAPH = os.path.join(os.environ.get("LOCALAPPDATA") or "", "CpuGraph", "settings.ini")
 SYSTEMS = ("", "windows", "linux")
 MAX_NAME = 64
+MAX_IGNORED = 500
 
 _HOST = re.compile(r"(?=.{1,253}$)(?!-)[A-Za-z0-9_-]{1,63}(?<!-)(?:\.(?!-)[A-Za-z0-9_-]{1,63}(?<!-))*\.?")
 
@@ -114,6 +118,8 @@ class Settings:
         self.lock = threading.Lock()
         self.machines: list[dict] = []
         self.problem = ""                                  # why the file can't be used, if it can't
+        self._discover = True
+        self._ignored: list[str] = []
         if path is None:
             for m in machines or []:
                 self._append(clean(m))
@@ -153,6 +159,8 @@ class Settings:
             except OSError:
                 pass
             return
+        self._discover = data.get("discover") is not False
+        self._ignored = [str(x)[:64] for x in data.get("ignored") or [] if isinstance(x, str)][-MAX_IGNORED:]
         for e in entries:
             try:
                 m = clean(e)
@@ -170,7 +178,8 @@ class Settings:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         temp = self.path + ".new"
         with open(temp, "w", encoding="utf-8") as f:
-            json.dump({"machines": self.machines}, f, indent=2, ensure_ascii=False)
+            json.dump({"machines": self.machines, "discover": self._discover, "ignored": self._ignored}, f,
+                      indent=2, ensure_ascii=False)
             f.write("\n")
         os.replace(temp, self.path)                        # whole or not at all
 
@@ -190,6 +199,30 @@ class Settings:
     def list(self) -> list[dict]:
         with self.lock:
             return [dict(m) for m in self.machines]
+
+    def discover(self) -> bool:
+        return self._discover
+
+    def ignored(self) -> list[str]:
+        with self.lock:
+            return list(self._ignored)
+
+    def set_discover(self, on: bool) -> None:
+        with self.lock:
+            self._discover = bool(on)
+            self._keep()
+
+    def ignore(self, endpoint: str) -> None:
+        with self.lock:
+            if endpoint not in self._ignored:
+                self._ignored = [*self._ignored, endpoint[:64]][-MAX_IGNORED:]
+                self._keep()
+
+    def _keep(self) -> None:
+        try:
+            self._save()
+        except OSError:
+            pass                                           # kept for this run, anyway
 
     def add(self, fields: dict) -> dict:
         m = clean(fields)

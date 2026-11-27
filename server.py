@@ -34,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import urlopen
 
+import discover
 import netwatch
 import perfmon
 import settings as app_settings
@@ -41,7 +42,7 @@ import sysmon
 
 # The app's version, shown in the tab bar. Raise it for each release; build.py
 # reads it from here and stamps it into the exe's file properties.
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # In the packaged exe the web files are unpacked next to the bundled modules.
 HERE = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
@@ -870,12 +871,13 @@ class CountingWriter:
 
 
 def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None, perf=None,
-                 details=None, scans=None, system=None, settings=None):
+                 details=None, scans=None, system=None, settings=None, discovery=None):
     """on_write(bytes, client_port) is called for everything sent, when no capture sees it.
 
     details(port) describes the processes on a port (GET /api/port?p=N); scans
     lists the port scans seen recently (GET /api/scans); settings holds the
-    remote machines (GET and POST /api/machines).
+    remote machines (GET and POST /api/machines); discovery finds agents on the
+    local networks (GET and POST /api/found).
     """
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     allowed_origins = {f"http://{h}" for h in allowed_hosts}
@@ -940,6 +942,8 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
             elif path == "/api/machines" and settings is not None:
                 body = json.dumps({"machines": settings.list(), "problem": settings.problem}).encode()
                 self._send(200, "application/json", body)
+            elif path == "/api/found" and discovery is not None:
+                self._send(200, "application/json", json.dumps(discovery.view(), separators=(",", ":")).encode())
             elif path == "/api/rmem" and perf is not None:
                 self._send(200, "application/json", json.dumps(perf.memory_now(), separators=(",", ":")).encode())
             elif path == "/omnitop-agent.py":
@@ -973,13 +977,15 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
             # {"machine": id or null, "numbers": bool, "page": name} says which remote
             # machine is being looked at closely, on which page, and whether the
             # others are only numbers; and
-            # POST /api/machines changes the list of them.
+            # POST /api/machines changes the list of them, and POST /api/found
+            # {"action": "look" | "on" | "ignore", ...} the looking for agents.
             if not self._ours():
                 return
             path = self.path.split("?", 1)[0]
-            if (path not in ("/api/rate", "/api/perf", "/api/sys", "/api/view", "/api/machines")
+            if (path not in ("/api/rate", "/api/perf", "/api/sys", "/api/view", "/api/machines", "/api/found")
                     or (path in ("/api/perf", "/api/view") and perf is None)
                     or (path == "/api/sys" and system is None)
+                    or (path == "/api/found" and discovery is None)
                     or (path == "/api/machines" and (perf is None or settings is None))):
                 self.send_error(404)
                 return
@@ -1011,6 +1017,17 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
                     reply = {"machine": perf.focus, "numbers": perf.numbers, "page": perf.page}
                 elif path == "/api/machines":
                     reply = self._machines(body)
+                elif path == "/api/found":
+                    action = body["action"]
+                    if action == "look":
+                        discovery.look_now()
+                    elif action == "on":
+                        discovery.set_on(bool(body["on"]))
+                    elif action == "ignore":
+                        discovery.ignore(str(body["address"])[:46], int(body["port"]))
+                    else:
+                        raise ValueError(action)
+                    reply = discovery.view()
                 else:
                     if not isinstance(body, dict) or not ({"interval", "source"} & body.keys()):
                         raise ValueError("nothing to set")
@@ -1047,6 +1064,8 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
             except app_settings.Invalid as exc:
                 return {"error": exc.args[1], "field": exc.args[0]}
             perf.apply_settings()
+            if discovery is not None:
+                discovery.publish()                        # what's watched now isn't offered
             return {**reply, "machines": settings.list()}
 
         def _send(self, code: int, ctype: str, body: bytes, download: str = "") -> None:
@@ -1264,6 +1283,8 @@ class Server:
         self.done = threading.Event()
         # CPU, disk & network tab (CPU Graph's sampler), at its own rate
         self.perf = perfmon.PerfMonitor(self.hub, mode, self.settings)
+        # Agents on the local networks, to offer on the Remote tab
+        self.discovery = discover.Discovery(self.perf, self.settings, self.hub, demo=mode == "demo")
         # Memory, GPU and CPU for the Memory page, at its own rate
         self.sysmon = sysmon.SystemMonitor(self.hub, mode, ProcessNames().get)
         try:
@@ -1272,7 +1293,7 @@ class Server:
             self.httpd = ThreadingHTTPServer(
                 ("127.0.0.1", self.port),
                 make_handler(self.hub, info, self.port, self.rate, on_write, self.perf,
-                             self.details, self.scans, self.sysmon, self.settings))
+                             self.details, self.scans, self.sysmon, self.settings, self.discovery))
         except BaseException:
             self.source.stop()
             self.scans.stop()
@@ -1280,6 +1301,7 @@ class Server:
                 self.demo_scans.stop()
             raise
         self.perf.start()
+        self.discovery.start()
         self.httpd.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.port}/"
         threading.Thread(target=run_ticker,
@@ -1303,6 +1325,7 @@ class Server:
                 self.demo_scans.stop()
             self.sysmon.stop()
             self.perf.stop()
+            self.discovery.stop()
 
     def run(self) -> None:
         """Serve until shutdown() is called from another thread (or Ctrl+C)."""

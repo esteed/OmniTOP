@@ -29,6 +29,7 @@ makes sense of them. Only figures: what identifies the machine or its hardware (
 numbers, addresses), command lines and files aren't among them.
 """
 import argparse
+import atexit
 import collections
 import ctypes
 import errno
@@ -51,7 +52,7 @@ try:
 except ImportError:          # the tests run on Windows
     pwd = None
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 PROTOCOL = 2
 DEFAULT_PORT = 7820
 DEFAULT_MS, MIN_MS, MAX_MS = 1000, 10, 10000
@@ -64,7 +65,7 @@ LOOK_EVERY = 1.5             # seconds between looks at which adapters and disks
 MAX_FEEDS, MAX_PATTERNS, MAX_FILES = 16, 64, 1024   # a viewer's feeds; patterns and files in one
 MAX_FILE, MAX_FEED = 256 << 10, 1 << 20             # bytes of one file, and of one feed's files
 MIN_FEED_MS = 250
-CAN = "feed,files,list,statvfs,nvidia"              # what feeds can hold
+CAN = "feed,files,list,statvfs,nvidia,echo"         # what feeds can hold, and latency
 TOP_PROGRAMS = 30
 
 NAME = "omnitop-agent"
@@ -932,8 +933,10 @@ def dynamic_range():
 class Helper(object):
     """The ports service: an engine shared by whoever is connected, while anyone wants something of it.
 
-    Lines in:   ticks <ms> (0: no more)   probes 0|1   port <n>
-    Lines out:  info {...}   ports {...}   probes {"t": now, "p": [...]}   port {...}
+    Lines in:   ticks <ms> (0: no more)   probes 0|1   port <n>   echo <ms> (0: no more)
+    Lines out:  info {...}   ports {...}   probes {"t": now, "p": [...]}   port {...}   echo {...}
+
+    echo is for an agent whose account may not ping (see EchoWatch): this service can.
     """
 
     def __init__(self, path, own_port, check_peer=True):
@@ -942,6 +945,7 @@ class Helper(object):
         self.wake = threading.Event()
         self.stopping = threading.Event()
         self.engine = None
+        self.echo = EchoWatch()
         try:
             os.unlink(path)
         except OSError:
@@ -992,6 +996,8 @@ class Helper(object):
         with self.lock:
             if c in self.clients:
                 self.clients.remove(c)
+        if "out" in c:
+            self.echo.forget(c["out"])
         c["conn"].close()
         self.wake.set()
 
@@ -1019,6 +1025,9 @@ class Helper(object):
                     c["ms"] = max(MIN_PORTS_MS, min(10000, n)) if n else 0
                 elif f[0] == "probes":
                     c["probes"] = bool(n)
+                elif f[0] == "echo":
+                    c.setdefault("out", Poster(self, c))
+                    self.echo.want(c["out"], max(MIN_ECHO_MS, min(MAX_ECHO_MS, n)) if n else 0)
                 elif f[0] == "port" and 0 < n < 65536:
                     try:
                         with self.lock:
@@ -1088,6 +1097,16 @@ class Helper(object):
         self.wake.set()
 
 
+class Poster(object):
+    """A connection to the ports service, as something EchoWatch can post lines to."""
+
+    def __init__(self, helper, c):
+        self.helper, self.c = helper, c
+
+    def post(self, line):
+        self.helper.send(self.c, line)
+
+
 def ports_helper(port):
     os.makedirs(os.path.dirname(PORTS_SOCKET), exist_ok=True)
     try:
@@ -1112,6 +1131,7 @@ class PortsLink(object):
         self.wants = {}                                # viewer -> [ms, probes]
         self.asked = []                                # (viewer, port) whose details are on the way
         self.info = ""
+        self.echo_ms, self.on_echo = 0, None           # pings asked of the service, and where its answers go
 
     def available(self):
         """Whether there's anything to ask. Run by root without being installed, the agent does it itself."""
@@ -1120,6 +1140,7 @@ class PortsLink(object):
         if not ROOT and hasattr(os, "geteuid") and os.geteuid() == 0:
             try:
                 folder = tempfile.mkdtemp(prefix="omnitop-")
+                atexit.register(shutil.rmtree, folder, True)   # not left behind (a --check during installs, say)
                 h = Helper(os.path.join(folder, "ports"), self.own_port)
             except OSError:
                 return False
@@ -1149,6 +1170,11 @@ class PortsLink(object):
             if self.wants.pop(viewer, None):
                 self._tell()
 
+    def echo(self, ms):
+        with self.lock:
+            self.echo_ms = ms
+            self._tell()
+
     def ask(self, viewer, port):
         with self.lock:
             if self._connected() and len(self.asked) < 32:
@@ -1157,8 +1183,9 @@ class PortsLink(object):
 
     def _tell(self):
         ms = [w[0] for w in self.wants.values() if w[0]]
-        if (self.wants or self.conn) and self._connected():
-            self._send("ticks %d\nprobes %d\n" % (min(ms) if ms else 0, any(w[1] for w in self.wants.values())))
+        if (self.wants or self.echo_ms or self.conn) and self._connected():
+            self._send("ticks %d\nprobes %d\n" % (min(ms) if ms else 0, any(w[1] for w in self.wants.values())) +
+                       ("echo %d\n" % self.echo_ms if self.echo_ms or self.on_echo else ""))
 
     def _connected(self):
         if self.conn is None:
@@ -1202,8 +1229,11 @@ class PortsLink(object):
                         port = int(m.group(1)) if m else 0
                         to = [v for v, p in self.asked if p == port]
                         self.asked = [a for a in self.asked if a[1] != port]
+                    relay = self.on_echo if kind == "echo" else None
                 for v in to:
                     v.post(line)
+                if relay:
+                    relay(line)
         except (OSError, ValueError):
             pass
         with self.lock:
@@ -1213,13 +1243,250 @@ class PortsLink(object):
         conn.close()
         time.sleep(3)                                  # the service was restarted, say
         with self.lock:
-            if self.wants and self.conn is None:
+            if (self.wants or self.echo_ms) and self.conn is None:
                 self._tell()
 
 
 # ---------------------------------------------------------------------------
 # Memory, programs and graphics cards
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Latency: round trips to each adapter's default gateway, while a viewer asks
+# (agent.py describes "echo"). Only the gateways, found here: a viewer can't have
+# it ping anything else. Ping sockets need no rights, where net.ipv4.ping_group_range
+# lets the account have them (systemd's default does); as root, a raw socket will do.
+# Where the agent's account may do neither, the ports service, which may, does the pinging.
+# ---------------------------------------------------------------------------
+MIN_ECHO_MS, MAX_ECHO_MS = 100, 10000
+ECHO_TIMEOUT = 1.0           # seconds: a reply that takes longer is lost
+ECHO_LOOK = 2.0              # between looks at which gateways there are
+ECHO_TARGETS = 16
+ECHO_PAYLOAD = b"OmniTOP latency." * 2
+
+
+def gateways():
+    """adapter -> its default gateway (IPv4), the one with the lowest metric, from /proc/net/route."""
+    best = {}
+    for line in (read("/proc/net/route") or "").splitlines()[1:]:
+        f = line.split()
+        if len(f) < 8:
+            continue
+        try:
+            dest, gw, flags, metric, mask = int(f[1], 16), int(f[2], 16), int(f[3], 16), int(f[6]), int(f[7], 16)
+        except ValueError:
+            continue
+        if dest or mask or not gw or flags & 3 != 3:      # not a default route that's up and has a gateway
+            continue
+        if f[0] not in best or metric < best[f[0]][0]:
+            best[f[0]] = (metric, socket.inet_ntoa(struct.pack("<I", gw)))
+    return dict((name, v[1]) for name, v in best.items())
+
+
+def ipv4_address(name):
+    """An adapter's IPv4 address, or ""."""
+    try:
+        import fcntl
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            r = fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", name[:15].encode()))   # SIOCGIFADDR
+            return socket.inet_ntoa(r[20:24])
+        finally:
+            s.close()
+    except (OSError, ImportError):
+        return ""
+
+
+def icmp_checksum(data):
+    if len(data) % 2:
+        data += b"\0"
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += s >> 16
+    return ~s & 0xFFFF
+
+
+class Pinger(object):
+    """ICMP echo to one address."""
+
+    def __init__(self, source, dest):
+        self.dest, self.raw, self.seq = dest, False, 0
+        try:
+            self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EPERM):
+                raise
+            try:
+                self.s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            except OSError:
+                raise OSError(exc.errno, "this account may not ping (net.ipv4.ping_group_range)")
+            self.raw = True
+        self.ident = (os.getpid() ^ id(self)) & 0xFFFF
+        if source:
+            try:
+                self.s.bind((source, 0))
+            except OSError:
+                pass
+
+    def ping(self):
+        """The round trip in ms, or None if no answer came in time."""
+        self.seq = (self.seq + 1) & 0xFFFF
+        packet = struct.pack("!BBHHH", 8, 0, 0, self.ident, self.seq) + ECHO_PAYLOAD
+        if self.raw:
+            packet = packet[:2] + struct.pack("!H", icmp_checksum(packet)) + packet[4:]
+        start = time.perf_counter()
+        self.s.sendto(packet, (self.dest, 0))
+        while True:
+            left = start + ECHO_TIMEOUT - time.perf_counter()
+            if left <= 0:
+                return None
+            self.s.settimeout(left)
+            try:
+                data, there = self.s.recvfrom(2048)
+            except socket.timeout:
+                return None
+            took = (time.perf_counter() - start) * 1000
+            if self.raw:                               # with its IP header
+                data = data[(data[0] & 15) * 4:] if data else b""
+            if there[0] != self.dest or len(data) < 8:
+                continue
+            kind, _, _, ident, seq = struct.unpack("!BBHHH", data[:8])
+            if kind == 0 and seq == self.seq and (not self.raw or ident == self.ident):
+                return took
+
+    def close(self):
+        self.s.close()
+
+
+def can_ping():
+    """Whether this process may send ICMP echo requests: a ping socket, or a raw one."""
+    for kind in (socket.SOCK_DGRAM, socket.SOCK_RAW):
+        try:
+            socket.socket(socket.AF_INET, kind, socket.IPPROTO_ICMP).close()
+            return True
+        except (OSError, AttributeError):
+            pass
+    return False
+
+
+class EchoWatch(object):
+    """Pings each adapter's gateway for the viewers that ask, and only while one does: one set of
+    pings, as often as the most eager viewer wants, each gateway on a thread of its own. If this
+    process may not ping, the ports service (link) does, and its answers are passed on."""
+
+    def __init__(self, link=None):
+        self.lock = threading.Lock()
+        self.wants = {}                                # viewer -> ms
+        self.ms = 0
+        self.results, self.workers, self.error = [], {}, ""
+        self.thread = None
+        self.wake = threading.Event()
+        self.link, self.via = link, None               # via: whether it's the ports service that pings
+
+    def want(self, viewer, ms):
+        with self.lock:
+            if ms:
+                self.wants[viewer] = ms
+            else:
+                self.wants.pop(viewer, None)
+            self.ms = min(self.wants.values()) if self.wants else 0
+            if self.ms and self.via is None:
+                self.via = bool(self.link) and not can_ping() and self.link.available()
+                if self.via:
+                    self.link.on_echo = self._relay
+            if self.ms and self.thread is None and not self.via:
+                self.thread = threading.Thread(target=self._run, name="latency")
+                self.thread.daemon = True
+                self.thread.start()
+            via, ms = self.via, self.ms
+        if via:
+            self.link.echo(ms)
+        self.wake.set()
+
+    def _relay(self, line):
+        with self.lock:
+            viewers = list(self.wants)
+        for v in viewers:
+            v.post(line)
+
+    def forget(self, viewer):
+        self.want(viewer, 0)
+
+    def stop(self):
+        with self.lock:
+            self.wants, self.ms = {}, 0
+        self.wake.set()
+
+    def _look(self):
+        found = {}
+        for name, gw in sorted(gateways().items()):
+            if word(name) and len(found) < ECHO_TARGETS:
+                found[word(name)] = (ipv4_address(name), gw)
+        with self.lock:
+            for key, w in list(self.workers.items()):
+                if found.get(key) != w[0]:
+                    w[1].set()
+                    del self.workers[key]
+            for key, target in found.items():
+                if key not in self.workers:
+                    stop = threading.Event()
+                    self.workers[key] = [target, stop]
+                    t = threading.Thread(target=self._ping, args=(key, target, stop), name="ping " + target[1])
+                    t.daemon = True
+                    t.start()
+        return dict((key, target[1]) for key, target in found.items())
+
+    def _ping(self, key, target, stop):
+        try:
+            p = Pinger(*target)
+        except OSError as exc:
+            self.error = "Can't ping: %s" % (exc.strerror or exc)
+            return
+        try:
+            due = time.perf_counter()
+            while not stop.is_set():
+                sent = time.time()
+                try:
+                    rtt = p.ping()
+                except OSError as exc:
+                    self.error, rtt = "Can't ping %s: %s" % (target[1], exc.strerror or exc), None
+                    stop.wait(1.0)
+                if stop.is_set():
+                    return
+                with self.lock:
+                    self.results.append([key, round(sent, 3), None if rtt is None else round(rtt, 3)])
+                    ms = self.ms or 1000
+                due += ms / 1000.0
+                wait = due - time.perf_counter()
+                if wait < 0:
+                    due, wait = time.perf_counter(), 0
+                stop.wait(wait)
+        finally:
+            p.close()
+
+    def _run(self):
+        gws, look_at = {}, 0.0
+        while True:
+            with self.lock:
+                ms = self.ms
+                if not ms:                             # nobody wants it: end, and a new want starts it again
+                    for w in self.workers.values():
+                        w[1].set()
+                    self.workers, self.results, self.thread = {}, [], None
+                    return
+            if time.monotonic() >= look_at:
+                gws, look_at = self._look(), time.monotonic() + ECHO_LOOK
+            self.wake.wait(ms / 1000.0)
+            self.wake.clear()
+            with self.lock:
+                done, self.results = self.results, []
+                viewers = list(self.wants)
+            if viewers:
+                line = "echo " + json.dumps({"t": round(time.time(), 3), "g": gws, "r": done, "e": self.error},
+                                            separators=(",", ":")) + "\n"
+                for v in viewers:
+                    v.post(line)
+
 
 def meminfo():
     out = {}
@@ -1536,7 +1803,7 @@ class Sampler(object):
 
 def parse_command(line):
     """("interval", ms), ("mem", ms), ("net", names, "all" or None for auto), ("disk", ...), ("feed <name>", Feed or
-    None), ("ports", ms), ("probes", bool) or ("port <n>", n); None for anything else."""
+    None), ("ports", ms), ("probes", bool), ("echo", ms) or ("port <n>", n); None for anything else."""
     if line.startswith("feed "):
         return parse_feed(line)
     f = line.split()
@@ -1549,6 +1816,8 @@ def parse_command(line):
         return "ports", 0 if f[1] == "off" else max(MIN_PORTS_MS, min(10000, int(f[1]))) if int(f[1]) else 0
     if len(f) == 2 and f[0] == "probes" and f[1] in ("on", "off"):
         return "probes", f[1] == "on"
+    if len(f) == 2 and f[0] == "echo" and re.match(r"(off|[0-9]{1,6})$", f[1]):
+        return "echo", 0 if f[1] == "off" or not int(f[1]) else max(MIN_ECHO_MS, min(MAX_ECHO_MS, int(f[1])))
     if len(f) == 2 and f[0] == "port" and re.match(r"[0-9]{1,5}$", f[1]) and 0 < int(f[1]) < 65536:
         return "port " + f[1], int(f[1])
     if f and f[0] in ("net", "disk"):
@@ -1688,6 +1957,7 @@ class Viewer(object):
         finally:
             self.gone = True
             self.server.link.forget(self)
+            self.server.echo.forget(self)
             self.mem_wake.set()
             self.sock.close()
 
@@ -1719,6 +1989,8 @@ class Viewer(object):
                 link = self.server.link
                 if "ports" in todo or "probes" in todo:
                     link.want(self, todo.get("ports"), todo.get("probes"))
+                if "echo" in todo:
+                    self.server.echo.want(self, todo["echo"])
                 for k in todo:
                     if k.startswith("port "):
                         link.ask(self, todo[k])
@@ -1755,6 +2027,7 @@ class Server(object):
                 self.sock = self._open(socket.AF_INET, ("", port), False)   # IPv6 is off here
         self.port = self.sock.getsockname()[1]
         self.link = PortsLink(self.port)
+        self.echo = EchoWatch(self.link)
 
     @staticmethod
     def _open(family, address, dual):
@@ -1819,6 +2092,7 @@ class Server(object):
 
     def stop(self):
         self.stopping.set()
+        self.echo.stop()
 
 
 def log(text):

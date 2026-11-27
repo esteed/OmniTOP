@@ -34,6 +34,17 @@ const DK_PAL = {
           lw: [0.74, 0.16, 48], br: [0.70, 0.15, 155], bw: [0.84, 0.15, 128], size: [0.72, 0.10, 220], queue: [0.80, 0.13, 70] },
 };
 let dkColors = {}, dkHot = null;   // dkHot: { id, key } of the label pointed at
+// The measures hidden from each disk's graph, by "machine|disk": a click on a label hides or shows one.
+const dkHidden = new Map(Object.entries(loadPref('disk.hidden') || {}).filter(([, v]) => Array.isArray(v)).map(([k, v]) => [k, new Set(v)]));
+const dkId = (s, item) => `${s.info.id}|${item.key}`;
+const dkOff = (s, item) => dkHidden.get(dkId(s, item)) || new Set();
+
+function dkToggle(id, key) {
+  const off = dkHidden.get(id) || new Set();
+  if (off.has(key)) off.delete(key); else off.add(key);
+  if (off.size) dkHidden.set(id, off); else dkHidden.delete(id);
+  savePref('disk.hidden', Object.fromEntries([...dkHidden].slice(-200).map(([k, v]) => [k, [...v]])));
+}
 
 function dkReadColors() {
   const pal = DK_PAL[darkQuery.matches ? 'dark' : 'light'];
@@ -59,6 +70,13 @@ function dkAverage(ring, seconds, { num, den }) {
   const from = ring.T(k) - seconds;
   for (; k >= 0 && ring.T(k) > from; k--) { a += num(ring, k); b += den(ring, k); }
   return b > 1e-9 ? a / b : null;
+}
+
+// What a line shows at sample k: the average over DK.smooth seconds up to it. null if nothing happened.
+function dkAt(ring, k, { num, den }) {
+  let a = 0, b = 0;
+  for (let j = k, from = ring.T(k) - DK.smooth; j >= 0 && ring.T(j) > from; j--) { a += num(ring, j); b += den(ring, j); }
+  return b > 1e-6 ? Math.max(0, a / b) : null;
 }
 
 // The same for every sample [from, to), over DK.smooth seconds up to each.
@@ -112,18 +130,18 @@ function dkPanel(s, item, ring, p, span) {
   const barsW = 2 * DK.bar + DK.gap, right = p.x + p.w;
   const plot = { x: p.x, y: p.y + DK.head, w: Math.max(120, p.w - DK.reach - DK.label - DK.gap - barsW), h: p.h - DK.head };
   const from = ring ? Math.max(0, ring.after(pp.tEnd - span) - 1) : 0, to = ring ? ring.after(pp.tEnd) : 0;
-  const lines = [], tops = { ...DK_LEAST };
+  const lines = [], tops = { ...DK_LEAST }, off = dkOff(s, item), id = dkId(s, item);
   if (ring && to > from) {
     for (const q of DK_SERIES) {
-      const v = dkTrail(ring, from, to, q);
+      const v = off.has(q.key) ? null : dkTrail(ring, from, to, q);
       lines.push(v);
-      if (q.unit !== 'busy') for (const x of v) if (x > tops[q.unit]) tops[q.unit] = x;
+      if (v && q.unit !== 'busy') for (const x of v) if (x > tops[q.unit]) tops[q.unit] = x;
     }
   }
   for (const u of ['bytes', 'iops', 'ms']) tops[u] = niceCeil(tops[u]);
 
   pframe(plot, 4, span, true);
-  const hot = dkHot && dkHot.id === item.key ? dkHot.key : null;
+  const hot = dkHot && dkHot.id === id && !off.has(dkHot.key) ? dkHot.key : null;
   const ends = [];
   clipTo(plot);
   DK_SERIES.forEach((q, i) => {
@@ -137,13 +155,15 @@ function dkPanel(s, item, ring, p, span) {
     pctx.stroke();
   });
   dkDash(false);
-  pctx.restore();
   pctx.globalAlpha = pAlpha = pDim;
+  dkMarks(s, item, ring, plot, span, lines, from, to, tops);
+  pctx.restore();
   border(plot);
-  const scales = `Top of the graph: ${['bytes', 'iops', 'ms', 'busy'].map(u => DK_TOP[u](tops[u])).join('  ·  ')}`;
+  const units = ['bytes', 'iops', 'ms', 'busy'].filter(u => DK_SERIES.some(q => q.unit === u && !off.has(q.key)));
+  const scales = units.length ? `Top of the graph: ${units.map(u => DK_TOP[u](tops[u])).join('  ·  ')}` : 'Every measure is hidden: click one of their names to show it';
   pText(scales, plot.x + 6, plot.y + 13, 10.5, T.muted, 400, 'left', plot.w - 12);
 
-  dkLabels(s, item, ring, plot, ends, hot);
+  dkLabels(s, item, ring, plot, ends, hot, off, id);
   const bx = right - barsW, live = ring && ring.n && pLive(s);
   const size = live ? dkAverage(ring, DK.bars, DK_SIZE) : null, queue = live ? dkAverage(ring, DK.bars, DK_QUEUE) : null;
   dkSizeBar({ x: bx, y: plot.y, w: DK.bar, h: plot.h }, size);
@@ -151,45 +171,73 @@ function dkPanel(s, item, ring, p, span) {
   PS.plots.push({ ...plot, kind: 'disk', s, item, ring });
 }
 
-// A label for each line, in a fixed order, with a line from where it ends now.
-function dkLabels(s, item, ring, plot, ends, hot) {
+// Where the pointer is: a dot on each line shown, at the moment it points at.
+function dkMarks(s, item, ring, plot, span, lines, from, to, tops) {
+  const hv = PS.hover;
+  if (!hv || hv.t == null || hv.id !== s.info.id || hv.key !== item.key || !ring || to <= from) return;
+  const k = nearest(ring, hv.t);
+  if (k < from || k >= to) return;
+  const x = plot.x + plot.w - (pp.tEnd - hv.t) * plot.w / span, bottom = plot.y + plot.h - 1;
+  DK_SERIES.forEach((q, i) => {
+    if (!lines[i]) return;
+    const y = bottom - Math.min(lines[i][k - from], tops[q.unit]) * (plot.h - 2) / tops[q.unit];
+    pctx.beginPath();
+    pctx.arc(x, y, 3.6, 0, 2 * Math.PI);
+    pctx.fillStyle = dkColors[q.key];
+    pctx.fill();
+    pctx.lineWidth = 1.5;
+    pctx.strokeStyle = PC.plot;
+    pctx.stroke();
+  });
+}
+
+// A label for each line, in a fixed order, with a line from where it ends now. A click on
+// one hides its line, or shows it again; a hidden one is faint, with no line to it.
+function dkLabels(s, item, ring, plot, ends, hot, off, id) {
   const n = DK_SERIES.length, x = plot.x + plot.w + DK.reach, two = plot.h >= n * DK.row - 4;
   const step = plot.h / n, live = ring && ring.n && pLive(s);
   DK_SERIES.forEach((q, i) => {
     const color = dkColors[q.key], shelf = Math.round(plot.y + step * (i + 1) - (step - (two ? DK.row : DK.tight)) / 2) - 1.5;
+    const hidden = off.has(q.key);
     const v = live ? dkAverage(ring, DK.numbers, q) : null;
     const value = v == null ? (live && q.unit === 'ms' ? 'no I/O' : '--') : DK_FORMAT[q.unit](v);
-    pctx.globalAlpha = pDim * (hot && hot !== q.key ? 0.3 : 1);
+    pctx.globalAlpha = pDim * (hidden ? 0.35 : hot && hot !== q.key ? 0.3 : 1);
     pctx.strokeStyle = color;
     pctx.lineWidth = hot === q.key ? 2 : 1.25;
     dkDash(q.dash);
-    pctx.beginPath();
-    pctx.moveTo(plot.x + plot.w + 3, ends[i]);
-    pctx.lineTo(x, shelf);
-    pctx.stroke();
+    if (!hidden) {
+      pctx.beginPath();
+      pctx.moveTo(plot.x + plot.w + 3, ends[i]);
+      pctx.lineTo(x, shelf);
+      pctx.stroke();
+    }
     dkDash(false);
     pctx.beginPath();
     pctx.moveTo(x, shelf);
     pctx.lineTo(x + DK.label, shelf);
     pctx.stroke();
-    pctx.beginPath();
-    pctx.arc(plot.x + plot.w + 1, ends[i], 2.6, 0, 2 * Math.PI);
-    pctx.fillStyle = color;
-    pctx.fill();
+    if (!hidden) {
+      pctx.beginPath();
+      pctx.arc(plot.x + plot.w + 1, ends[i], 2.6, 0, 2 * Math.PI);
+      pctx.fillStyle = color;
+      pctx.fill();
+    }
+    const name = hidden ? `${q.name} (hidden)` : q.name;
     if (two) {
-      pText(q.name, x + 2, shelf - 14.5, 11.5, T.ink, 600, 'left', DK.label - 4);
+      pText(name, x + 2, shelf - 14.5, 11.5, T.ink, 600, 'left', DK.label - 4);
       pText(value, x + 2, shelf - 3.5, 11, T.ink2, 400, 'left', DK.label - 4);
     } else {
       const vw = pText(value, x + DK.label - 2, shelf - 3, 11, T.ink2, 600, 'right');
-      pText(q.name, x + 2, shelf - 3, 11, T.ink, 400, 'left', DK.label - vw - 8);
+      pText(name, x + 2, shelf - 3, 11, T.ink, 400, 'left', DK.label - vw - 8);
     }
-    PS.plots.push({ x: x - 4, y: shelf - (two ? DK.row : DK.tight), w: DK.label + 8, h: two ? DK.row : DK.tight, kind: 'disklabel', id: item.key, key: q.key });
+    PS.plots.push({ x: x - 4, y: shelf - (two ? DK.row : DK.tight), w: DK.label + 8, h: two ? DK.row : DK.tight,
+                    kind: 'disklabel', id, key: q.key, name: q.name, hidden });
   });
   pctx.globalAlpha = pAlpha = pDim;
 }
 
 // An upright bar with its name above, its value below, and ticks beside it. at: 0 to 1.
-function dkBar(b, name, value, at, color, ticks) {
+function dkBar(b, name, value, at, color, ticks, caption = `${DK.bars} s average`, captionColor = T.muted) {
   const tx = 27, top = b.y + 18, bottom = b.y + b.h - 32, h = Math.max(10, bottom - top), bx = b.x + tx, bw = b.w - tx;
   pText(name, b.x + b.w, b.y + 10, 11.5, T.ink, 600, 'right');
   pctx.fillStyle = PC.plot;
@@ -213,7 +261,7 @@ function dkBar(b, name, value, at, color, ticks) {
   }
   border({ x: bx, y: top, w: bw, h });
   pText(value, b.x + b.w, bottom + 15, 12, T.ink, 600, 'right');
-  pText('5 s average', b.x + b.w, bottom + 28, 9.5, T.muted, 400, 'right');
+  pText(caption, b.x + b.w, bottom + 28, 9.5, captionColor, 400, 'right');
 }
 
 // Sizes double from 512 bytes to 1 MB, or as far as it takes.
@@ -233,21 +281,28 @@ function dkQueueBar(b, v, ring, from, to) {
   dkBar(b, 'Queue', v == null ? '--' : dkQueue(v), (v || 0) / top, dkColors.queue, ticks);
 }
 
-// What it all was at a moment.
+// What it all was at a moment: what the lines show there (each the last DK.smooth seconds), not
+// the one sample under the pointer, which between bursts of I/O is mostly nothing.
 function dkTip(p, t) {
   const ring = p.ring, k = nearest(ring, t);
   if (k < 0) return `<div class="head">${esc(p.item.name)}</div><div class="faint">No samples yet</div>`;
-  const ago = Math.max(0, pp.tEnd - ring.T(k));
-  const row = (q, v) => `<div><span class="sw" style="background:${dkColors[q.key]};border:0"></span>${q.name} <b>${v}</b></div>`;
-  const val = q => {
-    const d = q.den(ring, k);
-    return d > 1e-9 ? DK_FORMAT[q.unit](q.num(ring, k) / d) : 'no I/O';
+  const ago = Math.max(0, pp.tEnd - ring.T(k)), off = dkOff(p.s, p.item);
+  const row = q => {
+    const v = dkAt(ring, k, q);
+    return `<div><span class="sw" style="background:${dkColors[q.key]};border:0"></span>${q.name} <b>${v == null ? 'no I/O' : DK_FORMAT[q.unit](v)}</b></div>`;
   };
-  const ops = DK_SIZE.den(ring, k);
+  const size = dkAt(ring, k, DK_SIZE), queue = dkAt(ring, k, DK_QUEUE), busy = dkAt(ring, k, { num: (r, j) => r.V(0, j), den: dkOne });
+  const shown = DK_SERIES.filter(q => !off.has(q.key));
   return `<div class="head">${esc(p.item.name)} <span class="faint">${esc(p.s.info.name)}</span></div>` +
-    DK_SERIES.map(q => row(q, val(q))).join('') +
-    `<div class="sub">I/O size ${ops > 1e-9 ? dkSize(DK_SIZE.num(ring, k) / ops) : '–'} · queue ${dkQueue(ring.V(7, k))} · ${ring.V(0, k).toFixed(1)}% busy</div>` +
-    `<div class="faint">${ago < 0.05 ? 'now' : `${ago.toFixed(ago < 10 ? 1 : 0)} s ago`}</div>`;
+    shown.map(row).join('') +
+    (off.size ? `<div class="faint">${off.size} hidden: click a name to show it</div>` : '') +
+    `<div class="sub">I/O size ${size == null ? '–' : dkSize(size)} · queue ${dkQueue(queue || 0)} · ${(busy || 0).toFixed(1)}% busy</div>` +
+    `<div class="faint">${DK.smooth} s up to ${ago < 0.05 ? 'now' : `${ago.toFixed(ago < 10 ? 1 : 0)} s ago`}</div>`;
+}
+
+// A label: what a click does.
+function dkLabelTip(p) {
+  return `<div class="head">${esc(p.name)}</div><div class="faint">Click to ${p.hidden ? 'show it on' : 'hide it from'} the graph</div>`;
 }
 
 // How a page of them is laid out: { cols, rows, h (each), strip } for n disks in w x room.

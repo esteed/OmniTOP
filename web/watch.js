@@ -210,11 +210,12 @@ function bubProcs(p, b) {
 // ---------------------------------------------------------------------------
 // Each scan has its own alert: one that stops and starts again is a new scan.
 // Each machine's Ports page shows that machine's alerts. While a scan of the
-// machine shown runs, the Port scan button pulses red. A new scan zooms the
-// view out so both grids fit beside its alert, and, if its machine's Ports page
-// isn't showing, makes that page's tab flash (a red dot stays after the scan
-// ends, until the page is opened): the Ports tab, the Local tab for this PC,
-// the Remote tab and the machine's card for a remote one.
+// machine shown runs, the Port scan button and the Ports tab throb red. A new
+// scan zooms the view out so both grids fit beside its alert, and, if its
+// machine's Ports page isn't showing, makes the tabs that lead there throb until
+// it's opened: the Ports tab, the Local tab for this PC, the Remote tab for a
+// remote one. A remote machine's card says it was scanned, and when, until that
+// note is clicked (it's kept across restarts).
 const scanBox = $('alerts'), scanLight = $('ctl-scan'), scanTab = $('tabbtn-net'), scanTop = $('topbtn-local'),
   scanRemoteTop = $('topbtn-remote');
 const scanKnown = new Map();     // machine|scan id -> latest description from the server, with its machine as .m
@@ -223,6 +224,14 @@ const scanDismissed = new Map(Object.entries(loadPref('dismissedScans') || {}));
 let scanSkew = 0;                // server clock minus this one, seconds
 const scanUnseen = new Set();    // machines a scan began on while their Ports page wasn't showing
 let scanFitDue = false;          // fit the view around the alerts when the page is next shown
+// A remote machine's card's note: machine id -> { key, at (this clock's seconds), from, ports } of its
+// latest scan, until the note is clicked; and the scans whose notes were clicked away.
+const scanNotes = new Map(Object.entries(loadPref('scanNotes') || {}).filter(([, n]) => n && n.key));
+const scanNoteGone = new Set(Array.isArray(loadPref('scanNotesGone')) ? loadPref('scanNotesGone') : []);
+function scanNotesSave() {
+  savePref('scanNotes', Object.fromEntries(scanNotes));
+  savePref('scanNotesGone', [...scanNoteGone].slice(-100));
+}
 
 const scanKey = s => `${s.m}|${s.id}`;
 const scanShowing = id => activeTab === 'net' && portsOf === id;
@@ -230,6 +239,7 @@ const scanShowing = id => activeTab === 'net' && portsOf === id;
 function scanTake(m) {
   if (m.now) scanSkew = m.now - Date.now() / 1000;
   let fresh = false;
+  let noted = false;
   for (const s of m.scans || []) {
     s.m = s.m || m.m || 'local';
     if (!scanKnown.has(scanKey(s)) && !s.ended) {
@@ -237,7 +247,13 @@ function scanTake(m) {
       else scanUnseen.add(s.m);
     }
     scanKnown.set(scanKey(s), s);
+    const note = scanNotes.get(s.m);
+    if (s.m !== 'local' && !scanNoteGone.has(scanKey(s)) && (!note || note.key === scanKey(s) || note.at < s.first - scanSkew)) {
+      scanNotes.set(s.m, { key: scanKey(s), at: s.first - scanSkew, from: s.machines === 1 ? s.remotes[0][0] : `${s.machines} machines`, ports: s.total });
+      noted = true;
+    }
   }
+  if (noted) scanNotesSave();
   scanRender();
   if (fresh) {
     scanFitDue = true;
@@ -261,26 +277,50 @@ async function scanLoad() {
 
 const scanLive = id => [...scanKnown.values()].some(s => s.m === id && !s.ended);
 
-// Which tabs flash, and which machines' cards say they're being scanned.
+// Which tabs throb, and which machines' cards say they were scanned.
 function scanMarkTab() {
   const shown = typeof viewMachine === 'function' ? viewMachine() : 'local';
   const top = typeof nav !== 'undefined' ? nav.top : 'local';
-  const mark = (el, unseen, live) => {
-    el.classList.toggle('alarm', unseen && live);
-    el.classList.toggle('alarm-dot', unseen && !live);
-  };
-  mark(scanTab, scanUnseen.has(shown), scanLive(shown));
-  mark(scanTop, top !== 'local' && scanUnseen.has('local'), scanLive('local'));
+  scanTab.classList.toggle('alarm', scanLive(shown) || scanUnseen.has(shown));
+  scanTop.classList.toggle('alarm', top !== 'local' && scanUnseen.has('local'));
   const remote = [...scanUnseen].filter(id => id !== 'local' && !(top === 'remote' && id === shown));
-  mark(scanRemoteTop, remote.length > 0 && !(top === 'remote' && !nav.machine), remote.some(scanLive));
+  scanRemoteTop.classList.toggle('alarm', remote.length > 0 && !(top === 'remote' && !nav.machine));
   if (typeof rCards !== 'undefined') {
     for (const [id, c] of rCards) {
-      const live = scanLive(id);
-      c.el.classList.toggle('scanned', live || scanUnseen.has(id));
-      c.el.classList.toggle('scan-live', live);
-      c.el.querySelector('.rwho').dataset.scan = live ? 'Port scan under way' : scanUnseen.has(id) ? 'Was port scanned' : '';
+      const note = scanNotes.get(id), live = note && scanLive(id) && !scanKnown.get(note.key)?.ended;
+      const el = c.el.querySelector('.rscan');
+      c.el.classList.toggle('scanned', !!note);
+      c.el.classList.toggle('scan-live', !!live);
+      el.hidden = !note;
+      if (!note) continue;
+      const text = live ? 'Port scan under way' :`Port scanned ${bubWhen(note.at).replace(/\s/g, ' ')}`;   // the time on one line
+      if (el.textContent !== text) el.textContent = text;
+      el.dataset.short = live ? 'Being scanned' : `Scanned ${bubWhen(note.at)}`;
+      el.title = `${live ? 'Being port scanned' : `Port scanned ${bubWhen(note.at)}`}, from ${note.from}: ${note.ports.toLocaleString()} ports.` +
+        '\nIts Ports page has the details. Click this note to dismiss it.';
     }
   }
+}
+
+// A card's note, clicked: gone until there's another scan of that machine.
+function scanNoteDismiss(id) {
+  const note = scanNotes.get(id);
+  if (!note) return;
+  scanNoteGone.add(note.key);
+  scanNotes.delete(id);
+  scanUnseen.delete(id);
+  scanNotesSave();
+  scanMarkTab();
+}
+
+// Notes of machines no longer watched go too.
+if (typeof perfMetaListeners !== 'undefined') {
+  perfMetaListeners.push(meta => {
+    const ids = new Set(meta.machines.map(m => m.id));
+    let gone = false;
+    for (const id of [...scanNotes.keys()]) if (!ids.has(id)) { scanNotes.delete(id); gone = true; }
+    if (gone) scanNotesSave();
+  });
 }
 if (typeof perfMetaListeners !== 'undefined') perfMetaListeners.push(() => requestAnimationFrame(scanMarkTab));   // new cards
 

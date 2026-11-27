@@ -51,7 +51,7 @@ const $ = id => document.getElementById(id);
 const stage = $('stage'), cv = $('cv'), ctx = cv.getContext('2d'), tip = $('tip');
 const sysListeners = [];              // memory.js: called with each memory/GPU sample
 const rmemListeners = [];             // memory.js: and with each remote machine's
-const perfListeners = { perf: [], perfmeta: [] };   // perf.js
+const perfListeners = { perf: [], perfmeta: [], lat: [], found: [] };   // perf.js; found: remote.js
 const listListeners = [];             // watch.js: called after the busiest-ports list redraws
 const scanListeners = [];             // watch.js: called with each port scan update
 const tabListeners = [];              // watch.js: called with the tab's name when one is opened

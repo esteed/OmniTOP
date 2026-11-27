@@ -185,6 +185,26 @@ const perfMetaListeners = [];    // remote.js: the machines changed
 perfListeners.perf.push(onPerf);
 perfListeners.perfmeta.push(onPerfMeta);
 
+// Latency and jitter of a machine's adapters, while its Network page shows: { at, g: {key: gateway},
+// n: {key: [average ms, jitter ms, lost, pings]}, e: error, w: seconds }. Each adapter's last minute of
+// them is kept too, as [when, average, jitter], for the scale of its bars.
+const P_LAT_KEEP = 60000;
+function onLat(msg) {
+  const s = pStore(msg.m), at = performance.now();
+  s.lat = { at, g: msg.g || {}, n: msg.n || {}, e: msg.e || '', w: msg.w || 3 };
+  s.latHist = s.latHist || new Map();
+  for (const [key, [avg, jitter]] of Object.entries(s.lat.n)) {
+    const h = s.latHist.get(key) || [];
+    h.push([at, avg, jitter]);
+    while (h.length && h[0][0] < at - P_LAT_KEEP) h.shift();
+    s.latHist.set(key, h);
+  }
+  for (const f of perfDrawers) f();
+}
+perfListeners.lat.push(onLat);
+// The latest, if it's recent: a page that has just opened, or a machine that stopped answering, has none.
+const pLat = s => (s.lat && performance.now() - s.lat.at < 2500 ? s.lat : null);
+
 async function postPerf(body) {
   try {
     const res = await fetch('/api/perf', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -450,7 +470,7 @@ function fadeNow() {   // 1 to 0.15 and back, every P_LOST_FADE seconds
   return 0.575 + 0.425 * Math.cos(performance.now() / 1000 / P_LOST_FADE * 2 * Math.PI);
 }
 
-function drawNetStrip(s, item, ring, p, span, labels = true) {
+function drawNetStrip(s, item, ring, p, span, labels = true, more = '') {
   const from = ring ? Math.max(0, ring.after(pp.tEnd - span) - 1) : 0, to = ring ? ring.after(pp.tEnd) : 0;
   const yMax = ring ? netCeiling(s, item, ring, from, to) : 1e6;
   if (item.lost) {   // its link went down a moment ago: fade out and in until it's back or gone
@@ -473,7 +493,7 @@ function drawNetStrip(s, item, ring, p, span, labels = true) {
   const link = ring && ring.n ? ring.V(2, ring.n - 1) : 0;
   const axis = item.status ? '' : item.lost ? 'disconnected'
     : !item.virtual && ring && ring.n && (link !== 0 || s.lastLink.get(item.key) > 0) ? pLink(link) : `scale ${pAxisBits(yMax)}`;
-  stripLabels(p, item.name, axis, `↓ ${live ? pBits(ring.avg(0, pp.tEnd)) : '--'}`, PC.rx,
+  stripLabels(p, item.name, [axis, more].filter(Boolean).join('  ·  '),`↓ ${live ? pBits(ring.avg(0, pp.tEnd)) : '--'}`, PC.rx,
               `↑ ${live ? pBits(ring.avg(1, pp.tEnd)) : '--'}`, PC.tx, null);
   stripProblems(p, item.status, null);
   pctx.globalAlpha = pAlpha = pDim;
@@ -551,7 +571,7 @@ function drawCrosshair(span) {
   const g = pctx;
   g.beginPath();
   for (const p of PS.plots) {
-    if (p.kind === 'disklabel') continue;
+    if (P_NOT_GRAPHS.has(p.kind)) continue;
     const x = Math.round(p.x + p.w - (pp.tEnd - hv.t) * p.w / span) + 0.5;
     if (x < p.x || x > p.x + p.w) continue;
     g.moveTo(x, p.y + 1); g.lineTo(x, p.y + p.h - 1);
@@ -573,10 +593,13 @@ function nearest(ring, t) {
 }
 
 // The graph of a surface under a point on it, or null. Marks the moment there for the crosshair.
+// The moment pointed at, and the graph it's in (by machine and item key), are kept as S.hover.
+const P_NOT_GRAPHS = new Set(['disklabel', 'netbars']);   // things on the canvas that aren't graphs over time
 function plotAt(S, mx, my) {
   const p = S.plots.find(q => mx >= q.x && mx <= q.x + q.w && my >= q.y && my <= q.y + q.h);
-  if (p && p.kind === 'disklabel') { S.hover = null; return p; }
-  S.hover = p ? { t: pp.tEnd - (p.x + p.w - mx) / p.w * pVisible() } : null;
+  if (p && P_NOT_GRAPHS.has(p.kind)) { S.hover = null; return p; }
+  S.hover = p ? { t: pp.tEnd - (p.x + p.w - mx) / p.w * pVisible(), kind: p.kind, id: p.s ? p.s.info.id : null,
+                  key: p.item ? p.item.key : null } : null;
   return p || null;
 }
 

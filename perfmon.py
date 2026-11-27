@@ -18,7 +18,8 @@ It started as a port of CPU Graph 2.0 (github.com/esteed/CpuGraph):
 
 Samples go out as "perf" server-sent events, one per tick; "perfmeta" events
 describe the machines and their adapters and disks; "rmem" events carry the
-remote machines' memory.
+remote machines' memory; "lat" events the latency and jitter of a machine's adapters,
+while its Network page shows (latency.py).
 """
 from __future__ import annotations
 
@@ -35,12 +36,16 @@ import time
 import winreg
 from ctypes import wintypes
 
+import latency
 import netwatch
 from settings import AGENT_PORT
 from sysmon import PDH_FMT_COUNTERVALUE
 
 INTERVALS = (50, 100, 250, 500, 1000)    # ms between samples: 20, 10, 4, 2, 1 a second
 RETRY_SECONDS = 5
+ECHO_MS = 250                 # between pings of each gateway, while a Network page shows
+ECHO_IDLE = 5.0               # seconds the pinging goes on after the page closes: a quick look back costs nothing
+ECHO_SINCE = "2.2"            # the version whose agents measure latency
 
 _T0 = time.perf_counter()
 
@@ -580,13 +585,17 @@ class Machine:
         self.ports_note = ""                               # why not
         self.dynamic: list[int] | None = None              # its ephemeral port range
         self.ports_error = ""                              # what keeps it from capturing, now
+        self.echo = True                                   # whether it measures its adapters' latency
+        self.echo_note = ""                                # and why not
+        self.ip = ""                                       # the address it's reached at
 
     def meta(self) -> dict:
         return {"id": self.id, "name": self.name, "detail": self.detail, "state": self.state, "status": self.status,
                 "note": self.note, "os": self.os, "system": self.system, "kernel": self.kernel,
-                "agent": self.version, "address": self.address, "memory": self.memory, "io": self.io,
+                "agent": self.version, "address": self.address, "ip": self.ip, "memory": self.memory, "io": self.io,
                 "threads": self.threads, "v": self.version_no, "silent": self.silent,
                 "ports": {"can": self.ports, "note": self.ports_note, "dynamic": self.dynamic, "error": self.ports_error},
+                "lat": {"can": self.echo, "note": self.echo_note},
                 "nets": [i.meta() for i in self.nets], "disks": [i.meta() for i in self.disks]}
 
 
@@ -674,6 +683,17 @@ def endpoint_text(host: str, port: int) -> str:
     return (f"[{host}]" if ":" in host else host) + f":{port}"
 
 
+def ip_literal(host: str) -> str:
+    """The host if it's an IP address already, else ""."""
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, host)
+            return host
+        except (OSError, ValueError):
+            pass
+    return ""
+
+
 def resolve(host: str, port: int):
     infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     infos.sort(key=lambda i: i[0] != socket.AF_INET)       # IPv4 first
@@ -755,6 +775,7 @@ class RemoteAgent:
         self.machine = m = Machine(config["id"], config["name"] or self.host)
         m.state, m.status = "connecting", "Connecting…"
         m.os, m.address = config["os"], endpoint_text(self.host, self.port)
+        m.ip = ip_literal(self.host)
         self._stop = threading.Event()
         self._sock = None
         self._lock = threading.Lock()
@@ -777,6 +798,7 @@ class RemoteAgent:
         self.rates: dict[str, DiskRates] = {}
         self.io: dict[str, list[float]] = {}               # disks' figures, for the sample that follows
         self.tracker = NetTracker()
+        self.echoes = latency.Window()                     # its adapters' round trips to their gateways
 
     @property
     def endpoint(self) -> str:
@@ -853,6 +875,8 @@ class RemoteAgent:
             out += "feed disks sample " + json.dumps(want) + "\n" if self.monitor.wants_io(self.machine.id) else "feed disks off\n"
         if "ports" in self.can:                            # probes always: a scan is news on any page
             out += (f"ports {REMOTE_PORTS_MS}\n" if self.monitor.wants_ports(self.machine.id) else "ports off\n") + "probes on\n"
+        if "echo" in self.can:
+            out += f"echo {ECHO_MS}\n" if self.monitor.wants_echo(self.machine.id) else "echo off\n"
         return out
 
     def port_details(self, port: int, seconds: float = 5.0) -> dict:
@@ -880,6 +904,10 @@ class RemoteAgent:
     def _session(self) -> None:
         self._connected = False
         info = resolve(self.host, self.port)
+        ip = info[4][0].removeprefix("::ffff:")
+        if ip != self.machine.ip:
+            self.machine.ip = ip
+            self.monitor.meta_changed()
         sock = socket.socket(info[0], socket.SOCK_STREAM)
         with self._lock:
             if self._stop.is_set():
@@ -973,6 +1001,8 @@ class RemoteAgent:
             self._probes(rest)
         elif word == "port":
             self._port(rest)
+        elif word == "echo":
+            self._echo(rest)
         elif word == "portsinfo":
             try:
                 d = json.loads(rest)
@@ -1019,6 +1049,21 @@ class RemoteAgent:
             except (ValueError, TypeError):
                 continue
 
+    # 'echo {"t": now, "g": {adapter: gateway}, "r": [[adapter, time, ms or null]...], "e": ""}'
+    def _echo(self, text: str) -> None:
+        if not self.monitor.wants_echo(self.machine.id):
+            return                                         # from before it was told
+        try:
+            d = json.loads(text)
+            shift = time.time() - float(d["t"])            # its clock to this one's
+            gws = {str(k)[:64]: str(v)[:64] for k, v in d.get("g", {}).items()}
+            for key, t, rtt in d.get("r", [])[:1000]:
+                self.echoes.add(str(key)[:64], float(t) + shift, None if rtt is None else max(0.0, min(60000.0, float(rtt))))
+            error = str(d.get("e") or "")[:200]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return
+        self.monitor.publish_echo(self.machine.id, gws, self.echoes.summary(time.time()), error)
+
     def _port(self, text: str) -> None:
         try:
             d = json.loads(text)
@@ -1058,6 +1103,10 @@ class RemoteAgent:
         else:
             m.ports_note = (f"Its agent ({m.version or 'an older one'}) doesn't send port traffic. "
                             "Install OmniTOP 2.1's agent there to see it.")
+        m.echo = "echo" in self.can
+        m.echo_note = "" if m.echo else (f"Its agent ({m.version or 'an older one'}) doesn't measure latency. "
+                                         f"Install OmniTOP {ECHO_SINCE}'s agent there to see it.")
+        self.echoes.clear()
         m.nets, m.disks = [], []
         if protocol == 1:
             m.note = f"Agent {m.version or '1'} sends only the total CPU. Install OmniTOP's agent there to see the rest."
@@ -1380,6 +1429,67 @@ class LocalDisks:
         return out
 
 
+class LocalEcho:
+    """This PC's adapters' round trips to their gateways, while its Network page shows."""
+
+    def __init__(self, mon: "PerfMonitor") -> None:
+        self.mon = mon
+        self.echoes: latency.Echoes | None = None
+        self.window = latency.Window()
+        self.idle_since = 0.0
+
+    def look(self, mono: float) -> None:
+        if self.mon.wants_echo("local"):
+            self.idle_since = 0.0
+            if self.echoes is None:
+                self.window.clear()
+                self.echoes = latency.Echoes(self._find, self._report, ECHO_MS).start()
+        elif self.echoes is not None:
+            self.idle_since = self.idle_since or mono
+            if mono - self.idle_since > ECHO_IDLE:
+                self.echoes.stop()
+                self.echoes = None
+
+    def _find(self) -> dict[str, tuple[str, str]]:
+        keys = {}
+        for i in self.mon.local.nets:                      # keyed by LUID
+            if i.key.isdigit():
+                keys[int(i.key)] = i.key
+        return {keys[luid]: target for luid, target in latency.targets(keys).items()}
+
+    def _report(self, gateways: dict, done: list, error: str) -> None:
+        for key, t, rtt in done:
+            self.window.add(key, t, rtt)
+        if self.mon.wants_echo("local"):
+            self.mon.publish_echo("local", gateways, self.window.summary(time.time()), error)
+
+
+class DemoEcho:
+    """Made-up round trips for a demo machine's adapters, while its Network page shows."""
+
+    GATEWAYS = {"e": ("192.168.1.1", 0.42), "w": ("192.168.1.1", 2.8), "v": ("100.64.0.1", 21.0),
+                "eth0": ("10.0.0.1", 0.31), "vpn": ("10.8.0.1", 17.0)}   # "eth1", a storage network, has none
+
+    def __init__(self, mon: "PerfMonitor", mid: str) -> None:
+        self.mon, self.mid, self.at = mon, mid, 0.0
+        self.window = latency.Window()
+
+    def step(self, t: float, machine: Machine) -> None:
+        if not self.mon.wants_echo(self.mid) or t < self.at:
+            return
+        self.at = t + ECHO_MS / 1000
+        wall, gws = time.time(), {}
+        for i in machine.nets:
+            if i.lost or i.key not in self.GATEWAYS:
+                continue
+            gws[i.key], base = self.GATEWAYS[i.key]
+            radio = i.key in ("w", "v", "vpn")
+            lost = random.random() < (0.02 if radio else 0.001)
+            spike = 8 * base if radio and random.random() < 0.06 else 0.0
+            self.window.add(i.key, wall, None if lost else base * random.lognormvariate(0, 0.3 if radio else 0.08) + spike)
+        self.mon.publish_echo(self.mid, gws, self.window.summary(wall), "")
+
+
 class LocalPerf:
     """This PC: CPU threads (or just the total), adapters and drives."""
 
@@ -1394,7 +1504,7 @@ class LocalPerf:
         m.detail = threads_text(self.cpu.n) if self.cpu.n else ""
         m.os, m.system, m.kernel = "windows", windows_name(), windows_version()
         m.memory = True
-        self.nets, self.disks = LocalNets(mon), LocalDisks(mon)
+        self.nets, self.disks, self.echo = LocalNets(mon), LocalDisks(mon), LocalEcho(mon)
         self.utility = None
         self.utility_failed = False
 
@@ -1403,6 +1513,7 @@ class LocalPerf:
         mono = time.monotonic()
         self.nets.look(mono)
         self.disks.look(mono)
+        self.echo.look(mono)
 
     def _total(self, values: list[float]) -> list[float]:
         mon = self.mon
@@ -1446,6 +1557,7 @@ class PerfMonitor:
         self.source_note = ""
         self.focus: str | None = None                      # the remote machine being looked at closely
         self.page: str | None = None                       # and the page of it that's showing
+        self.local_page: str | None = None                 # the page showing when it's this PC's, or the list
         self.numbers = False                               # the others are shown as numbers only
         self.remote_scans = RemoteScans(hub)
         self._stop = threading.Event()
@@ -1474,6 +1586,7 @@ class PerfMonitor:
     def set_focus(self, mid: str | None, numbers: bool | None = None, page: str | None = None) -> None:
         self.focus = mid if mid and any(r.machine.id == mid for r in self.remotes) else None
         self.page = page if self.focus else None
+        self.local_page = None if self.focus else page
         if numbers is not None:
             self.numbers = numbers
         for r in self.remotes:
@@ -1497,6 +1610,17 @@ class PerfMonitor:
     def wants_ports(self, mid: str) -> bool:
         """Whether a machine should send its traffic per port: while its Ports page shows."""
         return mid == self.focus and self.page == "net"
+
+    def wants_echo(self, mid: str) -> bool:
+        """Whether a machine's adapters' gateways should be pinged: while its Network page shows."""
+        if mid == "local":
+            return self.focus is None and self.local_page == "network"
+        return mid == self.focus and self.page == "network"
+
+    def publish_echo(self, mid: str, gateways: dict, summary: dict, error: str) -> None:
+        """A machine's adapters' latency, jitter and losses over the last few seconds, to the view."""
+        self.hub.publish(json.dumps({"m": mid, "g": gateways, "n": summary, "e": error, "w": latency.WINDOW},
+                                    separators=(",", ":")), "lat")
 
     def remote_port(self, mid: str, port: int) -> dict:
         r = next((r for r in self.remotes if r.machine.id == mid), None)
@@ -1683,8 +1807,10 @@ class DemoAgent:
         if number == 0:                                    # and this one is scanned now and then
             self.scans = netwatch.DemoScans(mon.remote_scans.get(m.id))
             self.scans.start()
+        m.ip = self.host
         self.load = [random.uniform(1, 10) for _ in range(m.threads)]
         self.tracker = NetTracker()
+        self.echo = DemoEcho(mon, m.id)
         self.t0 = now()
         self.memory = None
         self.mem_at = 0.0
@@ -1794,6 +1920,7 @@ class DemoAgent:
         disks = [demo_disk(rng, 0.2 + 0.8 * burst / (1 + i), 0.15 + 0.1 * i, i > 0) for i in range(len(m.disks))]
         self.mon.add_remote(m.id, m.version_no, t - 0.004, [sum(self.load) / len(self.load)] + self.load,
                             [rates[i.key] for i in m.nets], disks)
+        self.echo.step(t, m)
         if t >= self.mem_at:
             import sysmon
             self.memory = self.memory or sysmon.DemoSystem(remote=self.number, linux=m.os == "linux")
@@ -1817,6 +1944,7 @@ class DemoPerf:
         m.silent = ["G: Cloud Drive"]
         m.version_no += 1
         self.tracker = NetTracker()
+        self.echo = DemoEcho(mon, "local")
         self.load = [self.rng.uniform(2, 20) for _ in range(16)]
         self.t0 = now()
 
@@ -1859,6 +1987,7 @@ class DemoPerf:
                  demo_disk(rng, 0.1 + 0.5 * max(0.0, math.sin(el / 23)) ** 4, 0.7, True)]
         for a in self.mon.remotes:
             a.sample(t)
+        self.echo.step(t, m)
         return _pack(t, cpu, [rates[i.key] for i in m.nets], disks)
 
 

@@ -26,7 +26,11 @@ not assumed.
   - **The graph** has eight lines, each with a line to its label: throughput, IOPS,
     latency and busy time, reads solid and writes dashed. Each measure has its own scale,
     named along the top. The lines are smoothed over a second. Point at a label to make
-    its line stand out.
+    its line stand out, and click it to hide the line, or show it again; the other lines
+    of that measure's scale fill the graph. Each disk remembers what's hidden.
+  - **Pointing at the graph** marks the moment with a dot on each line, and the tip has
+    what the lines show there: the second up to that moment, not the one sample under the
+    pointer, which between bursts of I/O is mostly nothing.
   - **The bars** are the average I/O size and queue depth over the last 5 seconds.
   - Latency is how long an operation took, waiting included. The queue depth is how many
     were waiting or under way. Reads and writes overlap, so the time the disk was busy is
@@ -37,6 +41,14 @@ not assumed.
 - **Network**: a graph per adapter. Green is received (↓) and coral is sent (↑), in bits
   per second. The axis runs to the link's speed, or fits the traffic for adapters whose
   link speed means nothing, such as VPNs.
+  - **Latency and jitter**, the two bars at the end of each graph, are of the round trips
+    to the adapter's default gateway (IPv4), named by its name, over the last 3 seconds.
+    While the Network page shows, the gateway is pinged 4 times a second from the
+    adapter's own address. Latency is the average round trip; jitter is how much one
+    round trip differs from the next, on average; lost pings are counted under the bar.
+    It's the first hop, the part of the way the adapter's own link decides. An adapter
+    with no gateway, such as a storage network, says so. Point at the bars for the
+    details.
   - Network cards are shown while they have a link.
   - Virtual adapters, such as a VPN's, are added once they carry real traffic: about 64
     kb/s for a second or more.
@@ -67,8 +79,22 @@ machines go to a row as fit. From 100 up it's only numbers: the CPU, and the bus
 **Show** picks one of these whatever the number. Click a machine for everything: the same
 pages as for this PC, Ports included.
 
-A machine that can't be reached gets a red X over its icon and **Connection Issues** under
-it, says why, and reconnects by itself.
+Under each machine's name is the IP address it's reached at (what its host name resolves
+to, if it was added by name). A machine that can't be reached gets a red X over its icon
+and **Connection Issues** under it, says why, and reconnects by itself.
+
+**Found on your network.** OmniTOP looks for agents on this PC's networks: every address of
+each IPv4 network of its adapters that are up (the /24 around this PC's address, for a
+network wider than /22) is tried on port 7820, and on any other port a watched machine's
+agent uses. Where something answers, only its first line is read, which says whether it's
+an agent and which, and the connection is closed. That's a few hundred quick connection
+attempts, a second or two, when the app starts and every 10 minutes while its window is
+open. Agents it finds that aren't in the list are offered above it, with what they run:
+**Add** watches one, **Add all** all of them, and **✕** stops it being offered. The line
+under the list says which networks are looked at and when; **Look now** looks at once,
+and **Stop looking** stops it for good (it's in the settings, like what isn't to be
+offered). On a network someone else manages, ask first: a sweep like this can set off
+their intrusion detection.
 
 **Add machine** asks for the machine's host name or IP address, the agent's TCP port,
 its operating system, and a name if you want another than its own. **Test connection**
@@ -89,8 +115,8 @@ Each machine runs an agent that streams its numbers:
   removes all of it. `omniTop.exe --agent` runs the agent without installing anything,
   until it's closed.
 - **Linux machines**: the agent is one Python file,
-  [omnitop-agent.py](linux/omnitop-agent.py), for Python 3.6 or later. Copy it there and
-  run `sudo python3 omnitop-agent.py --install`. It:
+  [omnitop-agent.py](linux/omnitop-agent.py), for Python 3.6 or later (up to 3.14). Copy
+  it there and run `sudo python3 omnitop-agent.py --install`. It:
   - copies itself to `/usr/local/lib/omnitop-agent`
   - adds a systemd service, **omnitop-agent**, that runs as a throwaway account with no
     rights of its own
@@ -99,6 +125,11 @@ Each machine runs an agent that streams its numbers:
 
   `--replace` stops CPU Graph's cpugraph-agent if it has the port, and `--uninstall`
   removes all of it. Without systemd, start `python3 omnitop-agent.py` your own way.
+
+  On **Debian** (13, trixie, and earlier), a minimal install may have neither Python nor
+  sudo. As root (`su -`), `apt install python3` if `python3 --version` finds none, and
+  run `python3 omnitop-agent.py --install` without sudo. Debian runs no firewall unless
+  one was set up: with your own nftables rules, let TCP port 7820 in yourself.
 
 `--agent-port 7821` (Windows) or `--port 7821` (Linux) uses another port, and `--listen
 192.168.1.20` one address only.
@@ -118,15 +149,18 @@ OmniTOP's scan rules can change without touching the agents. OmniTOP goes on wor
 agents from 2.0 on, and says on the page when one can't send what that page needs.
 
 Older agents work too: CPU Graph's own cpugraph-agent, and version 1.9's on Windows. They
-send no memory, only throughput and busy time of disks, and no ports.
+send no memory, only throughput and busy time of disks, and no ports. Agents before 2.2
+don't measure latency.
 
 **Ports of remote machines.** A remote machine's Ports page is this PC's, for that machine:
 the grids, the busiest ports, the bubbles about the processes on a pinned port, and port
 scan alerts. Its traffic comes 5 times a second, and only while its Ports page is open. Scan
 detection runs all the time for every connected machine, whatever page is open. A scan of a
-remote machine shows on that machine's Ports page. Until you've seen it, the machine's card
-in the list says so, and the Remote tab and its Ports tab flash. White is the agent's own
-traffic: the stream to OmniTOP. What it takes on each system:
+remote machine shows on that machine's Ports page. The machine's card in the list says
+it's being scanned, and then when it was, until you click that note (or press Delete on the
+machine); the note is kept across restarts. Until you've seen the scan, the Remote tab and
+the machine's Ports tab throb. White is the agent's own traffic: the stream to OmniTOP.
+What it takes on each system:
 
 - **Windows**: the agent watches the network the way OmniTOP does on this PC, with an ETW
   session of its own, and needs no more rights for it. The session runs only while some
@@ -144,6 +178,12 @@ traffic: the stream to OmniTOP. What it takes on each system:
   only UDP headers and the first packet of each TCP connection. If it isn't running, the
   rest of the agent works as before, and the Ports page says why.
 
+Latency takes ICMP echo (ping). The Windows agent uses Windows' own ping functions, which
+need no rights. The Linux agent uses a ping socket, which needs none either where
+`net.ipv4.ping_group_range` allows it, as systemd's default does; where it doesn't, the
+omnitop-agent-ports service, which may send ICMP, does the pinging for it. Either way only
+the gateways the agent finds itself are pinged: a viewer can't have it ping anything else.
+
 The agents only read and run no commands. The connection isn't encrypted or authenticated:
 anyone who can reach the port can read the machine's CPU, memory, network and disk activity,
 the names of its programs, adapters and drives, and which programs talk to which addresses
@@ -154,7 +194,8 @@ looking at sends at the chosen rate. The others send up to 4 samples a second, o
 the more of them there are. Shown as numbers, they send no memory either.
 
 The machines are kept in `%LOCALAPPDATA%\PortTrafficViz\settings.json`, which the app
-writes. The first time, it takes over the machines in CPU Graph's `settings.ini`.
+writes, with whether to look for agents and the ones found that aren't to be offered. The
+first time, it takes over the machines in CPU Graph's `settings.ini`.
 
 ## Ports
 
@@ -215,10 +256,12 @@ writes. The first time, it takes over the machines in CPU Graph's `settings.ini`
   - **View.** The view zooms out so both grids fit beside the alert.
   - **Port scan button.** The button next to All | TCP | UDP pulses bright red
     while the scan runs. Click it to bring back the latest alert.
+  - **Ports tab.** Throbs red while a scan of the machine shown is under way, whatever
+    page is open.
   - **Grid.** Each probed port's square lights up red for a second.
-  - **Other tabs.** If another page is open, the Ports tab flashes red, and so does
-    Local if Remote is open. After the scan, a red dot stays until you open Ports.
-    For a remote machine, the Remote tab flashes and its card in the list says so.
+  - **Other tabs.** A scan that began while its Ports page wasn't showing makes the tabs
+    that lead there throb until that page is opened: the Ports tab, Local if Remote is
+    open, and for a remote machine the Remote tab. Its card in the list says so too.
 
   A scan is over once no probe has come for about 3 seconds, or 30 if several
   machines are making it, or up to 2 minutes for a slow one. If it starts again
@@ -449,7 +492,7 @@ clock using the fastest network trip seen so far, so all rows line up.
 
 `agent.py` is the Windows agent and `linux/omnitop-agent.py` the Linux one. They speak
 `cpugraph-agent`'s protocol (version 2), with additions that `agent.py` describes: every
-adapter and disk, memory, feeds of raw figures, and ports. For a remote machine's scans,
+adapter and disk, memory, feeds of raw figures, ports, and latency. For a remote machine's scans,
 the agent leaves out what only it can tell isn't a probe (replies to connections it made,
 and to UDP it sent; `netwatch.ProbeFilter` on Windows), and the app runs a `ScanWatch` for
 each machine on what's left. The Windows agent uses the
@@ -461,10 +504,16 @@ CPU. The Windows agent keeps a short log in
 `%LOCALAPPDATA%\PortTrafficViz\agent.log` (installed, under LOCAL SERVICE's profile:
 `C:\Windows\ServiceProfiles\LocalService`).
 
+`latency.py` pings adapters' gateways: their gateways come from `GetIpForwardTable2`, their
+addresses from `GetUnicastIpAddressTable`, and the round trips, timed with the performance
+counter, from `IcmpSendEcho2Ex`. Its `Window` turns round trips, this PC's or an agent's
+(the `echo` lines), into the average, jitter and losses of the last 3 seconds. `discover.py`
+looks for agents on this PC's networks.
+
 `settings.py` keeps the list of remote machines. The page is `web/`: `shell.js` has the
 tabs, `perf.js` the graphs, `disk.js` the disk panels, `views.js` the pages of one machine,
-`remote.js` the list of machines and the form, `memory.js` and `dimm.js` memory, `app.js`
-and `watch.js` the ports.
+`remote.js` the list of machines, what's found on the network and the form, `memory.js` and
+`dimm.js` memory, `app.js` and `watch.js` the ports.
 
 The server only listens on 127.0.0.1 and refuses requests whose `Host` header
 isn't its own address.

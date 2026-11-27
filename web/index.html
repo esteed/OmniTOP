@@ -72,12 +72,18 @@
   <main>
     <div id="rscroll" class="stage" tabindex="-1">
       <p id="rproblem" class="rproblem" hidden></p>
+      <section id="rfound" class="rfound" aria-labelledby="rf-title" hidden>
+        <div class="rf-head"><h2 id="rf-title">Found on your network</h2><span class="rf-what">Machines with an agent that aren't in the list</span>
+          <button type="button" id="rf-all">Add all</button></div>
+        <ul id="rf-list" class="rf-list"></ul>
+      </section>
       <ol id="rlist" class="rlist"></ol>
       <div id="rempty" class="rempty" hidden>
         <h2>No remote machines yet</h2>
         <p>Add the Windows PCs and Linux machines you want to watch. Each needs OmniTOP's agent, which takes a minute to install: the form shows how.</p>
         <button type="button" class="primary" data-add-machine>Add machine</button>
       </div>
+      <p id="rf-status" class="rf-status" hidden></p>
       <div id="rtip" class="tip" hidden></div>
     </div>
   </main>

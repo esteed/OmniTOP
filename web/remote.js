@@ -54,7 +54,8 @@ function rCard(id) {
   const el = document.createElement('li');
   el.className = 'rcard';
   el.dataset.id = id;
-  el.innerHTML = '<button type="button" class="rwho"><span class="ric"></span><span class="rname"></span><span class="rsub"></span></button>' +
+  el.innerHTML = '<button type="button" class="rwho"><span class="ric"></span><span class="rname"><span class="rn"></span><span class="rip"></span></span>' +
+    '<span class="rsub"></span><span class="rscan" hidden></span></button>' +
     '<div class="rgraphs"><canvas></canvas></div>' +
     '<span class="rnum"><span>CPU</span><b class="rcpu">–</b></span><span class="rnum"><span>Disk</span><b class="rdisk">–</b></span>' +
     '<div class="redit"><button type="button" data-do="up" title="Move up" aria-label="Move up">▲</button>' +
@@ -82,16 +83,17 @@ function rSync(meta) {
     const c = rCards.get(m.id) || rCard(m.id);
     if (rList.children[i] !== c.el) rList.insertBefore(c.el, rList.children[i] || null);
     const down = m.state === 'down', sub = down ? 'Connection Issues' : m.state === 'connecting' ? 'Connecting…' : m.system || m.address;
-    const key = JSON.stringify([m.name, m.os, m.state, sub, m.status, m.system, m.address]);
+    const ip = rIp(m), key = JSON.stringify([m.name, m.os, m.state, sub, m.status, m.system, m.address, ip]);
     if (key === c.key) return;
     c.key = key;
     const who = c.el.querySelector('.rwho');
     c.el.classList.toggle('down', down);
     c.el.querySelector('.ric').innerHTML = osIcon(m.os, down);
-    c.el.querySelector('.rname').textContent = m.name.replace(/([._-])(?=.)/g, '$1\u200b');   // long names break after these
+    c.el.querySelector('.rn').textContent = m.name.replace(/([._-])(?=.)/g, '$1\u200b');   // long names break after these
+    c.el.querySelector('.rip').textContent = ip === m.name ? '' : ip.replace(/([.:])(?=.)/g, '$1\u200b');
     c.el.querySelector('.rsub').textContent = sub;
-    who.title = [m.name, m.system, m.address, m.status, 'Click for details'].filter(Boolean).join('\n');
-    who.setAttribute('aria-label', [m.name, m.system, down ? `Connection Issues: ${m.status}` : '', 'details'].filter(Boolean).join(', '));
+    who.title = [m.name, ip, m.system, m.address !== ip ? m.address : '', m.status, 'Click for details'].filter(Boolean).join('\n');
+    who.setAttribute('aria-label', [m.name, ip, m.system, down ? `Connection Issues: ${m.status}` : '', 'details'].filter(Boolean).join(', '));
   });
   rSetLook(rWish !== 'auto' ? rWish : machines.length >= R.numbersFrom ? 'numbers' : machines.length >= R.compactFrom ? 'compact' : 'full');
   $('rempty').hidden = machines.length > 0;
@@ -104,6 +106,13 @@ function rSync(meta) {
   rInvalidate();
 }
 perfMetaListeners.push(rSync);
+
+// The address a machine is reached at: the one its name resolved to, else what it was added with.
+function rIp(m) {
+  if (m.ip) return m.ip;
+  const host = (m.address || '').replace(/^\[(.*)\](:\d+)?$/, '$1').replace(/^([^:]+):\d+$/, '$1');
+  return host;
+}
 
 function rSetLook(look) {
   if (look === rLook) return;
@@ -271,10 +280,20 @@ function rHover(id, c) {
 rList.addEventListener('click', ev => {
   const card = ev.target.closest('.rcard');
   if (!card) return;
+  if (ev.target.closest('.rscan')) { scanNoteDismiss(card.dataset.id); return; }   // its port scan note, not the machine
   const id = card.dataset.id, b = ev.target.closest('[data-do]');
   if (ev.target.closest('.rwho') || rLook === 'numbers' && !b) go({ top: 'remote', machine: id, page: 'overview' });
   else if (b && b.dataset.do === 'edit') rOpen(id);
   else if (b) rPost({ action: 'move', id, by: b.dataset.do === 'up' ? -1 : 1 });
+});
+
+// Delete on a machine dismisses its port scan note, as a click on the note does.
+rList.addEventListener('keydown', ev => {
+  const who = ev.target.closest('.rwho');
+  if (who && ev.key === 'Delete' && !who.querySelector('.rscan').hidden) {
+    ev.preventDefault();
+    scanNoteDismiss(who.closest('.rcard').dataset.id);
+  }
 });
 
 // The keys that scroll, wherever the focus is. (Up and Down change the rate on other pages.)
@@ -286,6 +305,93 @@ document.addEventListener('keydown', ev => {
   if (to === undefined) return;
   ev.preventDefault();
   rScroll.scrollTo({ top: to });
+});
+
+// ---------------------------------------------------------------------------
+// Agents found on the local networks (discover.py): offered above the list, to add with a
+// click, or to have it not offer again; and a line under the list about the looking.
+// ---------------------------------------------------------------------------
+let rFound = null, rFoundSkew = 0;
+const R_KIND = { omnitop: 'OmniTOP agent', old: "OmniTOP 1.9's agent: no memory", cpugraph: "CPU Graph's agent: no memory" };
+
+function rOnFound(v) {
+  rFound = v;
+  rFoundSkew = v.now - Date.now() / 1000;
+  rFoundDraw();
+}
+perfListeners.found.push(rOnFound);
+fetch('/api/found', { cache: 'no-store' }).then(r => (r.ok ? r.json() : null)).then(v => { if (v) rOnFound(v); }).catch(() => { /* they come anyway */ });
+
+// What's found and still not watched: the server leaves out what is, but a machine added a moment ago may not be in its view yet.
+function rFoundList() {
+  if (!rFound) return [];
+  const watched = new Set((pp.meta ? pp.meta.machines : []).flatMap(m => {
+    const odd = m.address.match(/^\[.*\]:(\d+)$/) || (m.address.split(':').length === 2 && m.address.match(/:(\d+)$/));
+    const port = odd ? Number(odd[1]) : 7820;
+    return [`${rIp(m)}:${port}`, `${m.ip}:${port}`];
+  }));
+  return rFound.found.filter(f => !watched.has(`${f.address}:${f.port}`));
+}
+
+function rFoundDraw() {
+  const v = rFound, list = rFoundList();
+  $('rfound').hidden = !list.length;
+  $('rf-all').hidden = list.length < 2;
+  $('rf-list').innerHTML = list.map(f => {
+    const where = f.port === 7820 ? f.address : `${f.address}:${f.port}`;
+    const what = `${R_KIND[f.kind] || 'agent'}${f.agent ? ` ${f.agent}` : ''}`;
+    return `<li data-address="${esc(f.address)}" data-port="${f.port}" data-os="${esc(f.os)}">${osIcon(f.os, false)}` +
+      `<div class="rf-who"><b>${esc(f.host || f.address)}</b><span>${esc(where)} · <span class="${f.kind === 'omnitop' ? '' : 'old'}" style="display:inline">${esc(what)}</span></span></div>` +
+      `<button type="button" data-found="add">Add</button>` +
+      `<button type="button" class="rf-x" data-found="ignore" title="Don't offer it again" aria-label="Don't offer ${esc(f.host || f.address)} again">✕</button></li>`;
+  }).join('');
+  const s = $('rf-status');
+  s.hidden = !v;
+  if (!v) return;
+  const nets = v.networks.length ? v.networks.join(', ') : 'this PC\'s networks';
+  const ago = v.last ? Math.max(0, Date.now() / 1000 + rFoundSkew - v.last) : null;
+  const when = ago == null ? '' : ago < 90 ? ' · last looked just now' : ` · last looked ${Math.round(ago / 60)} min ago`;
+  s.innerHTML = !v.on ? 'Not looking for agents on your network. <button type="button" data-found="on">Look for them</button>'
+    : (v.busy ? `Looking for agents on ${esc(nets)}…` : `Looks for agents on ${esc(nets)} every ${Math.round(v.every / 60)} minutes${when}.`) +
+      (v.error ? ` <span class="bad">${esc(v.error)}</span>` : '') +
+      (v.busy ? '' : ' <button type="button" data-found="look">Look now</button>') + ' <button type="button" data-found="off">Stop looking</button>';
+  rCountText();
+}
+perfMetaListeners.push(() => { if (rFound) rFoundDraw(); });
+setInterval(() => { if (rFound && activeTab === 'remotes') rFoundDraw(); }, 30000);   // "last looked ... ago"
+
+function rCountText() {
+  const n = rFoundList().length, el = $('rcount');
+  el.dataset.found = n ? ` · ${n} more found on your network` : '';
+}
+
+async function rFoundPost(body) {
+  try {
+    const res = await fetch('/api/found', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (res.ok) rOnFound(await res.json());
+  } catch { /* the next event says how it is */ }
+}
+
+async function rFoundAdd(li) {
+  li.querySelectorAll('button').forEach(b => { b.disabled = true; });
+  const a = await rPost({ action: 'add', name: '', address: li.dataset.address, port: Number(li.dataset.port), os: li.dataset.os });
+  if (a.error) {
+    li.querySelector('.rf-who span').textContent = a.error;
+    li.querySelectorAll('button').forEach(b => { b.disabled = false; });
+  }
+}
+
+document.addEventListener('click', async ev => {
+  const b = ev.target.closest('[data-found]');
+  if (!b || !b.closest('#tab-remotes')) return;
+  const li = b.closest('li'), what = b.dataset.found;
+  if (what === 'add') await rFoundAdd(li);
+  else if (what === 'ignore') await rFoundPost({ action: 'ignore', address: li.dataset.address, port: Number(li.dataset.port) });
+  else if (what === 'look') await rFoundPost({ action: 'look' });
+  else if (what === 'on' || what === 'off') await rFoundPost({ action: 'on', on: what === 'on' });
+});
+$('rf-all').addEventListener('click', async () => {
+  for (const li of [...$('rf-list').children]) await rFoundAdd(li);
 });
 
 // ---------------------------------------------------------------------------
@@ -420,7 +526,9 @@ function rHelp() {
         rOldAgent === 'linux' ? '<br><code>--replace</code> stops the cpugraph-agent it runs now, which has that port.'
           : '<br>If it already runs cpugraph-agent, add <code>--replace</code>.') +
       step('Come back here and choose <b>Test connection</b>.') +
-      '</ol><p class="rnote">To remove it: <code>sudo python3 omnitop-agent.py --uninstall</code></p>';
+      '</ol><p class="rnote">No sudo there, or no Python (a minimal Debian, say)? Sign in as root (<code>su -</code>), ' +
+      '<code>apt install python3</code> if it\'s missing, and run the same command without <code>sudo</code>.</p>' +
+      '<p class="rnote">To remove it: <code>sudo python3 omnitop-agent.py --uninstall</code></p>';
   } else {
     html = '<h3>Installing the agent on Windows</h3>' +
       (rOldAgent === 'windows' ? '<p class="rnote">This PC runs an older agent, which sends no memory. These steps replace it.</p>' : '') + '<ol>' +

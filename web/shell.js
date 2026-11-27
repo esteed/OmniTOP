@@ -166,9 +166,10 @@ function connect() {
     if (m.id === portsOf) onTick(m);
   });
   es.addEventListener('probe', ev => onProbe(JSON.parse(ev.data)));
-  // scan: watch.js; sys and rmem: memory.js; perf and perfmeta: perf.js
+  // scan: watch.js; sys and rmem: memory.js; perf, perfmeta and lat: perf.js
   for (const [kind, listeners] of [['scan', scanListeners], ['sys', sysListeners], ['rmem', rmemListeners],
-                                   ['perf', perfListeners.perf], ['perfmeta', perfListeners.perfmeta]]) {
+                                   ['perf', perfListeners.perf], ['perfmeta', perfListeners.perfmeta],
+                                   ['lat', perfListeners.lat], ['found', perfListeners.found]]) {
     es.addEventListener(kind, ev => {
       const m = JSON.parse(ev.data);
       for (const f of listeners) f(m);
