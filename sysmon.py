@@ -1154,14 +1154,14 @@ class DemoSystem:
     """Plausible made-up numbers: 32 GB of RAM with the usual gap below 4 GB, a 24 GB GPU.
 
     remote: a made-up remote machine's number instead, with as much as an agent sends;
-    linux: what the Linux agent sends.
+    linux: what the Linux agent sends; mac: what it sends on a Mac.
     """
 
     SLICE = 128 << 20
 
-    def __init__(self, remote: int | None = None, linux: bool = False) -> None:
+    def __init__(self, remote: int | None = None, linux: bool = False, mac: bool = False) -> None:
         self.rng = rng = random.Random()
-        self.remote, self.linux = remote, linux
+        self.remote, self.linux, self.mac = remote, linux, mac
         self.size = 32 * GB if remote is None else (8, 64, 16, 32)[remote % 4] * GB
         self.t0 = time.monotonic()
         self.level = 0.5                                             # share of usable RAM in use
@@ -1239,7 +1239,29 @@ class DemoSystem:
                 "commit": None, "swap": {"total": 4 * GB, "used": int(self.swap)},
                 "cpu": round(max(1.0, rng.gauss(12, 3)), 1), "gpu": None, "gpuErr": None}
 
+    def _mac(self, w: float) -> dict:
+        """What a Mac's agent sends: app memory, wired, compressed; cached files; free."""
+        rng = self.rng
+        total = self.size
+        self.level = min(0.85, max(0.3, self.level + rng.gauss(0, 0.004) * w))
+        inuse = total * self.level
+        cache = (total - inuse) * 0.7
+        free = total - inuse - cache
+        shares = [("proc", 0.58), ("wired", 0.22), ("comp", 0.14), ("kernel", 0.06)]
+        names = [("WindowServer", 0.6), ("Safari", 1.8), ("Xcode", 2.4), ("Photos", 1.0), ("mds_stores", 0.4), ("Finder", 0.2),
+                 ("Mail", 0.5), ("Music", 0.3)]
+        k = inuse * 0.58 / sum(s for _, s in names)
+        top = [[n, int(s * k), int(s * k), 0, 1] for n, s in sorted(names, key=lambda x: -x[1])]
+        return {"ram": {"installed": total, "total": total, "avail": int(cache + free), "err": None, "countersErr": None,
+                        "lists": {"free": int(free), "modified": 0, "standby": [0, int(cache), 0]},
+                        "uses": [[n, int(inuse * f)] for n, f in shares], "kernel": [], "pagedAll": 0,
+                        "progs": {"top": top, "other": [int(inuse * 0.05), 120, 300], "total": int(inuse * 0.63)}},
+                "commit": None, "swap": {"total": 2 * GB, "used": int(self.swap * 0.5)},
+                "cpu": round(max(1.0, rng.gauss(10, 3)), 1), "gpu": None, "gpuErr": None}
+
     def sample(self, dt: float = 1.0) -> dict:
+        if self.mac:
+            return self._mac(math.sqrt(max(0.01, min(1.0, dt))))
         if self.linux:
             return self._linux(math.sqrt(max(0.01, min(1.0, dt))))
         # Random walks step by sqrt(dt), so they wander as fast at any sample rate.

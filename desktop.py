@@ -14,13 +14,18 @@ Run from source with:  python desktop.py [--demo]   (needs pywebview)
 """
 from __future__ import annotations
 
+import os
+import sys
+
+if os.environ.get("OMNITOP_ASKPASS") == "1":   # ssh asking for a password, for pushinstall.py: answer, and stop
+    import pushinstall
+    sys.exit(pushinstall.askpass(sys.argv[1:]))
+
 import argparse
 import ctypes
 import html
-import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time

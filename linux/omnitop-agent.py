@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OmniTOP's agent for Linux: lets OmniTOP on a Windows PC watch this machine.
+"""OmniTOP's agent for Linux and macOS: lets OmniTOP on a Windows PC watch this machine.
 
     sudo python3 omnitop-agent.py --install              start with the system (systemd)
     sudo python3 omnitop-agent.py --uninstall            remove it again
@@ -53,7 +53,7 @@ try:
 except ImportError:          # the tests run on Windows
     pwd = None
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 PROTOCOL = 2
 DEFAULT_PORT = 7820
 DEFAULT_MS, MIN_MS, MAX_MS = 1000, 10, 10000
@@ -78,6 +78,8 @@ PORTS_SOCKET = "/run/omnitop-agent/ports"
 MIN_PORTS_MS = 100
 
 ROOT = ""                    # tests read a made-up /proc and /sys from here
+MAC = sys.platform == "darwin"   # macOS: see the end, where what differs is put in place
+OS_ID = "macos" if MAC else "linux"
 
 
 def now():
@@ -392,6 +394,8 @@ def gather(spec):
     if asked:
         here = mount_points()
         out["statvfs"] = {m: STATVFS.get(m) for m in (here if "*" in asked else [m for m in asked if m in here])[:256]}
+    if MAC and spec.get("iokit"):
+        out["iokit"] = mac_iokit_feed()
     nv = spec.get("nvidia")
     if isinstance(nv, dict):
         out["nvidia"] = {"gpu": nvidia_rows("gpu", nv.get("gpu") or []), "apps": nvidia_rows("compute-apps", nv.get("apps") or [])}
@@ -1156,6 +1160,9 @@ class Helper(object):
     @staticmethod
     def allowed(conn):
         """Root, or the agent's service: nobody else on this machine."""
+        if MAC:                                        # LOCAL_PEERCRED: a struct xucred; the agent runs as nobody
+            uid = struct.unpack_from("=I", conn.getsockopt(0, 1, 76), 4)[0]
+            return uid in (0, os.geteuid(), 0xFFFFFFFE)
         pid, uid, _ = struct.unpack("=iII", conn.getsockopt(socket.SOL_SOCKET, 17, 12))   # SO_PEERCRED
         return uid == 0 or uid == os.geteuid() or ("/%s.service" % NAME) in (read("/proc/%d/cgroup" % pid) or "")
 
@@ -1462,7 +1469,8 @@ class PortsLink(object):
             self._tell()
             if ms and self.conn is None:               # nobody to ask: say so, rather than send nothing
                 viewer.post("portsinfo " + json.dumps({"dynamic": dynamic_range(), "udp": False, "error":
-                            "The omnitop-agent-ports service isn't answering (sudo systemctl status omnitop-agent-ports says why)."}) + "\n")
+                            "The omnitop-agent-ports service isn't answering (%s says why)." % (
+                                "sudo launchctl print system/" + MAC_PORTS_LABEL if MAC else "sudo systemctl status omnitop-agent-ports")}) + "\n")
 
     def forget(self, viewer):
         with self.lock:
@@ -1611,7 +1619,7 @@ def ipv4_address(name):
         import fcntl
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            r = fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", name[:15].encode()))   # SIOCGIFADDR
+            r = fcntl.ioctl(s.fileno(), 0xc0206921 if MAC else 0x8915, struct.pack("256s", name[:15].encode()))   # SIOCGIFADDR
             return socket.inet_ntoa(r[20:24])
         finally:
             s.close()
@@ -1643,7 +1651,10 @@ def on_device(s, device):
     """Send through that adapter, whatever the routes say. Unprivileged since Linux 5.7; elsewhere, the address it's from does."""
     if device:
         try:
-            s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), device.encode()[:15] + b"\0")
+            if MAC:                                    # IP_BOUND_IF, by the adapter's index
+                s.setsockopt(socket.IPPROTO_IP, 25, socket.if_nametoindex(device))
+            else:
+                s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), device.encode()[:15] + b"\0")
         except OSError:
             pass
 
@@ -1695,6 +1706,7 @@ class Pinger(object):
                 raise OSError(exc.errno, "this account may not ping (net.ipv4.ping_group_range)")
             self.raw = True
         self.ident = (os.getpid() ^ id(self)) & 0xFFFF
+        self.own = self.raw or MAC                     # the checksum and identifier are ours, and replies come with IP headers
         on_device(self.s, device)
         if source:
             try:
@@ -1706,7 +1718,7 @@ class Pinger(object):
         """The round trip in ms, or None if no answer came in time."""
         self.seq = (self.seq + 1) & 0xFFFF
         packet = struct.pack("!BBHHH", 8, 0, 0, self.ident, self.seq) + ECHO_PAYLOAD
-        if self.raw:
+        if self.own:
             packet = packet[:2] + struct.pack("!H", icmp_checksum(packet)) + packet[4:]
         start = time.perf_counter()
         self.s.sendto(packet, (self.dest, 0))
@@ -1720,12 +1732,12 @@ class Pinger(object):
             except socket.timeout:
                 return None
             took = (time.perf_counter() - start) * 1000
-            if self.raw:                               # with its IP header
-                data = data[(data[0] & 15) * 4:] if data else b""
+            if self.own and data and data[0] >> 4 == 4:    # with its IP header
+                data = data[(data[0] & 15) * 4:]
             if there[0] != self.dest or len(data) < 8:
                 continue
             kind, _, _, ident, seq = struct.unpack("!BBHHH", data[:8])
-            if kind == 0 and seq == self.seq and (not self.raw or ident == self.ident):
+            if kind == 0 and seq == self.seq and (not self.own or ident == self.ident):
                 return took
 
     def close(self):
@@ -2057,6 +2069,8 @@ class Memory(object):
             return self.value
 
     def _sample(self):
+        if MAC:
+            return self._mac_sample()
         m = meminfo()
         g = m.get
         total, free = g("MemTotal", 0), g("MemFree", 0)
@@ -2083,6 +2097,16 @@ class Memory(object):
                         "progs": self.programs.sample()},
                 "commit": None, "swap": {"total": swap, "used": max(0, swap - g("SwapFree", 0))},
                 "cpu": round(cpu[0], 1) if cpu else None, "gpu": self.gpu.sample(), "gpuErr": None}
+
+
+    def _mac_sample(self):
+        r = mac_memory() or {"installed": 0, "total": 0, "avail": 0, "uses": [], "lists": {"free": 0, "modified": 0, "standby": [0, 0, 0]},
+                             "swap": {"total": 0, "used": 0}}
+        cpu = self.cpu.read()
+        return {"ram": {"installed": r["installed"], "total": r["total"], "avail": r["avail"], "err": None, "countersErr": None,
+                        "lists": r["lists"], "uses": [list(p) for p in r["uses"]], "kernel": [], "pagedAll": 0,
+                        "progs": self.programs.sample()},
+                "commit": None, "swap": r["swap"], "cpu": round(cpu[0], 1) if cpu else None, "gpu": None, "gpuErr": None}
 
 
 # ---------------------------------------------------------------------------
@@ -2476,16 +2500,18 @@ class Server(object):
 
     def hello(self, cpus):
         host = word(socket.gethostname()) or "unknown"
-        kernel = (read("/proc/sys/kernel/osrelease", 128) or "unknown").strip().replace(" ", "_")
-        return "cpugraph-agent %d host=%s cpus=%d kernel=%s version=%s os=linux omni=2 can=%s\n" % (
-            PROTOCOL, host, cpus, kernel, VERSION, CAN + (",ports,portsnet,procio" if self.link.available() else ""))
+        kernel = (read("/proc/sys/kernel/osrelease", 128) or os.uname().release or "unknown").strip().replace(" ", "_")
+        extra = (",procio" if MAC else ",ports,portsnet,procio") if self.link.available() else ""   # a Mac's ports: not yet
+        return "cpugraph-agent %d host=%s cpus=%d kernel=%s version=%s os=%s omni=2 can=%s\n" % (
+            PROTOCOL, host, cpus, kernel, VERSION, OS_ID, CAN + extra)
 
     @staticmethod
     def system_line():
         boot = re.search(r"^btime (\d+)", read("/proc/stat") or "", re.M)
-        return "sys " + json.dumps({"os": "linux", "system": system_name(), "distribution": distribution(),
+        boot = int(boot.group(1)) if boot else (struct.unpack_from("=q", mac_sysctl_raw("kern.boottime"))[0] if MAC else 0)
+        return "sys " + json.dumps({"os": OS_ID, "system": system_name(), "distribution": distribution(),
                                     "machine": os.uname().machine if hasattr(os, "uname") else "",
-                                    "boot": int(boot.group(1)) if boot else 0, "python": sys.version.split()[0]}) + "\n"
+                                    "boot": boot, "python": sys.version.split()[0]}) + "\n"
 
     def serve(self):
         self.sock.settimeout(0.5)                      # so Ctrl+C and stop() are noticed
@@ -2685,8 +2711,8 @@ def check():
     try:
         with socket.create_connection(("127.0.0.1", srv.port), timeout=5) as c:
             c.settimeout(3)
-            c.sendall(b'interval 100\nnet all\ndisk all\nmem 250\nfeed check sample {"files": ["/proc/stat"]}\n'
-                      b'ports 100\nprobes on\nport 22\n')
+            c.sendall(b'interval 100\nnet all\ndisk all\nmem 250\nfeed check sample ' +
+                      (b'{"iokit": ["*"]}' if MAC else b'{"files": ["/proc/stat"]}') + b'\nports 100\nprobes on\nport 22\n')
             lines, deadline = c.makefile("rb"), time.monotonic() + 8
             while (wanted or ports) and time.monotonic() < deadline:
                 line = lines.readline()
@@ -2697,8 +2723,9 @@ def check():
                 ports.discard(word)
                 if word == "cpugraph-agent" and b",ports" not in line:
                     ports.clear()
-                    about = "It can't see ports: that takes root, or the installed omnitop-agent-ports service."
-                if word == "portsinfo" and b'"udp": false' in line:
+                    about = ("Ports of Macs aren't shown yet." if MAC else
+                             "It can't see ports: that takes root, or the installed omnitop-agent-ports service.")
+                if word == "portsinfo" and b'"udp": false' in line and ports:
                     about = "It sees TCP, but not UDP or probes: " + line.decode("utf-8", "replace").split('"error": ')[-1].strip(' }\n')
     except OSError as exc:
         said.append(str(exc))
@@ -2867,11 +2894,519 @@ def uninstall():
     return 0
 
 
+# ---------------------------------------------------------------------------
+# macOS: the same figures from Mach, sysctl, IOKit and libproc, through ctypes, so it's
+# still one file and needs nothing but the Python the Command Line Tools bring. What
+# differs from Linux is replaced here, below everything else; the protocol, the viewers,
+# the feeds and the helper service are the same. Installed, it's two launchd daemons:
+# the agent as nobody, and the helper as root (for processes' disk I/O).
+# ---------------------------------------------------------------------------
+MAC_LABEL, MAC_PORTS_LABEL = "org.omnitop.agent", "org.omnitop.agent-ports"
+MAC_PLIST = "/Library/LaunchDaemons/%s.plist" % MAC_LABEL
+MAC_PORTS_PLIST = "/Library/LaunchDaemons/%s.plist" % MAC_PORTS_LABEL
+MAC_LOG = "/var/log/omnitop-agent.log"              # the agent's, which runs as nobody: it's made theirs
+MAC_PORTS_LOG = "/var/log/omnitop-agent-ports.log"
+MAC_USER = "nobody"
+MAC_FIREWALL = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+
+if MAC:
+    import ctypes.util
+    import plistlib
+
+    _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    _iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+    _cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    _proc = ctypes.CDLL("/usr/lib/libproc.dylib") if os.path.exists("/usr/lib/libproc.dylib") else _libc
+    c_uint, c_int, c_size_t, c_void_p = ctypes.c_uint, ctypes.c_int, ctypes.c_size_t, ctypes.c_void_p
+    _libc.sysctlbyname.argtypes = [ctypes.c_char_p, c_void_p, ctypes.POINTER(c_size_t), c_void_p, c_size_t]
+    _libc.sysctl.argtypes = [ctypes.POINTER(c_int), c_uint, c_void_p, ctypes.POINTER(c_size_t), c_void_p, c_size_t]
+    _libc.mach_host_self.restype = c_uint
+    _libc.host_processor_info.argtypes = [c_uint, c_int, ctypes.POINTER(c_uint), ctypes.POINTER(ctypes.POINTER(c_int)),
+                                          ctypes.POINTER(c_uint)]
+    _libc.host_statistics64.argtypes = [c_uint, c_int, c_void_p, ctypes.POINTER(c_uint)]
+    _libc.vm_deallocate.argtypes = [c_uint, c_size_t, c_size_t]
+    _proc.proc_listallpids.argtypes = [c_void_p, c_int]
+    _proc.proc_pid_rusage.argtypes = [c_int, c_int, c_void_p]
+    _proc.proc_name.argtypes = [c_int, c_void_p, c_uint]
+    _iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+    _iokit.IOServiceMatching.restype = c_void_p
+    _iokit.IOServiceGetMatchingServices.argtypes = [c_uint, c_void_p, ctypes.POINTER(c_uint)]
+    _iokit.IOIteratorNext.argtypes = [c_uint]
+    _iokit.IOIteratorNext.restype = c_uint
+    _iokit.IOObjectRelease.argtypes = [c_uint]
+    _iokit.IORegistryEntryCreateCFProperty.argtypes = [c_uint, c_void_p, c_void_p, c_uint]
+    _iokit.IORegistryEntryCreateCFProperty.restype = c_void_p
+    _iokit.IORegistryEntryGetChildEntry.argtypes = [c_uint, ctypes.c_char_p, ctypes.POINTER(c_uint)]
+    _iokit.IORegistryEntryGetParentEntry.argtypes = [c_uint, ctypes.c_char_p, ctypes.POINTER(c_uint)]
+    _cf.CFStringCreateWithCString.argtypes = [c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    _cf.CFStringCreateWithCString.restype = c_void_p
+    _cf.CFDictionaryGetValue.argtypes = [c_void_p, c_void_p]
+    _cf.CFDictionaryGetValue.restype = c_void_p
+    _cf.CFNumberGetValue.argtypes = [c_void_p, c_int, c_void_p]
+    _cf.CFNumberGetValue.restype = ctypes.c_bool
+    _cf.CFStringGetCString.argtypes = [c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+    _cf.CFStringGetCString.restype = ctypes.c_bool
+    _cf.CFGetTypeID.argtypes = [c_void_p]
+    _cf.CFGetTypeID.restype = ctypes.c_ulong
+    _cf.CFStringGetTypeID.restype = ctypes.c_ulong
+    _cf.CFNumberGetTypeID.restype = ctypes.c_ulong
+    _cf.CFDictionaryGetTypeID.restype = ctypes.c_ulong
+    _cf.CFRelease.argtypes = [c_void_p]
+    _MACH_TASK = c_uint.in_dll(_libc, "mach_task_self_")
+    _UTF8 = 0x08000100
+
+    def mac_sysctl(name, kind=ctypes.c_int64):
+        """A number sysctl knows by name, or None."""
+        v, size = kind(), c_size_t(ctypes.sizeof(kind))
+        if _libc.sysctlbyname(name.encode(), ctypes.byref(v), ctypes.byref(size), None, 0):
+            return None
+        return v.value
+
+    def mac_sysctl_raw(name=None, mib=None):
+        """What sysctl has under a name, or a MIB, as bytes; b"" if nothing."""
+        size = c_size_t(0)
+        args = (lambda buf, sz: _libc.sysctlbyname(name.encode(), buf, sz, None, 0)) if name else \
+            (lambda buf, sz: _libc.sysctl((c_int * len(mib))(*mib), len(mib), buf, sz, None, 0))
+        for _ in range(3):                                 # it can grow between asking how big and reading it
+            if args(None, ctypes.byref(size)) or not size.value:
+                return b""
+            buf = ctypes.create_string_buffer(size.value + 4096)
+            size = c_size_t(len(buf))
+            if args(buf, ctypes.byref(size)) == 0:
+                return buf.raw[:size.value]
+        return b""
+
+    def _cfstr(text):
+        return _cf.CFStringCreateWithCString(None, text.encode(), _UTF8)
+
+    def _cfvalue(ref):
+        """A CF string, number or dictionary (whose keys are strings) as Python."""
+        if not ref:
+            return None
+        kind = _cf.CFGetTypeID(ref)
+        if kind == _cf.CFStringGetTypeID():
+            buf = ctypes.create_string_buffer(1024)
+            return buf.value.decode("utf-8", "replace") if _cf.CFStringGetCString(ref, buf, len(buf), _UTF8) else None
+        if kind == _cf.CFNumberGetTypeID():
+            v = ctypes.c_int64()
+            return v.value if _cf.CFNumberGetValue(ref, 4, ctypes.byref(v)) else None    # kCFNumberSInt64Type
+        return ref                                          # a dictionary: looked into with _cfget
+
+    def _cfget(d, key):
+        k = _cfstr(key)
+        try:
+            return _cfvalue(_cf.CFDictionaryGetValue(d, k)) if d else None
+        finally:
+            _cf.CFRelease(k)
+
+    def _ioprop(entry, key):
+        """A property of an IORegistry entry: (value, the reference to release) - a dictionary must be looked into first."""
+        k = _cfstr(key)
+        try:
+            ref = _iokit.IORegistryEntryCreateCFProperty(entry, k, None, 0)
+        finally:
+            _cf.CFRelease(k)
+        return _cfvalue(ref), ref
+
+    class MacCpu(object):
+        """Busy % of all CPUs and of each, from Mach's per-processor ticks."""
+
+        def __init__(self):
+            self.last = None
+            self.n = max(1, len(self._times()) - 1)
+
+        @staticmethod
+        def _times():
+            count, info, size = c_uint(), ctypes.POINTER(c_int)(), c_uint()
+            if _libc.host_processor_info(_libc.mach_host_self(), 2, ctypes.byref(count), ctypes.byref(info), ctypes.byref(size)):
+                return []                                   # PROCESSOR_CPU_LOAD_INFO: user, system, idle, nice per CPU
+            try:
+                cpus = []
+                for i in range(count.value):
+                    user, system, idle, nice = (info[4 * i + j] & 0xFFFFFFFF for j in range(4))
+                    cpus.append(("cpu%d" % i, user + system + nice, user + system + nice + idle))
+            finally:
+                _libc.vm_deallocate(_MACH_TASK.value, ctypes.cast(info, c_void_p).value or 0, size.value * 4)
+            return [("cpu", sum(c[1] for c in cpus), sum(c[2] for c in cpus))] + cpus
+
+        read = Cpu.read
+
+    class vm_statistics64(ctypes.Structure):
+        _fields_ = [("free_count", ctypes.c_uint32), ("active_count", ctypes.c_uint32), ("inactive_count", ctypes.c_uint32),
+                    ("wire_count", ctypes.c_uint32), ("zero_fill_count", ctypes.c_uint64), ("reactivations", ctypes.c_uint64),
+                    ("pageins", ctypes.c_uint64), ("pageouts", ctypes.c_uint64), ("faults", ctypes.c_uint64),
+                    ("cow_faults", ctypes.c_uint64), ("lookups", ctypes.c_uint64), ("hits", ctypes.c_uint64),
+                    ("purges", ctypes.c_uint64), ("purgeable_count", ctypes.c_uint32), ("speculative_count", ctypes.c_uint32),
+                    ("decompressions", ctypes.c_uint64), ("compressions", ctypes.c_uint64), ("swapins", ctypes.c_uint64),
+                    ("swapouts", ctypes.c_uint64), ("compressor_page_count", ctypes.c_uint32),
+                    ("throttled_count", ctypes.c_uint32), ("external_page_count", ctypes.c_uint32),
+                    ("internal_page_count", ctypes.c_uint32), ("total_uncompressed_pages_in_compressor", ctypes.c_uint64)]
+
+    def mac_memory():
+        """The RAM as the memory page shows it: {"installed", "total", "avail", "uses", "lists", "swap"}.
+
+        In use: what programs have (App Memory), what's wired down, and what the compressor holds;
+        cached: file-backed and purgeable pages, given up as soon as programs want them; free.
+        """
+        vs, count = vm_statistics64(), c_uint(ctypes.sizeof(vm_statistics64) // 4)
+        if _libc.host_statistics64(_libc.mach_host_self(), 4, ctypes.byref(vs), ctypes.byref(count)):   # HOST_VM_INFO64
+            return None
+        page = mac_sysctl("vm.pagesize") or mac_sysctl("hw.pagesize") or 4096
+        total = mac_sysctl("hw.memsize") or 0
+        free = vs.free_count * page
+        cache = (vs.external_page_count + vs.purgeable_count) * page
+        inuse = max(0, total - free - cache)
+        parts = [("proc", max(0, vs.internal_page_count - vs.purgeable_count) * page), ("wired", vs.wire_count * page),
+                 ("comp", vs.compressor_page_count * page)]
+        known = sum(b for _, b in parts)
+        scale = min(1.0, float(inuse) / known) if known else 0.0
+        parts = [(k, int(b * scale)) for k, b in parts]
+        parts.append(("kernel", max(0, inuse - sum(b for _, b in parts))))
+        raw = mac_sysctl_raw("vm.swapusage")               # xsw_usage: total, avail, used, page size, encrypted
+        swap_total, _, swap_used = struct.unpack_from("=QQQ", raw) if len(raw) >= 24 else (0, 0, 0)
+        return {"installed": total, "total": total, "avail": free + cache, "uses": parts,
+                "lists": {"free": free, "modified": 0, "standby": [0, cache, 0]}, "swap": {"total": swap_total, "used": swap_used}}
+
+    def mac_pids():
+        n = _proc.proc_listallpids(None, 0)
+        if n <= 0:
+            return []
+        buf = (c_int * (n + 64))()
+        got = _proc.proc_listallpids(buf, ctypes.sizeof(buf))
+        return [p for p in buf[:max(0, got)] if p > 0]
+
+    def mac_rusage(pid):
+        """(physical footprint, bytes read from disk, bytes written to disk) of a process, or None (another
+        account's, without root). rusage_info_v2."""
+        buf = ctypes.create_string_buffer(256)
+        if _proc.proc_pid_rusage(pid, 2, buf):
+            return None
+        return struct.unpack_from("=Q", buf.raw, 72)[0], struct.unpack_from("=Q", buf.raw, 144)[0], struct.unpack_from("=Q", buf.raw, 152)[0]
+
+    def mac_name(pid):
+        buf = ctypes.create_string_buffer(256)
+        n = _proc.proc_name(pid, buf, len(buf))
+        return printable(buf.raw[:n].decode("utf-8", "replace"), 32) if n > 0 else "PID %d" % pid
+
+    class MacPrograms(Programs):
+        """RAM each program uses (its physical footprint, as Activity Monitor shows it), added up by name. Other
+        accounts' processes take root to see."""
+
+        def sample(self):
+            mono = time.monotonic()
+            if self.value is not None and mono < self.at:
+                return self.value
+            self.at = mono + self.EVERY
+            progs = {}
+            for pid in mac_pids():
+                r = mac_rusage(pid)
+                if r is None or not r[0]:
+                    continue
+                g = progs.setdefault(mac_name(pid), [0, 0, 0, 0])
+                g[0] += r[0]
+                g[1] += r[0]
+                g[3] += 1
+            rows = sorted(progs.items(), key=lambda kv: kv[1][0], reverse=True)
+            rest = rows[TOP_PROGRAMS:]
+            self.value = {"top": [[n] + v for n, v in rows[:TOP_PROGRAMS]],
+                          "other": [sum(v[0] for _, v in rest), sum(v[3] for _, v in rest), len(rest)],
+                          "total": sum(v[0] for _, v in rows)}
+            return self.value
+
+    class MacProcIO(ProcIO):
+        """Every process's disk I/O, from proc_pid_rusage (bytes read from and written to disk), which takes root
+        for other accounts' processes. Like Linux, not per disk, and no operations."""
+
+        def take(self):
+            mono = time.monotonic()
+            dt, self.at = (mono - self.at if self.at else None), mono
+            now_io = {}
+            for pid in mac_pids():
+                r = mac_rusage(pid)
+                if r is not None:
+                    now_io[pid] = (r[1], r[2])
+            rows = []
+            if dt:
+                for pid, (rb, wb) in now_io.items():
+                    old = self.last.get(pid)
+                    if old and (rb > old[0] or wb > old[1]):
+                        rows.append((pid, max(0, rb - old[0]) / dt, max(0, wb - old[1]) / dt))
+            self.last = now_io
+            rows.sort(key=lambda r: -(r[1] + r[2]))
+            out = [[mac_name(pid), pid, round(r, 1), round(w, 1), None, None] for pid, r, w in rows[:self.TOP]]
+            rest = rows[self.TOP:]
+            if rest:
+                out.append(["(other)", 0, round(sum(r[1] for r in rest), 1), round(sum(r[2] for r in rest), 1), None, None])
+            return {"*": out}
+
+    _ifaces = {"at": 0.0, "map": {}}
+
+    def mac_interfaces():
+        """name -> (type, flags, link bits/s, bytes received, bytes sent), from sysctl's interface list
+        (NET_RT_IFLIST2: 64-bit counters, which don't wrap at 4 GB as getifaddrs' do)."""
+        if time.monotonic() - _ifaces["at"] < 0.05:
+            return _ifaces["map"]
+        raw, out, at = mac_sysctl_raw(mib=[4, 17, 0, 0, 6, 0]), {}, 0   # CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0
+        while at + 4 <= len(raw):
+            length, kind = struct.unpack_from("=H", raw, at)[0], raw[at + 3]
+            if length < 4:
+                break
+            if kind == 0x12 and at + 32 + 80 <= len(raw):  # RTM_IFINFO2: an if_msghdr2, its if_data64 at 32
+                flags, index = struct.unpack_from("=i", raw, at + 8)[0], struct.unpack_from("=H", raw, at + 12)[0]
+                d = at + 32
+                try:
+                    name = socket.if_indextoname(index)
+                except OSError:
+                    name = ""
+                if name:
+                    out[name] = (raw[d], flags, struct.unpack_from("=Q", raw, d + 16)[0],
+                                 struct.unpack_from("=Q", raw, d + 64)[0], struct.unpack_from("=Q", raw, d + 72)[0])
+            at += length
+        _ifaces["at"], _ifaces["map"] = time.monotonic(), out
+        return out
+
+    def mac_net_counters():
+        return dict((name, (v[3], v[4])) for name, v in mac_interfaces().items())
+
+    _MAC_SKIP = re.compile(r"(lo|gif|stf|anpi|XHC|ipsec)\d")
+    _MAC_VIRTUAL = re.compile(r"(utun|bridge|awdl|llw|ap|vmnet|feth|vlan|bond|tap|tun|zt|tailscale)\d*")
+
+    def mac_adapter(name):
+        """As adapter() is on Linux: hardware ones are the en*s (Ethernet and Wi-Fi)."""
+        v = mac_interfaces().get(name)
+        if v is None or _MAC_SKIP.match(name) or v[0] == 24:   # IFT_LOOP
+            return None
+        up = bool(v[1] & 0x1) and bool(v[1] & 0x40)            # IFF_UP, IFF_RUNNING
+        card = name.startswith("en") and not _MAC_VIRTUAL.match(name)
+        speed = v[2] // 1000000 if 0 < v[2] < 10 ** 13 and v[2] != 0xFFFFFFFF else 0
+        return {"card": card, "link": "down" if not up else str(speed)}
+
+    _disks = {"at": 0.0, "map": {}}
+
+    def mac_disks():
+        """bsd name -> {"size", "model", "stats": (bytes read, bytes written, reads, writes, ns reading, ns writing)},
+        the whole disks behind IOKit's block storage drivers (not disk images)."""
+        if time.monotonic() - _disks["at"] < 0.05:
+            return _disks["map"]
+        out, it = {}, c_uint()
+        if _iokit.IOServiceGetMatchingServices(0, _iokit.IOServiceMatching(b"IOBlockStorageDriver"), ctypes.byref(it)) == 0:
+            while True:
+                drv = _iokit.IOIteratorNext(it.value)
+                if not drv:
+                    break
+                media, dev = c_uint(), c_uint()
+                try:
+                    if _iokit.IORegistryEntryGetChildEntry(drv, b"IOService", ctypes.byref(media)):
+                        continue
+                    name, ref = _ioprop(media.value, "BSD Name")
+                    if ref:
+                        _cf.CFRelease(ref)
+                    size, ref = _ioprop(media.value, "Size")
+                    if ref:
+                        _cf.CFRelease(ref)
+                    if not name or not word(name):
+                        continue
+                    stats, ref = _ioprop(drv, "Statistics")
+                    try:
+                        s = tuple(_cfget(stats, k) or 0 for k in ("Bytes (Read)", "Bytes (Write)", "Operations (Read)",
+                                                                   "Operations (Write)", "Total Time (Read)", "Total Time (Write)"))
+                    finally:
+                        if ref:
+                            _cf.CFRelease(ref)
+                    model, virtual = "", False
+                    if _iokit.IORegistryEntryGetParentEntry(drv, b"IOService", ctypes.byref(dev)) == 0:
+                        chars, ref = _ioprop(dev.value, "Device Characteristics")
+                        model = _cfget(chars, "Product Name") or ""
+                        if ref:
+                            _cf.CFRelease(ref)
+                        proto, ref = _ioprop(dev.value, "Protocol Characteristics")
+                        virtual = (_cfget(proto, "Physical Interconnect") or "") == "Virtual Interface"   # a disk image
+                        if ref:
+                            _cf.CFRelease(ref)
+                    if not virtual:
+                        out[name] = {"size": size or 0, "model": printable(model.strip(), 48), "stats": s}
+                finally:
+                    for o in (media.value, dev.value, drv):
+                        if o:
+                            _iokit.IOObjectRelease(o)
+            _iokit.IOObjectRelease(it.value)
+        _disks["at"], _disks["map"] = time.monotonic(), out
+        return out
+
+    def mac_disk_names():
+        return sorted(mac_disks(), key=lambda n: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", n)])[:MAX_ALL]
+
+    def mac_disk_counters():
+        """name -> (bytes read, bytes written, ms busy): busy is the time operations took, so with several at once,
+        more than the time it was busy (it's kept to 100% when shown)."""
+        return dict((n, (d["stats"][0], d["stats"][1], (d["stats"][4] + d["stats"][5]) // 1000000)) for n, d in mac_disks().items())
+
+    class MacDisk(object):
+        def __init__(self, name):
+            self.name, self.word = name, word(name)
+            d = mac_disks().get(name) or {}
+            self.size, self.model = d.get("size", 0), d.get("model", "")
+            self.last, self.value = None, (0.0, 0.0, 0.0)
+
+    def mac_system_name():
+        try:
+            with open("/System/Library/CoreServices/SystemVersion.plist", "rb") as f:
+                v = plistlib.load(f)
+            return printable("%s %s" % (v.get("ProductName", "macOS"), v.get("ProductUserVisibleVersion") or v.get("ProductVersion", "")))
+        except (OSError, ValueError):
+            return "macOS"
+
+    def mac_mount_points():
+        status, out = command("/sbin/mount", timeout=5)
+        points = []
+        for line in out.splitlines() if status == 0 else []:
+            m = re.match(r"^.+? on (.+) \(([^,)]+)", line)
+            if m and m.group(2) not in ("devfs", "autofs", "nullfs"):
+                points.append(m.group(1))
+        return points
+
+    def mac_gateways():
+        """adapter -> its default gateway (IPv4), from the routing table."""
+        status, out = command("/usr/sbin/netstat", "-rn", "-f", "inet", timeout=5)
+        best = {}
+        for line in out.splitlines() if status == 0 else []:
+            f = line.split()
+            if len(f) >= 4 and f[0] == "default" and re.match(r"^\d+\.\d+\.\d+\.\d+$", f[1]) and "G" in f[2]:
+                best.setdefault(f[3], f[1])                # the first one listed for each is the one used
+        return best
+
+    def mac_dynamic_range():
+        a, b = mac_sysctl("net.inet.ip.portrange.first", ctypes.c_int), mac_sysctl("net.inet.ip.portrange.last", ctypes.c_int)
+        return [a, b] if a and b else [49152, 65535]
+
+    def mac_iokit_feed():
+        """The "iokit" feed: every disk's running totals, as mac_disks has them."""
+        return dict((n, list(d["stats"])) for n, d in mac_disks().items())
+
+    # What differs from Linux, put in place
+    Cpu, Programs, ProcIO = MacCpu, MacPrograms, MacProcIO
+    Disk, disk_names, disk_counters = MacDisk, mac_disk_names, mac_disk_counters
+    net_counters, adapter = mac_net_counters, mac_adapter
+    system_name, distribution = mac_system_name, (lambda: "macos")
+    mount_points, gateways, dynamic_range = mac_mount_points, mac_gateways, mac_dynamic_range
+    PORTS_SOCKET = "/var/run/omnitop-agent/ports"
+    CAN = "feed,statvfs,iokit,echo,sites"
+
+
+def mac_plist(label, arguments, user):
+    log = MAC_PORTS_LOG if user == "root" else MAC_LOG
+    d = {"Label": label, "ProgramArguments": arguments, "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 5,
+         "StandardErrorPath": log, "StandardOutPath": log, "ProcessType": "Background"}
+    if user != "root":
+        d["UserName"] = user
+    import plistlib as _pl
+    return _pl.dumps(d)
+
+
+def mac_launchctl(plist, label, start):
+    command("launchctl", "bootout", "system/" + label, timeout=20)
+    if start:
+        return command("launchctl", "bootstrap", "system", plist, timeout=20)
+    return 0, ""
+
+
+def mac_installed_port():
+    m = re.search(rb"<string>--port</string>\s*<string>(\d+)</string>", read_whole(MAC_PLIST) or b"")
+    return int(m.group(1)) if m else 0
+
+
+def mac_firewall(python):
+    """Let python3 take connections, if the application firewall is on. Returns what was done."""
+    if not os.path.exists(MAC_FIREWALL) or "enabled" not in command(MAC_FIREWALL, "--getglobalstate")[1]:
+        return ""
+    command(MAC_FIREWALL, "--add", python)
+    command(MAC_FIREWALL, "--unblockapp", python)
+    return "Let %s through the firewall." % python
+
+
+def mac_install(port, listen, replace):
+    """--install on macOS: launchd daemons, all or nothing as on Linux."""
+    need_root("--install")
+    me, python = os.path.abspath(__file__), sys.executable
+    old = dict((p, read_whole(p)) for p in (INSTALLED, MAC_PLIST, MAC_PORTS_PLIST))
+    if not port:
+        port = mac_installed_port() or DEFAULT_PORT
+        m = re.search(rb"<string>--listen</string>\s*<string>([^<]+)</string>", old[MAC_PLIST] or b"")
+        listen = listen or (m.group(1).decode() if m else "")
+    there = port_free(port)
+    if there and old[MAC_PLIST] is None:
+        raise SystemExit("Something else answers on TCP port %d (%s). Choose another with --port." % (port, there[:60]))
+    problem = try_out(python, me)
+    if problem:
+        raise SystemExit("The agent doesn't work on this Mac: %s" % problem)
+    os.makedirs(os.path.dirname(INSTALLED), exist_ok=True)
+    args = [python, "-I", INSTALLED, "--port", str(port)] + (["--listen", listen] if listen else [])
+
+    def undo(why):
+        for path, data in old.items():
+            if data is None:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            else:
+                write_whole(path, data, 0o644)
+        for plist, label in ((MAC_PORTS_PLIST, MAC_PORTS_LABEL), (MAC_PLIST, MAC_LABEL)):
+            mac_launchctl(plist, label, old[plist] is not None)
+        raise SystemExit("%s%s" % (why, " The version that was there runs again." if old[MAC_PLIST] else ""))
+
+    with open(me, "rb") as f:
+        write_whole(INSTALLED, f.read(), 0o644)
+    try:                                               # its log, which launchd opens as the account it runs as
+        with open(MAC_LOG, "a"):
+            pass
+        who = pwd.getpwnam(MAC_USER)
+        os.chown(MAC_LOG, who.pw_uid, who.pw_gid)
+    except (OSError, KeyError, AttributeError):
+        pass
+    write_whole(MAC_PORTS_PLIST, mac_plist(MAC_PORTS_LABEL, [python, "-I", INSTALLED, "--ports-helper", "--port", str(port)], "root"), 0o644)
+    write_whole(MAC_PLIST, mac_plist(MAC_LABEL, args, MAC_USER), 0o644)
+    for plist, label in ((MAC_PORTS_PLIST, MAC_PORTS_LABEL), (MAC_PLIST, MAC_LABEL)):
+        status, out = mac_launchctl(plist, label, True)
+        if status:
+            undo("launchctl couldn't start %s: %s." % (label, out))
+    for _ in range(20):
+        time.sleep(0.5)
+        if port_free(port).startswith("cpugraph-agent") and "version=%s " % VERSION in port_free(port) + " ":
+            break
+    else:
+        said = command("launchctl", "print", "system/" + MAC_LABEL, timeout=10)[1]
+        state = " ".join(re.findall(r"^\s*(?:state|last exit code|last exit reason|job state) = .*$", said, re.M)[:4])
+        tail = (read_whole(MAC_LOG) or b"").decode("utf-8", "replace").strip().splitlines()[-3:]
+        undo("The new version was installed, but it isn't answering on TCP port %d. launchd: %s %s" % (
+            port, " ".join(state.split()) or "-", " / ".join(tail)))
+    done = mac_firewall(python)
+    print("omnitop-agent %s is running on TCP port %d and starts with the Mac.%s" % (VERSION, port, " " + done if done else ""))
+    return 0
+
+
+def mac_uninstall():
+    need_root("--uninstall")
+    for plist, label in ((MAC_PLIST, MAC_LABEL), (MAC_PORTS_PLIST, MAC_PORTS_LABEL)):
+        mac_launchctl(plist, label, False)
+        try:
+            os.remove(plist)
+        except OSError:
+            pass
+    try:
+        os.remove(INSTALLED)
+        os.rmdir(os.path.dirname(INSTALLED))
+    except OSError:
+        pass
+    print("omnitop-agent is removed.")
+    return 0
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Lets OmniTOP on a Windows PC watch this Linux machine.")
+    ap = argparse.ArgumentParser(description="Lets OmniTOP on a Windows PC watch this machine (Linux or macOS).")
     ap.add_argument("--port", type=int, default=0, help="TCP port (default %d, or the one it was installed with)" % DEFAULT_PORT)
     ap.add_argument("--listen", default="", help="an address to listen on (default all)")
-    ap.add_argument("--install", action="store_true", help="start with the system (systemd)")
+    ap.add_argument("--install", action="store_true", help="start with the system (systemd; launchd on a Mac)")
     ap.add_argument("--replace", action="store_true", help="with --install: stop cpugraph-agent if it has the port")
     ap.add_argument("--uninstall", action="store_true", help="remove the installed agent")
     ap.add_argument("--ports-helper", action="store_true", help=argparse.SUPPRESS)   # the omnitop-agent-ports service
@@ -2887,9 +3422,9 @@ def main():
     if args.ports_helper:
         return ports_helper(args.port or DEFAULT_PORT)
     if args.install:
-        return install(args.port, args.listen, args.replace)
+        return (mac_install if MAC else install)(args.port, args.listen, args.replace)
     if args.uninstall:
-        return uninstall()
+        return mac_uninstall() if MAC else uninstall()
     return run(args.listen, args.port or DEFAULT_PORT)
 
 

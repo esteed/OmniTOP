@@ -60,8 +60,18 @@ const LINUX_KINDS = {
   free: { name: 'Free', tip: 'Memory holding nothing.' },
   hw: { name: 'Reserved', tip: 'RAM the firmware and the kernel itself set aside at start-up.' },
 };
+// What macOS calls them (as Activity Monitor does), and the kinds only it has
+const MAC_KINDS = {
+  proc: { name: 'App memory', tip: "Programs' own memory: their data, heaps and stacks." },
+  wired: { name: 'Wired', color: 'nonpaged', tip: "Memory that can't be compressed or written out: the kernel's, and what drivers and programs have locked." },
+  comp: { name: 'Compressed', tip: 'Memory macOS has compressed to keep it in RAM instead of writing it to the swap file.' },
+  kernel: { name: 'Other', tip: "Memory in use that the counters don't single out." },
+  standby: { name: 'Cached files', tip: 'File data and purgeable memory kept in case they are needed again. macOS gives it up as soon as programs want memory.' },
+  free: { name: 'Free', tip: 'Memory holding nothing.' },
+  hw: { name: 'Reserved', tip: 'RAM the firmware and the system set aside.' },
+};
 const IN_USE = new Set(['proc', 'apps', 'comp', 'mapped', 'cache', 'shared', 'paged', 'nonpaged', 'ptables', 'kernel',
-  'drivers', 'huge', 'slab']);
+  'drivers', 'huge', 'slab', 'wired']);
 
 // OKLCH; checked for color-vision deficiencies between neighbours on the bar
 const MPAL = {
@@ -81,7 +91,9 @@ const MPAL = {
   },
 };
 let MC = {};                                       // palette name -> css color
-const kindOf = k => (mem.os === 'linux' && LINUX_KINDS[k]) || KINDS[k] || { name: k, tip: '' };
+const kindOf = k => (mem.os === 'macos' && MAC_KINDS[k]) || (mem.os === 'linux' && LINUX_KINDS[k]) || KINDS[k] || { name: k, tip: '' };
+const memUnix = () => mem.os === 'linux' || mem.os === 'macos';
+const memOsName = () => ({ linux: 'Linux', macos: 'macOS' }[mem.os] || 'Windows');
 const kindColor = k => MC[kindOf(k).color || k] || MC.hw;
 
 const mstage = $('mstage'), mcv = $('mcv'), mtip = $('mtip');
@@ -682,7 +694,7 @@ function drawDim(x0, x1, y, name, value, color, key, over) {
   hit(Math.min(x0, tx), y - 9, Math.max(end, tx + tw), y + 9, { kind: 'dim', key });
 }
 
-const ramSubtitle = r => `${capacity(r.installed)} GB installed · ${(r.total / GiB).toFixed(1)} GB usable by ${mem.os === 'linux' ? 'Linux' : 'Windows'}`;
+const ramSubtitle = r => `${capacity(r.installed)} GB installed · ${(r.total / GiB).toFixed(1)} GB usable by ${memOsName()}`;
 
 function drawRam(look = 'full') {
   const m = mem.last, r = m.ram, sec = ML.ram, bar = { x: ML.x0, ...sec.bar };
@@ -714,7 +726,7 @@ function drawRam(look = 'full') {
   drawDim(ML.x0, usedEnd, sec.dimY[0], 'In use', fmtSize(inUse), MC.proc, 'inuse');
   if (r.lists) {
     const mod = at('modified'), sb = at('standby'), fr = at('free');
-    drawDim(sb.x0, fr.x1, sec.dimY[0], mem.os === 'linux' ? 'Cache and free' : 'Available', fmtSize(r.lists.free + msum(r.lists.standby)), MC.standby, 'avail');
+    drawDim(sb.x0, fr.x1, sec.dimY[0], memUnix() ? 'Cache and free' : 'Available', fmtSize(r.lists.free + msum(r.lists.standby)), MC.standby, 'avail');
     drawDim(mod.x0, sb.x1, sec.dimY[1], 'Cached', fmtSize(r.lists.modified + msum(r.lists.standby)), MC.modified, 'cached');
   } else {
     const av = at('avail');
@@ -811,7 +823,7 @@ function drawProgs() {
   const r = mem.last.ram, p = r.progs, sec = ML.progs, bar = { x: ML.x0, ...sec.bar };
   const count = p.top.length + p.other[2];
   drawHead(sec.headY, 'Memory by program',
-    `the ${p.top.length} biggest of ${count} programs, by ${mem.os === 'linux' ? 'memory of their own' : 'private working set'} · on the same scale as the bar above`);
+    `the ${p.top.length} biggest of ${count} programs, by ${{ linux: 'memory of their own', macos: 'physical footprint' }[mem.os] || 'private working set'} · on the same scale as the bar above`);
   const list = geom(mem.psegs, ML.x0, ML.w);
   const hk = mem.hover && mem.hover.kind === 'pseg' ? mem.hover.key : null;
   drawSegments(list, bar, s => MC[s.tone], hk, 'pseg');
@@ -1186,12 +1198,16 @@ function dimTip(key) {
   if (key === 'inuse') {
     const total = msum(uses.map(s => s.bytes));
     return tipHead(MC.proc, 'In use', fmtSize(total)) +
-      tipDesc(`Memory programs, drivers and ${mem.os === 'linux' ? 'the kernel' : 'Windows'} are using.`) +
+      tipDesc(`Memory programs, drivers and ${memUnix() ? 'the kernel' : 'Windows'} are using.`) +
       [...uses].sort((a, b) => b.bytes - a.bytes).map(s =>
         `<div class="sub">${swatch(kindColor(s.key))}${esc(kindOf(s.key).name)} ${fmtSize(s.bytes)}</div>`).join('');
   }
   if (key === 'avail') {
     const total = r.lists ? r.lists.free + msum(r.lists.standby) : r.avail;
+    if (mem.os === 'macos') {
+      return tipHead(MC.standby, 'Cache and free', fmtSize(total)) +
+        tipDesc('Cached files plus free: memory programs can get right away.');
+    }
     if (mem.os === 'linux') {
       return tipHead(MC.standby, 'Cache and free', fmtSize(total)) +
         tipDesc(`Page cache plus free. Linux reckons programs can get ${fmtSize(r.avail)} of it without swapping (MemAvailable).`);
@@ -1201,7 +1217,8 @@ function dimTip(key) {
   }
   const total = r.lists.modified + msum(r.lists.standby);
   return tipHead(MC.modified, 'Cached', fmtSize(total)) +
-    tipDesc(mem.os === 'linux' ? 'Page cache, including what is still to be written to disk.' : 'Modified plus standby: what Task Manager calls Cached.');
+    tipDesc(mem.os === 'macos' ? 'File-backed and purgeable memory macOS keeps while it can.'
+      : mem.os === 'linux' ? 'Page cache, including what is still to be written to disk.' : 'Modified plus standby: what Task Manager calls Cached.');
 }
 
 function cellTip(a) {
@@ -1245,6 +1262,9 @@ function psegTip(key) {
     return html + `<div class="sub">${s.count} more programs, ${s.procs} processes</div>` +
       tipDesc('The private working sets of every program not shown on its own.');
   }
+  if (key === 'r:shared' && mem.os === 'macos') {
+    return html + tipDesc("Memory in use that no one program owns: wired memory (the kernel's), what the compressor holds, and memory programs share.");
+  }
   if (key === 'r:shared' && mem.os === 'linux') {
     return html + tipDesc("Memory in use that no one program owns: memory programs share, tmpfs, and the kernel's own.");
   }
@@ -1253,6 +1273,10 @@ function psegTip(key) {
   }
   if (key === 'r:idle') return html + tipDesc('Cached and free memory: see the bar at the top.');
   if (key === 'r:hw') return html + tipDesc(kindOf('hw').tip);
+  if (mem.os === 'macos') {
+    return html + `<div class="sub">${s.procs} process${s.procs === 1 ? '' : 'es'}</div>` +
+      tipDesc("Physical footprint: the memory this program's processes use, as Activity Monitor's Memory column shows it.");
+  }
   if (mem.os === 'linux') {
     return html + `<div class="sub">${s.procs} process${s.procs === 1 ? '' : 'es'} · resident ${fmtSize(s.ws)}</div>` +
       tipDesc("RAM only this program's processes use: resident memory, less what's backed by files or shared.");

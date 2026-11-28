@@ -295,6 +295,27 @@ button.primary:hover { background: var(--accent-2); }
 .rscan:hover { background: #ff3b44; }
 .rscan::after { content: "\2715"; margin-left: 5px; font-size: 9px; opacity: 0.85; }
 .rscan[hidden] { display: none; }
+/* A machine whose agent is older than this OmniTOP's: a click opens the form to update it */
+.rupd {
+  max-width: 100%;
+  margin-top: 3px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 13px;
+  text-align: center;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.rupd:hover { background: var(--accent-2); }
+.rupd[hidden] { display: none; }
+.compact .rupd, .numbers .rupd { font-size: 0; white-space: nowrap; }
+.compact .rupd::before { content: attr(data-short); font-size: 10px; }
+.numbers .rupd::before { content: "Update"; font-size: 10px; }
+.compact .rupd { grid-column: 2; justify-self: start; margin-top: 1px; }
+.numbers .rupd { grid-column: 3; margin: 0; }
 .compact .rscan, .numbers .rscan { font-size: 0; white-space: nowrap; }
 .compact .rscan::before { content: attr(data-short); font-size: 10px; }
 .numbers .rscan::before { content: "Scan"; font-size: 10px; }
@@ -364,7 +385,28 @@ button.primary:hover { background: var(--accent-2); }
 .rresult:empty { display: none; }
 .rresult.good { color: var(--live); }
 .rresult.bad { color: var(--bad); }
-.rhelp { min-width: 0; padding-left: 28px; border-left: 1px solid var(--border); font-size: 13px; line-height: 1.5; color: var(--text-2); }
+.rside { min-width: 0; padding-left: 28px; border-left: 1px solid var(--border); }
+.rhelp { min-width: 0; font-size: 13px; line-height: 1.5; color: var(--text-2); }
+.rpush { margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border); font-size: 13px; line-height: 1.5; color: var(--text-2); }
+.rpush[hidden] { display: none; }
+.rpush h3 { margin: 0 0 4px; font-size: 13px; color: var(--text); }
+.rpush p { margin: 0 0 10px; }
+.rpush .rnote { margin: 8px 0 0; }
+.rpushrow { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-bottom: 8px; }
+.rpushrow label { display: flex; flex-direction: column; gap: 4px; flex: 1 1 150px; min-width: 0; font-weight: 600; color: var(--text); }
+.rpushrow input {
+  font: 14px var(--font);
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  padding: 7px 10px;
+  min-width: 0;
+}
+.rpushrow input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+.rpushrow input[aria-invalid=true] { border-color: var(--bad); }
+.rpushrow button { flex: none; }
+.rpush .rresult { margin: 0; }
 .rhelp h3 { margin: 0 0 8px; font-size: 13px; color: var(--text); }
 .rhelp ol { margin: 0; padding-left: 18px; }
 .rhelp li { margin-bottom: 9px; }
@@ -796,7 +838,7 @@ aside h2 .muted { font-weight: 400; }
   body { display: block; }
   .page { display: block; }
   .rcols { grid-template-columns: minmax(0, 1fr); }
-  .rhelp { padding: 14px 0 0; border-left: 0; border-top: 1px solid var(--border); }
+  .rside { padding: 14px 0 0; border-left: 0; border-top: 1px solid var(--border); }
   .full .rcard { grid-template-columns: 96px minmax(0, 1fr); gap: 12px; }
   .full .redit { width: 96px; }
   #rscroll { height: auto; overflow: visible; }

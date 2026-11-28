@@ -38,17 +38,28 @@ import discover
 import latency
 import netwatch
 import perfmon
+import pushinstall
 import settings as app_settings
 import sysmon
 
 # The app's version, shown in the tab bar. Raise it for each release; build.py
 # reads it from here and stamps it into the exe's file properties.
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 
 # In the packaged exe the web files are unpacked next to the bundled modules.
 HERE = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web")
 LINUX_AGENT = os.path.join(HERE, "linux", "omnitop-agent.py")
+
+
+def linux_agent_version() -> str:
+    """The version of the Linux and macOS agent this has with it (what the Remote tab offers to update to)."""
+    try:
+        with open(LINUX_AGENT, encoding="utf-8") as f:
+            m = re.search(r'^VERSION = "([^"]+)"', f.read(), re.M)
+        return m.group(1) if m else VERSION
+    except OSError:
+        return VERSION
 DEFAULT_PORT = 8787
 RATES = (20, 10, 5, 2, 1)   # samples a second the view can choose from
 DEFAULT_RATE = 20
@@ -918,6 +929,7 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
     """
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     allowed_origins = {f"http://{h}" for h in allowed_hosts}
+    pusher = pushinstall.Pusher(LINUX_AGENT, os.path.join(app_settings.APP_DIR, "known_hosts"))
 
     class Handler(BaseHTTPRequestHandler):
         server_version = f"omniTop/{VERSION}"
@@ -1095,9 +1107,19 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
             self._send(200, "application/json", json.dumps(reply).encode())
 
         def _machines(self, body: dict) -> dict:
-            """Add, change, move, remove or test a remote machine. {"error", "field"} says what's wrong with a form."""
+            """Add, change, move, remove or test a remote machine, or install its agent over SSH ("push", with
+            "user" and "password", answers {"job"}; "pushed" {"job"} says how it's going). {"error", "field"}
+            says what's wrong with a form."""
             action = body["action"]
             try:
+                if action == "push":
+                    m = app_settings.clean(body)
+                    if m["os"] not in ("linux", "macos"):
+                        raise app_settings.Invalid("os", "OmniTOP installs the agent itself on Linux and macOS.")
+                    pusher.demo = perf.mode == "demo"
+                    return pusher.start(m["address"], m["port"], body.get("user"), body.get("password"), m["os"])
+                if action == "pushed":
+                    return pusher.state(int(body["job"]))
                 if action == "test":
                     m = app_settings.clean(body)
                     if perf.mode == "demo":
@@ -1345,7 +1367,8 @@ class Server:
         self.sysmon = sysmon.SystemMonitor(self.hub, mode, ProcessNames().get)
         try:
             info = {"mode": mode, "rates": list(RATES), "host": socket.gethostname(),
-                    "version": VERSION, "services": load_services(), "dynamic": dynamic_ports()}
+                    "version": VERSION, "agent": linux_agent_version(), "services": load_services(),
+                    "dynamic": dynamic_ports()}
             self.httpd = ThreadingHTTPServer(
                 ("127.0.0.1", self.port),
                 make_handler(self.hub, info, self.port, self.rate, on_write, self.perf,

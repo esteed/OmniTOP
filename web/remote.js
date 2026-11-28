@@ -32,11 +32,14 @@ const R_LINUX = '<svg viewBox="0 0 64 64" aria-hidden="true">' +
 const R_UNKNOWN = '<svg viewBox="0 0 64 64" aria-hidden="true"><rect x="6" y="10" width="52" height="35" rx="4" fill="none" stroke="currentColor" stroke-width="3.5"/>' +
   '<path d="M24 55h16M32 45v10" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>' +
   '<text x="32" y="36" text-anchor="middle" font-size="24" font-weight="600" fill="currentColor">?</text></svg>';
+// A Mac: the Command key's sign on a key cap, not anyone's logo
+const R_MAC = '<svg viewBox="0 0 64 64" aria-hidden="true"><rect x="8" y="8" width="48" height="48" rx="11" fill="#e9ebef" stroke="#8a8f98" stroke-width="2"/>' +
+  '<path d="M26 26h12v12H26zM26 26a5 5 0 1 0-5 5h5M38 26a5 5 0 1 1 5 5h-5M26 38a5 5 0 1 1-5-5h5M38 38a5 5 0 1 0 5-5h-5" fill="none" stroke="#2b2f36" stroke-width="3" stroke-linejoin="round"/></svg>';
 const R_CROSS = '<svg class="os-x" viewBox="0 0 64 64" aria-hidden="true"><path d="M9 9 55 55M55 9 9 55"/></svg>';
 
 // The icon of a machine's operating system, crossed out if it can't be reached.
 function osIcon(os, down) {
-  return `<span class="os-icon${down ? ' down' : ''}">${os === 'windows' ? R_WINDOWS : os === 'linux' ? R_LINUX : R_UNKNOWN}${down ? R_CROSS : ''}</span>`;
+  return `<span class="os-icon${down ? ' down' : ''}">${os === 'windows' ? R_WINDOWS : os === 'linux' ? R_LINUX : os === 'macos' ? R_MAC : R_UNKNOWN}${down ? R_CROSS : ''}</span>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +58,7 @@ function rCard(id) {
   el.className = 'rcard';
   el.dataset.id = id;
   el.innerHTML = '<button type="button" class="rwho"><span class="ric"></span><span class="rname"><span class="rn"></span><span class="rip"></span></span>' +
-    '<span class="rsub"></span><span class="rscan" hidden></span></button>' +
+    '<span class="rsub"></span><span class="rscan" hidden></span><span class="rupd" hidden></span></button>' +
     '<div class="rgraphs"><canvas></canvas></div>' +
     '<span class="rnum"><span>CPU</span><b class="rcpu">–</b></span><span class="rnum"><span>Disk</span><b class="rdisk">–</b></span>' +
     '<div class="redit"><button type="button" data-do="up" title="Move up" aria-label="Move up">▲</button>' +
@@ -83,7 +86,7 @@ function rSync(meta) {
     const c = rCards.get(m.id) || rCard(m.id);
     if (rList.children[i] !== c.el) rList.insertBefore(c.el, rList.children[i] || null);
     const down = m.state === 'down', sub = down ? 'Connection Issues' : m.state === 'connecting' ? 'Connecting…' : m.system || m.address;
-    const ip = rIp(m), key = JSON.stringify([m.name, m.os, m.state, sub, m.status, m.system, m.address, ip]);
+    const ip = rIp(m), need = rAgentNeed(m), key = JSON.stringify([m.name, m.os, m.state, sub, m.status, m.system, m.address, ip, need]);
     if (key === c.key) return;
     c.key = key;
     const who = c.el.querySelector('.rwho');
@@ -92,6 +95,14 @@ function rSync(meta) {
     c.el.querySelector('.rn').textContent = m.name.replace(/([._-])(?=.)/g, '$1\u200b');   // long names break after these
     c.el.querySelector('.rip').textContent = ip === m.name ? '' : ip.replace(/([.:])(?=.)/g, '$1\u200b');
     c.el.querySelector('.rsub').textContent = sub;
+    const upd = c.el.querySelector('.rupd');
+    upd.hidden = !need;
+    if (need) {
+      upd.textContent = need.replace ? 'Replace its agent' : `Update agent ${need.agent} → ${need.newest}`;
+      upd.dataset.short = need.replace ? 'Replace agent' : 'Update agent';
+      upd.title = need.replace ? `It runs ${need.agent ? `agent ${need.agent}` : 'an older agent'}, which sends no memory. Click to replace it.`
+        : `It runs agent ${need.agent}; this OmniTOP brings ${need.newest}. Click to update it.`;
+    }
     who.title = [m.name, ip, m.system, m.address !== ip ? m.address : '', m.status, 'Click for details'].filter(Boolean).join('\n');
     who.setAttribute('aria-label', [m.name, ip, m.system, down ? `Connection Issues: ${m.status}` : '', 'details'].filter(Boolean).join(', '));
   });
@@ -106,6 +117,24 @@ function rSync(meta) {
   rInvalidate();
 }
 perfMetaListeners.push(rSync);
+
+// Whether a connected machine's agent is older than the one this OmniTOP brings: null, or
+// {agent, newest, replace}, replace when it's another kind (CPU Graph's, OmniTOP 1.9's: no memory).
+function rAgentNeed(m) {
+  if (!m || m.state !== 'ok') return null;
+  const newest = m.os === 'windows' ? pp.version : pp.agentVersion;
+  if (!m.memory) return { agent: m.agent || '', newest, replace: true };
+  return newest && m.agent && rNewer(newest, m.agent) ? { agent: m.agent, newest, replace: false } : null;
+}
+
+function rNewer(a, b) {   // whether version a is after b ("2.3.1" > "2.2.0")
+  const pa = String(a).split('.').map(x => parseInt(x, 10)), pb = String(b).split('.').map(x => parseInt(x, 10));
+  if (pa.some(Number.isNaN) || pb.some(Number.isNaN)) return false;
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
+}
 
 // The address a machine is reached at: the one its name resolved to, else what it was added with.
 function rIp(m) {
@@ -281,6 +310,7 @@ rList.addEventListener('click', ev => {
   const card = ev.target.closest('.rcard');
   if (!card) return;
   if (ev.target.closest('.rscan')) { scanNoteDismiss(card.dataset.id); return; }   // its port scan note, not the machine
+  if (ev.target.closest('.rupd')) { rOpen(card.dataset.id, true); return; }         // its older agent: the form, to update it
   const id = card.dataset.id, b = ev.target.closest('[data-do]');
   if (ev.target.closest('.rwho') || rLook === 'numbers' && !b) go({ top: 'remote', machine: id, page: 'overview' });
   else if (b && b.dataset.do === 'edit') rOpen(id);
@@ -399,6 +429,7 @@ $('rf-all').addEventListener('click', async () => {
 // ---------------------------------------------------------------------------
 const rDialog = $('rdialog'), rForm = $('rform');
 let rEditing = null, rTestNo = 0, rAsking = false, rOldAgent = '';   // rOldAgent: "linux" or "windows" if it runs an agent that's to be replaced
+let rNeed = null;   // rAgentNeed() of the machine in the form, as last seen
 
 async function rPost(body) {
   try {
@@ -410,7 +441,7 @@ async function rPost(body) {
   }
 }
 
-async function rOpen(id) {
+async function rOpen(id, toUpdate = false) {
   rEditing = null;
   if (id) {
     try {
@@ -429,12 +460,20 @@ async function rOpen(id) {
   $('rsave').textContent = rEditing ? 'Save' : 'Add machine';
   $('rremove').hidden = !rEditing;
   rOldAgent = info && info.state === 'ok' && !info.memory ? info.os : '';
+  rNeed = rAgentNeed(info);
   rAskRemove(false);
   rErrors({});
   rResult('', '');
+  rPushReset();
   rHelp();
   rDialog.showModal();
-  rForm.elements[rEditing ? 'name' : 'address'].focus();
+  if (toUpdate && !$('rpush').hidden) {   // straight to updating it
+    $('rpush').scrollIntoView({ block: 'nearest' });
+    rForm.elements[rForm.elements.puser.value ? 'ppass' : 'puser'].focus();
+  } else {
+    if (toUpdate) $('rhelp').scrollIntoView({ block: 'nearest' });
+    rForm.elements[rEditing ? 'name' : 'address'].focus();
+  }
 }
 
 const rFields = () => ({ name: rForm.elements.name.value, address: rForm.elements.address.value,
@@ -466,9 +505,10 @@ async function rTest() {
   if (a.field !== undefined) { rErrors(a); rResult('', ''); return; }
   if (!a.ok) { rResult('bad', `${a.error}. Check that the agent is installed there, and that its firewall lets TCP port ${rForm.elements.port.value || 7820} in.`); return; }
   rOldAgent = a.memory ? '' : a.os;
+  rNeed = rAgentNeed({ state: 'ok', os: a.os, agent: a.agent, memory: a.memory });
   if (a.os) rForm.elements.os.value = a.os;
   rHelp();
-  rResult('good', `Connected to ${a.host || 'it'}: ${[a.system || (a.os === 'windows' ? 'Windows' : 'Linux'), a.cpus && threadsText(Number(a.cpus)), `agent ${a.agent}`].filter(Boolean).join(', ')}.` +
+  rResult('good', `Connected to ${a.host || 'it'}: ${[a.system || ({ windows: 'Windows', macos: 'macOS' }[a.os] || 'Linux'), a.cpus && threadsText(Number(a.cpus)), `agent ${a.agent}`].filter(Boolean).join(', ')}.` +
     (a.memory ? '' : a.os === 'windows' ? ' That agent is too old to send memory: the steps here replace it.'
       : " It's CPU Graph's agent, which sends no memory: the steps here replace it."));
 }
@@ -502,8 +542,8 @@ rForm.addEventListener('submit', rSave);
 $('rtest').addEventListener('click', rTest);
 $('rremove').addEventListener('click', rRemove);
 $('rcancel').addEventListener('click', () => { if (rAsking) rAskRemove(false); else rDialog.close(); });
-rDialog.addEventListener('close', () => { rTestNo++; $('rtest').disabled = false; });
-rForm.addEventListener('input', ev => { if (ev.target.name === 'address' || ev.target.name === 'port') rOldAgent = ''; rResult('', ''); rTestNo++; $('rtest').disabled = false; rHelp(); });
+rDialog.addEventListener('close', () => { rTestNo++; $('rtest').disabled = false; rPushReset(); });
+rForm.addEventListener('input', ev => { if (ev.target.closest('#rpush')) { rPushErr(''); return; } if (ev.target.name === 'address' || ev.target.name === 'port') { rOldAgent = ''; rNeed = null; } rResult('', ''); rTestNo++; $('rtest').disabled = false; rHelp(); });
 for (const b of document.querySelectorAll('[data-add-machine]')) b.addEventListener('click', () => rOpen(null));
 
 // ---------------------------------------------------------------------------
@@ -517,8 +557,25 @@ function rHelp() {
   const code = text => `<span class="code"><code>${esc(text)}</code><button type="button" data-copy="${esc(text)}">Copy</button></span>`;
   const step = (...parts) => `<li>${parts.join('')}</li>`;
   let html;
-  if (os === 'linux') {
-    html = '<h3>Installing the agent on Linux</h3><ol>' +
+  $('rpush').hidden = os !== 'linux' && os !== 'macos';
+  const n = rNeed;
+  $('rpushh').textContent = !n ? 'Install it from here' : n.replace ? 'Replace its agent from here' : 'Update its agent from here';
+  $('rpushgo').textContent = !n ? 'Install' : n.replace ? 'Replace' : 'Update';
+  $('rpushwhat').textContent = (!n ? '' : n.replace ? `It runs ${n.agent ? `agent ${n.agent}` : 'an older agent'}, which sends no memory. `
+    : `It runs agent ${n.agent}; this OmniTOP brings ${n.newest}. `) +
+    'OmniTOP signs in there with SSH, copies the agent over and installs it, in place of an older agent or CPU Graph\'s. Use an account that can use sudo, or root.';
+  if (os === 'macos') {
+    html = '<h3>Or install it yourself, on the Mac</h3><ol>' +
+      step('Get the agent: the same Python file as for Linux. It needs the Python that Apple\'s Command Line Tools bring ' +
+        '(if <code>python3 --version</code> asks to install them, let it).<br><button type="button" data-get="linux">Save omnitop-agent.py</button> <span class="rsaved" id="rsaved"></span>') +
+      step('Copy it to the Mac, with an account you can sign in to there (turn on Remote Login in System Settings, General, Sharing, to sign in with ssh):',
+        code(`scp omnitop-agent.py you@${target}:`)) +
+      step('Sign in, and install it:', code(`ssh -t you@${shell} sudo python3 omnitop-agent.py --install${odd ? ` --port ${port}` : ''}`),
+        `It starts with the Mac (launchd), as an account with no rights of its own, and if the Mac's firewall is on, lets Python take connections on TCP port ${port}.`) +
+      step('Come back here and choose <b>Test connection</b>.') +
+      '</ol><p class="rnote">A Mac\'s ports aren\'t shown yet. To remove the agent: <code>sudo python3 omnitop-agent.py --uninstall</code></p>';
+  } else if (os === 'linux') {
+    html = '<h3>Or install it yourself</h3><ol>' +
       step('Get the agent: one Python file, for Python 3.6 or later.<br><button type="button" data-get="linux">Save omnitop-agent.py</button> <span class="rsaved" id="rsaved"></span>') +
       step("Copy it to the machine, with an account you can sign in to there:", code(`scp omnitop-agent.py you@${target}:`)) +
       step('Sign in, and install it:', code(`ssh -t you@${shell} sudo python3 omnitop-agent.py --install${odd ? ` --port ${port}` : ''}${rOldAgent === 'linux' ? ' --replace' : ''}`),
@@ -530,8 +587,9 @@ function rHelp() {
       '<code>apt install python3</code> if it\'s missing, and run the same command without <code>sudo</code>.</p>' +
       '<p class="rnote">To remove it: <code>sudo python3 omnitop-agent.py --uninstall</code></p>';
   } else {
-    html = '<h3>Installing the agent on Windows</h3>' +
-      (rOldAgent === 'windows' ? '<p class="rnote">This PC runs an older agent, which sends no memory. These steps replace it.</p>' : '') + '<ol>' +
+    html = `<h3>${n && !n.replace ? 'Updating' : 'Installing'} the agent on Windows</h3>` +
+      (rOldAgent === 'windows' ? '<p class="rnote">This PC runs an older agent, which sends no memory. These steps replace it.</p>'
+        : n ? `<p class="rnote">This PC runs agent ${esc(n.agent)}; this OmniTOP brings ${esc(n.newest)}. The same steps update it, and keep its port.</p>` : '') + '<ol>' +
       step('The agent is part of OmniTOP. Copy <b>omniTop.exe</b> to the PC, on a share or a USB stick, say.' +
         (pp.desktop ? '<br><button type="button" data-get="exe">Show omniTop.exe</button> <span class="rsaved" id="rsaved"></span>'
           : '<br><a href="https://github.com/esteed/OmniTOP/releases/latest" target="_blank" rel="noopener">Download it</a>')) +
@@ -546,6 +604,71 @@ function rHelp() {
     $('rhelp').innerHTML = html;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Installing it from here: the server signs in with ssh (pushinstall.py), and this asks how it's going
+// ---------------------------------------------------------------------------
+let rPushNo = 0;
+
+function rPushSay(kind, text) {
+  $('rpushres').className = 'rresult ' + (kind === 'busy' ? 'busy' : kind);
+  $('rpushres').textContent = text;
+}
+
+function rPushErr(field) {   // marks the install part's field that's wrong, or none
+  for (const [name, f] of [['puser', 'user'], ['ppass', 'password']]) rForm.elements[name].setAttribute('aria-invalid', String(field === f));
+}
+
+function rPushReset() {
+  rPushNo++;
+  rForm.elements.ppass.value = '';
+  if (!rForm.elements.puser.value) rForm.elements.puser.value = loadPref('remote.user') || '';
+  rPushErr('');
+  rPushSay('', '');
+  $('rpushgo').disabled = false;
+}
+
+async function rPush() {
+  const no = ++rPushNo, user = rForm.elements.puser.value.trim();
+  rErrors({});
+  rPushErr('');
+  if (!user) { rPushErr('user'); rPushSay('bad', 'Enter the account to sign in with there.'); rForm.elements.puser.focus(); return; }
+  $('rpushgo').disabled = true;
+  rPushSay('busy', `Signing in to ${rForm.elements.address.value.trim() || 'it'}…`);
+  let a = await rPost({ action: 'push', ...rFields(), user, password: rForm.elements.ppass.value });
+  while (no === rPushNo && a.job && !a.error) {   // its state, until it's done
+    await new Promise(r => setTimeout(r, 400));
+    if (no !== rPushNo) return;
+    const s = await rPost({ action: 'pushed', job: a.job });
+    if (s.error) { a = s; break; }
+    rPushSay(s.state, s.text);
+    if (s.state !== 'busy') { a = s; break; }
+  }
+  if (no !== rPushNo) return;
+  $('rpushgo').disabled = false;
+  if (a.error) {   // a field of the machine's, or of this part
+    if (['name', 'address', 'port', 'os'].includes(a.field)) rErrors(a);
+    rPushErr(a.field);
+    rPushSay('bad', a.error);
+    return;
+  }
+  if (a.state !== 'good') {
+    rPushErr(a.field);
+    if (a.field === 'password') rForm.elements.ppass.select();
+    return;
+  }
+  savePref('remote.user', user);
+  rForm.elements.ppass.value = '';
+  if (a.os) rForm.elements.os.value = a.os;
+  rOldAgent = '';
+  rHelp();
+  rTest();   // and see that it answers
+}
+
+$('rpushgo').addEventListener('click', rPush);
+$('rpush').addEventListener('keydown', ev => {   // Enter installs, rather than adding the machine
+  if (ev.key === 'Enter' && ev.target.tagName === 'INPUT') { ev.preventDefault(); if (!$('rpushgo').disabled) rPush(); }
+});
 
 $('rhelp').addEventListener('click', async ev => {
   const copy = ev.target.closest('[data-copy]'), get = ev.target.closest('[data-get]');

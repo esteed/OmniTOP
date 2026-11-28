@@ -428,6 +428,15 @@ def windows_totals(v: list) -> tuple:
     return at / 1e7, rb, wb, r, w, rt / 1e7, wt / 1e7, (at - idle) / 1e7, (rt + wt) / 1e7
 
 
+def mac_totals(v: list, t: float) -> tuple:
+    """A Mac's disk's running totals (IOKit: bytes read and written, reads, writes, ns reading and writing), read at
+    time t, as DiskRates takes them. IOKit counts no busy time: the time operations took stands in for it, which
+    is the queue depth over time, and is right while one operation runs at a time (the busy % is kept to 100)."""
+    rb, wb, r, w, rns, wns = (float(x) for x in v[:6])
+    took = (rns + wns) / 1e9
+    return t, rb, wb, r, w, rns / 1e9, wns / 1e9, took, took
+
+
 def linux_totals(text: str, t: float) -> dict[str, tuple]:
     """Every disk's line of /proc/diskstats, read at time t, as DiskRates takes it."""
     out = {}
@@ -766,7 +775,7 @@ def test_agent(host: str, port: int) -> dict:
     except Exception as exc:  # noqa: BLE001 - shown in the form
         return {"ok": False, "error": describe_failure(exc, host, endpoint, connected)}
     system_kind = fields.get("os", "").lower()
-    return {"ok": True, "host": fields.get("host", "")[:64], "os": system_kind if system_kind in ("windows", "linux") else "linux",
+    return {"ok": True, "host": fields.get("host", "")[:64], "os": system_kind if system_kind in ("windows", "linux", "macos") else "linux",
             "system": system, "cpus": fields.get("cpus", ""), "agent": fields.get("version", "")[:32], "memory": omni}
 
 
@@ -879,7 +888,7 @@ class RemoteAgent:
         interval, mem = self.monitor.rates_for(self.machine.id)
         out = f"interval {interval}\n" + (f"mem {mem}\n" if self.omni else "")
         if "feed" in self.can:
-            want = {"diskperf": ["*"]} if "diskperf" in self.can else {"files": ["/proc/diskstats"]}
+            want = {"diskperf": ["*"]} if "diskperf" in self.can else {"iokit": ["*"]} if "iokit" in self.can else {"files": ["/proc/diskstats"]}
             out += "feed disks sample " + json.dumps(want) + "\n" if self.monitor.wants_io(self.machine.id) else "feed disks off\n"
         if "ports" in self.can:                            # probes always: a scan is news on any page
             if "portsnet" in self.can:
@@ -1003,7 +1012,7 @@ class RemoteAgent:
             try:
                 d = json.loads(rest)
                 self.machine.system = str(d.get("system", ""))[:80]
-                if d.get("os") in ("windows", "linux"):
+                if d.get("os") in ("windows", "linux", "macos"):
                     self.machine.os = d["os"]
             except (ValueError, AttributeError):
                 return
@@ -1125,7 +1134,7 @@ class RemoteAgent:
         m.detail = " · ".join(x for x in (threads_text(cpus) if cpus else "",
                                           self.endpoint if self.endpoint.lower() != m.name.lower() else "") if x)
         kind = fields.get("os", "").lower()
-        m.os = kind if kind in ("windows", "linux") else "linux"   # cpugraph-agent is for Linux, and doesn't say
+        m.os = kind if kind in ("windows", "linux", "macos") else "linux"   # cpugraph-agent is for Linux, and doesn't say
         m.kernel, m.version = fields.get("kernel", "")[:80], fields.get("version", "")[:32]
         m.memory, m.io = self.omni, "feed" in self.can
         m.silent = []
@@ -1134,6 +1143,8 @@ class RemoteAgent:
         m.procio = "procio" in self.can
         if m.ports:
             m.ports_note = ""
+        elif m.os == "macos":
+            m.ports_note = "OmniTOP doesn't show a Mac's ports yet: its agent can't watch the network there."
         elif self.omni and version_at_least(m.version, (2, 1)):
             m.ports_note = ("This PC doesn't let the agent watch its network." if m.os == "windows" else
                             "The agent there can't see ports: that takes its omnitop-agent-ports service, "
@@ -1212,6 +1223,8 @@ class RemoteAgent:
             d = json.loads(text)
             if "diskperf" in d:
                 totals = {k: windows_totals(v) for k, v in d["diskperf"].items()}
+            elif "iokit" in d:
+                totals = {k: mac_totals(v, float(d["t"]) / 1000) for k, v in d["iokit"].items()}
             else:
                 totals = linux_totals(d["files"]["/proc/diskstats"], float(d["t"]) / 1000)
         except (ValueError, KeyError, TypeError, AttributeError):
@@ -1302,7 +1315,7 @@ class RemoteAgent:
             i = Item(word, self.labels.get(("disk", word), word))
             text, size = self.about.get(word, ("", 0))
             used = self.usage.get(word)
-            i.detail = " · ".join(x for x in (text, size_text(size) if size and (not self.omni or self.machine.os == "linux") else "") if x)
+            i.detail = " · ".join(x for x in (text, size_text(size) if size and (not self.omni or self.machine.os != "windows") else "") if x)
             if used:
                 i.used, i.size = used
             if missing:
@@ -1570,15 +1583,19 @@ class DemoProcs:
     LINUX = [("postgres", 1201, 5), ("rsync", 4410, 3), ("systemd-journald", 412, 1), ("jbd2/sda1-8", 280, 1),
              ("containerd", 990, 1.5), ("restic", 6020, 2), ("kworker/u8:2", 77, 0.5)]
 
-    def __init__(self, mon: "PerfMonitor", mid: str, linux: bool) -> None:
+    MAC = [("WindowServer", 412, 1), ("mds_stores", 611, 4), ("Safari", 2210, 2), ("Xcode", 3301, 3), ("Photos", 4122, 2),
+           ("backupd", 702, 3), ("kernel_task", 0, 1), ("Finder", 980, 0.5)]
+
+    def __init__(self, mon: "PerfMonitor", mid: str, linux: bool, mac: bool = False) -> None:
         self.mon, self.mid, self.linux, self.at = mon, mid, linux, 0.0
+        self.mac = mac
         self.mix = {}                                      # disk -> {name: weight}, drifting
 
     def step(self, t: float, machine: Machine, disks: list) -> None:
         if not self.mon.wants_procio(self.mid) or t < self.at:
             return
         self.at = t + PROCIO_MS / 1000
-        procs = self.LINUX if self.linux else self.WINDOWS
+        procs = self.MAC if self.mac else self.LINUX if self.linux else self.WINDOWS
         out = {}
         if self.linux:                                     # every disk's together, and no operations, as Linux counts it
             rb = sum(d[1] for d in disks)
@@ -1906,6 +1923,7 @@ DEMO_MACHINES = [
     {"name": "build-server", "address": "10.0.0.43", "port": 7820, "os": "windows"},
     {"name": "backup-nas", "address": "10.0.0.50", "port": 7820, "os": "linux"},
     {"name": "lab-pc", "address": "10.0.0.61", "port": 7820, "os": "windows"},
+    {"name": "studio-mac", "address": "10.0.0.70", "port": 7820, "os": "macos"},
 ]
 
 
@@ -1938,12 +1956,16 @@ class DemoAgent:
         m.address = endpoint_text(self.host, self.port)
         m.threads = (4, 16, 8, 8)[number % 4]
         m.detail = f"{threads_text(m.threads)} · {m.address}"
-        m.system = "Ubuntu 24.04 LTS" if m.os == "linux" else "Windows Server 2025"
-        m.kernel, m.version, m.memory = ("6.8.0" if m.os == "linux" else "10.0.26100"), "demo", True
-        m.ports, m.dynamic = True, [32768, 60999] if m.os == "linux" else [49152, 65535]
+        m.system = {"linux": "Ubuntu 24.04 LTS", "macos": "macOS 27.0"}.get(m.os, "Windows Server 2025")
+        import server                                  # loaded by now: it runs this
+        m.kernel, m.memory = {"linux": "6.8.0", "macos": "27.0.0"}.get(m.os, "10.0.26100"), True
+        m.version = "2.2.0" if self.host == "10.0.0.50" else server.VERSION   # backup-nas has one to update
+        m.ports, m.dynamic = m.os != "macos", [32768, 60999] if m.os == "linux" else [49152, 65535]
+        if m.os == "macos":
+            m.ports_note = "OmniTOP doesn't show a Mac's ports yet: its agent can't watch the network there."
         m.ports_nets = m.procio = True
         self.ports_net = None                              # the adapter its Ports page shows
-        self.procs = DemoProcs(mon, m.id, m.os == "linux")
+        self.procs = DemoProcs(mon, m.id, m.os != "windows", mac=m.os == "macos")
         self.traffic = self.details = None                 # made-up port traffic, while its Ports page shows
         self.traffic_at = self.traffic_idle = 0.0
         if number == 0:                                    # and this one is scanned now and then
@@ -1956,7 +1978,10 @@ class DemoAgent:
         self.t0 = now()
         self.memory = None
         self.mem_at = 0.0
-        if m.os == "linux":
+        if m.os == "macos":
+            m.disks = [Item("disk0")]
+            m.disks[0].detail = "APPLE SSD AP1024Z · 1 TB"
+        elif m.os == "linux":
             m.disks = [Item("nvme0n1"), Item("sda"), Item("sdb")]
             for i, detail in zip(m.disks, ("Simulated SSD · 1 TB", "Simulated disk · 8 TB", "Simulated disk · 8 TB")):
                 i.detail = detail
@@ -2044,8 +2069,8 @@ class DemoAgent:
         down = max(0.0, 3e8 * max(0.0, math.sin(el / 11 + self.number)) ** 4 + rng.gauss(1e6, 4e5))
         vpn = max(0.0, 4e6 * math.sin(el / 9) + rng.gauss(0, 2e5)) if 12 < el % 90 < 70 else 0.0
         unplugged = self.number % 4 == 1 and 30 < el % 75 < 48
-        found = [{"key": "eth0", "name": "enp1s0" if m.os == "linux" else "Ethernet", "card": True, "link": 1e9, "bps": down},
-                 {"key": "vpn", "name": "wg0" if m.os == "linux" else "Tailscale", "card": False,
+        found = [{"key": "eth0", "name": {"linux": "enp1s0", "macos": "en0"}.get(m.os, "Ethernet"), "card": True, "link": 1e9, "bps": down},
+                 {"key": "vpn", "name": {"linux": "wg0", "macos": "utun4"}.get(m.os, "Tailscale"), "card": False,
                   "link": 0.0 if 12 < el % 90 < 70 else -1.0, "bps": vpn}]
         if self.number % 4 == 1:
             found.append({"key": "eth1", "name": "Storage network", "card": True, "link": -1.0 if unplugged else 1e10, "bps": 0.0})
@@ -2067,7 +2092,7 @@ class DemoAgent:
         self.echo.step(t, m)
         if t >= self.mem_at:
             import sysmon
-            self.memory = self.memory or sysmon.DemoSystem(remote=self.number, linux=m.os == "linux")
+            self.memory = self.memory or sysmon.DemoSystem(remote=self.number, linux=m.os == "linux", mac=m.os == "macos")
             self.mem_at = t + 1.0
             d = self.memory.sample(1.0)
             d.update(t=round(t, 3), iv=1000, os=m.os)

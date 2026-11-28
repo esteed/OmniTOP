@@ -284,11 +284,25 @@
           <legend>Operating system</legend>
           <label class="ros"><input type="radio" name="os" value="windows" checked>Windows</label>
           <label class="ros"><input type="radio" name="os" value="linux">Linux</label>
+          <label class="ros"><input type="radio" name="os" value="macos">macOS</label>
         </fieldset>
         <button type="button" id="rtest">Test connection</button>
         <p id="rresult" class="rresult" role="status"></p>
       </div>
-      <div id="rhelp" class="rhelp"></div>
+      <div class="rside">
+        <div id="rpush" class="rpush" hidden>
+          <h3 id="rpushh">Install it from here</h3>
+          <p id="rpushwhat">OmniTOP signs in there with SSH, copies the agent over and installs it, in place of an older agent or CPU Graph's. Use an account that can use sudo, or root.</p>
+          <div class="rpushrow">
+            <label>User name<input name="puser" type="text" maxlength="64" autocomplete="off" spellcheck="false" aria-describedby="rpushres"></label>
+            <label>Password<input name="ppass" type="password" maxlength="256" autocomplete="off" aria-describedby="rpushres"></label>
+            <button type="button" id="rpushgo">Install</button>
+          </div>
+          <p id="rpushres" class="rresult" role="status"></p>
+          <p class="rnote">The password is only used to sign in and for sudo, and isn't saved. The first time, the machine's SSH key is trusted and remembered.</p>
+        </div>
+        <div id="rhelp" class="rhelp"></div>
+      </div>
     </div>
     <p id="rerr-" class="rerr" role="alert"></p>
     <div class="rbuttons">

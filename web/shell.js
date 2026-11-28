@@ -134,6 +134,9 @@ async function loadInfo() {
     }
     if (info.tick > 0) setTick(info.tick);
     document.title = `OmniTOP · ${info.host}`;
+    pp.version = info.version || '';
+    pp.agentVersion = info.agent || info.version || '';   // the Linux and macOS agent it brings
+    if (pp.meta) rSync(pp.meta);   // cards say which agents are older
     if (info.version) {   // top right, beside the Live / Demo data light
       $('version').textContent = info.version;
       $('version').title = `OmniTOP version ${info.version}`;
