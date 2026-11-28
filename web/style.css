@@ -699,6 +699,7 @@ main { position: relative; }
 }
 .alerts:empty { display: none; }
 /* Why a remote machine's ports can't be shown */
+#ctl-net { max-width: 190px; text-overflow: ellipsis; }
 .ports-note {
   position: absolute;
   left: 50%;

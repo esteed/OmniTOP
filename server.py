@@ -35,6 +35,7 @@ from urllib.parse import parse_qs, urlsplit
 from urllib.request import urlopen
 
 import discover
+import latency
 import netwatch
 import perfmon
 import settings as app_settings
@@ -42,7 +43,7 @@ import sysmon
 
 # The app's version, shown in the tab bar. Raise it for each release; build.py
 # reads it from here and stamps it into the exe's file properties.
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # In the packaged exe the web files are unpacked next to the bundled modules.
 HERE = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
@@ -71,44 +72,66 @@ class Accumulator:
     Traffic this app causes itself (the stream from its server to its window,
     and anything its own processes send) is kept apart, so the view can show
     it separately or leave it out.
+
+    The traffic of each adapter in `views` (keys the capture tags traffic with) is
+    also kept apart, for whoever looks at only that adapter.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self.views: frozenset = frozenset()
         self._reset()
 
     def _reset(self) -> None:
-        self._ports: dict[int, list[int]] = {}
-        self._own: dict[int, list[int]] = {}
-        self._totals = [0, 0, 0, 0, 0]  # in, out, own in, own out, events
+        self._all = ({}, {}, [0, 0, 0, 0, 0])   # ports, own ports, (in, out, own in, own out, events)
+        self._by = {key: ({}, {}, [0, 0, 0, 0, 0]) for key in self.views}
+
+    def watch(self, views) -> None:
+        """Keep these adapters' traffic apart too, from now on."""
+        with self._lock:
+            self.views = frozenset(v for v in views if v is not None)
+            for key in self.views:
+                self._by.setdefault(key, ({}, {}, [0, 0, 0, 0, 0]))
+
+    @staticmethod
+    def _put(into, lport: int, rport: int, size: int, proto: int, outbound: bool, pid: int, own: bool) -> None:
+        ports = into[1] if own else into[0]
+        if lport:
+            e = ports.get(lport)
+            if e is None:
+                e = ports[lport] = [0, 0, 0, 0, 0]
+            e[proto * 2] += size
+            e[4] = pid
+        if rport:
+            e = ports.get(rport)
+            if e is None:
+                e = ports[rport] = [0, 0, 0, 0, 0]
+            e[proto * 2 + 1] += size
+            e[4] = pid
+        t = into[2]
+        k = 1 if outbound else 0
+        t[k] += size
+        if own:
+            t[2 + k] += size
+        t[4] += 1
 
     def add(self, lport: int, rport: int, size: int, proto: int, outbound: bool, pid: int,
-            own: bool = False) -> None:
+            own: bool = False, adapter=None) -> None:
         with self._lock:
-            ports = self._own if own else self._ports
-            if lport:
-                e = ports.get(lport)
-                if e is None:
-                    e = ports[lport] = [0, 0, 0, 0, 0]
-                e[proto * 2] += size
-                e[4] = pid
-            if rport:
-                e = ports.get(rport)
-                if e is None:
-                    e = ports[rport] = [0, 0, 0, 0, 0]
-                e[proto * 2 + 1] += size
-                e[4] = pid
-            t = self._totals
-            k = 1 if outbound else 0
-            t[k] += size
-            if own:
-                t[2 + k] += size
-            t[4] += 1
+            self._put(self._all, lport, rport, size, proto, outbound, pid, own)
+            if adapter is not None and adapter in self._by:
+                self._put(self._by[adapter], lport, rport, size, proto, outbound, pid, own)
 
-    def drain(self):
-        """(ports, own ports, (in, out, own in, own out, events)) since the last call."""
+    def drain(self, view=None):
+        """(ports, own ports, (in, out, own in, own out, events)) since the last call: of every adapter, or of one."""
+        return self.drain_views()[view if view in self.views else None]
+
+    def drain_views(self) -> dict:
+        """{None: every adapter's, adapter: its own, ...} as drain gives them, since the last call."""
         with self._lock:
-            out = self._ports, self._own, tuple(self._totals)
+            out = {None: (self._all[0], self._all[1], tuple(self._all[2]))}
+            for key, b in self._by.items():
+                out[key] = (b[0], b[1], tuple(b[2]))
             self._reset()
         return out
 
@@ -343,6 +366,8 @@ class EtwCapture:
         self._callback = EVENT_RECORD_CALLBACK(self._on_event)
         self._logfile = None
         self.scans_error = ""
+        self.adapter_of: dict[bytes, str] = {}   # local address -> its adapter's key, while someone looks at one
+        self.watch_own = True                    # keep track of this app's own processes (DiskTrace doesn't need to)
         self.names = ProcessNames().get
         # This app's own traffic: its web server's port, and the processes it
         # runs as (this one, plus the window and its browser engine).
@@ -385,7 +410,25 @@ class EtwCapture:
         if rc:
             raise OSError(rc, f"Couldn't start the trace session: {ctypes.FormatError(rc).strip()}")
         self.session = handle.value
+        self._enable()
 
+        log = EVENT_TRACE_LOGFILEW()
+        log.LoggerName = self.session_name
+        log.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD
+        log.EventRecordCallback = self._callback
+        self._logfile = log
+        trace = self.adv.OpenTraceW(ctypes.byref(log))
+        if trace == INVALID_PROCESSTRACE_HANDLE:
+            err = ctypes.get_last_error()
+            self.stop()
+            raise OSError(err, f"Couldn't open the trace: {ctypes.FormatError(err).strip()}")
+        self.trace = trace
+        threading.Thread(target=self._pump, name="etw", daemon=True).start()
+        if self.watch_own:
+            threading.Thread(target=self._watch_own, name="own-pids", daemon=True).start()
+
+    def _enable(self) -> None:
+        """The providers of the session: Kernel-Network, and TCPIP for scans."""
         rc = 1
         if self.events:
             self._network_filter = self._event_filter(self.events)
@@ -401,20 +444,6 @@ class EtwCapture:
             raise OSError(rc, f"Couldn't enable the network provider: {ctypes.FormatError(rc).strip()}")
         if self.scans is not None:
             self._enable_tcpip()
-
-        log = EVENT_TRACE_LOGFILEW()
-        log.LoggerName = self.session_name
-        log.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD
-        log.EventRecordCallback = self._callback
-        self._logfile = log
-        trace = self.adv.OpenTraceW(ctypes.byref(log))
-        if trace == INVALID_PROCESSTRACE_HANDLE:
-            err = ctypes.get_last_error()
-            self.stop()
-            raise OSError(err, f"Couldn't open the trace: {ctypes.FormatError(err).strip()}")
-        self.trace = trace
-        threading.Thread(target=self._pump, name="etw", daemon=True).start()
-        threading.Thread(target=self._watch_own, name="own-pids", daemon=True).start()
 
     @staticmethod
     def _event_filter(ids) -> tuple:
@@ -478,7 +507,8 @@ class EtwCapture:
             # loopback connections to its web server (127.0.0.1 only, IPv4).
             own = pid in self.own_pids or (alen == 4 and data[8] == 127
                                            and self.own_port in (sport, dport))
-            self.acc.add(sport, dport, size, proto, outbound, pid, own)
+            adapter = self.adapter_of.get(data[8 + alen:8 + 2 * alen]) if self.adapter_of else None
+            self.acc.add(sport, dport, size, proto, outbound, pid, own, adapter)
             if outbound and proto == UDP and self.scans is not None:
                 self.scans.sending(sport)
         except Exception:  # never let an exception escape into ETW's thread
@@ -686,8 +716,9 @@ class Demo:
     ]
     SAME_PORT = {5353, 1900, 137, 138}
 
-    def __init__(self, acc: Accumulator) -> None:
+    def __init__(self, acc: Accumulator, adapters=(("e", 6), ("w", 2), ("v", 1))) -> None:
         self.acc = acc
+        self.adapters = adapters                   # (key, weight): demo adapters the connections go through
         self.rng = random.Random()
         self.conns: list[dict] = []
         self._stop = threading.Event()
@@ -709,13 +740,16 @@ class Demo:
         scale = rng.lognormvariate(0, 0.8)
         lport = rport if rport in self.SAME_PORT else self._ephemeral()
         self.conns.append(dict(l=lport, r=rport, proto=proto, rin=rin * scale, rout=rout * scale,
-                               pid=pid, ttl=rng.uniform(3, 45)))
+                               pid=pid, ttl=rng.uniform(3, 45), a=self._adapter()))
+
+    def _adapter(self) -> str:
+        return self.rng.choices([a for a, _ in self.adapters], [w for _, w in self.adapters])[0]
 
     def _run(self) -> None:
         rng = self.rng
         # Long-lived inbound sessions: this machine is the server on 3389.
         self.conns.append(dict(l=3389, r=rng.randint(50000, 60000), proto=TCP, rin=2e4,
-                               rout=1.5e5, pid=1113, ttl=1e9))
+                               rout=1.5e5, pid=1113, ttl=1e9, a=self.adapters[0][0]))
         target = 30
         last = time.perf_counter()
         while not self._stop.wait(FASTEST_TICK / 2):
@@ -728,7 +762,7 @@ class Demo:
             if rng.random() < dt / 25:  # occasional big download
                 self.conns.append(dict(l=self._ephemeral(), r=443, proto=TCP,
                                        rin=rng.uniform(1e7, 3.5e7), rout=2e5,
-                                       pid=rng.choice([1108, 1104, 1101]), ttl=rng.uniform(6, 14)))
+                                       pid=rng.choice([1108, 1104, 1101]), ttl=rng.uniform(6, 14), a=self._adapter()))
             for c in list(self.conns):
                 c["ttl"] -= dt
                 if c["ttl"] <= 0:
@@ -737,9 +771,9 @@ class Demo:
                 f = rng.uniform(0.3, 1.7)
                 b_in, b_out = int(c["rin"] * dt * f), int(c["rout"] * dt * f)
                 if b_in:
-                    self.acc.add(c["l"], c["r"], b_in, c["proto"], False, c["pid"])
+                    self.acc.add(c["l"], c["r"], b_in, c["proto"], False, c["pid"], adapter=c["a"])
                 if b_out:
-                    self.acc.add(c["l"], c["r"], b_out, c["proto"], True, c["pid"])
+                    self.acc.add(c["l"], c["r"], b_out, c["proto"], True, c["pid"], adapter=c["a"])
 
 
 # ---------------------------------------------------------------------------
@@ -801,7 +835,8 @@ class TickRate:
 
 
 def run_ticker(acc: Accumulator, hub: Hub, names, stop: threading.Event, rate: TickRate,
-               seen: netwatch.PortSeen | None = None) -> None:
+               seen: netwatch.PortSeen | None = None, view=lambda: None) -> None:
+    """view() says which adapter's traffic to send: None for all of them."""
     last = time.perf_counter()
     next_t = last + rate.seconds
     report_t, report = last, [0, 0, 0, 0.0]
@@ -814,9 +849,10 @@ def run_ticker(acc: Accumulator, hub: Hub, names, stop: threading.Event, rate: T
         now = time.perf_counter()
         dt, last = now - last, now
         next_t = max(next_t + rate.seconds, now)
-        ports, own, (b_in, b_out, own_in, own_out, events) = acc.drain()
+        views = acc.drain_views()
+        ports, own, (b_in, b_out, own_in, own_out, events) = views.get(view(), views[None])
         if seen is not None:
-            seen.note(ports, time.monotonic())
+            seen.note(views[None][0], time.monotonic())   # bubbles know of every adapter's
         rows = [[p, e[0], e[1], e[2], e[3], names(e[4])] for p, e in ports.items()]
         own_rows = [[p, e[0], e[1], e[2], e[3]] for p, e in own.items()]
         hub.publish(json.dumps({"dt": round(dt, 4), "t": rate.seconds, "in": b_in, "out": b_out,
@@ -871,13 +907,14 @@ class CountingWriter:
 
 
 def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None, perf=None,
-                 details=None, scans=None, system=None, settings=None, discovery=None):
+                 details=None, scans=None, system=None, settings=None, discovery=None, ports_view=None):
     """on_write(bytes, client_port) is called for everything sent, when no capture sees it.
 
     details(port) describes the processes on a port (GET /api/port?p=N); scans
     lists the port scans seen recently (GET /api/scans); settings holds the
     remote machines (GET and POST /api/machines); discovery finds agents on the
-    local networks (GET and POST /api/found).
+    local networks (GET and POST /api/found); ports_view(key or None) says which of
+    this PC's adapters the Ports page shows (POST /api/ports).
     """
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     allowed_origins = {f"http://{h}" for h in allowed_hosts}
@@ -979,10 +1016,14 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
             # others are only numbers; and
             # POST /api/machines changes the list of them, and POST /api/found
             # {"action": "look" | "on" | "ignore", ...} the looking for agents.
+            # POST /api/ports {"machine": id, "adapter": key or null}: the adapter a
+            # machine's Ports page shows, or all of them. POST /api/procio {"machine": id or
+            # null}: whose processes' disk I/O to send (a Disk page shows a measure by process).
             if not self._ours():
                 return
             path = self.path.split("?", 1)[0]
-            if (path not in ("/api/rate", "/api/perf", "/api/sys", "/api/view", "/api/machines", "/api/found")
+            if (path not in ("/api/rate", "/api/perf", "/api/sys", "/api/view", "/api/machines", "/api/found", "/api/ports",
+                             "/api/procio")
                     or (path in ("/api/perf", "/api/view") and perf is None)
                     or (path == "/api/sys" and system is None)
                     or (path == "/api/found" and discovery is None)
@@ -1017,6 +1058,20 @@ def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None,
                     reply = {"machine": perf.focus, "numbers": perf.numbers, "page": perf.page}
                 elif path == "/api/machines":
                     reply = self._machines(body)
+                elif path == "/api/procio":
+                    if perf is None:
+                        raise ValueError("no perf")
+                    perf.set_procio(None if body.get("machine") is None else str(body["machine"])[:16])
+                    reply = {"machine": body.get("machine")}
+                elif path == "/api/ports":
+                    adapter = None if body.get("adapter") is None else str(body["adapter"])[:64]
+                    mid = str(body.get("machine") or "local")
+                    if mid == "local":
+                        if ports_view is not None:
+                            ports_view(adapter)
+                    elif perf is not None:
+                        perf.set_ports_net(mid, adapter)
+                    reply = {"machine": mid, "adapter": adapter}
                 elif path == "/api/found":
                     action = body["action"]
                     if action == "look":
@@ -1281,6 +1336,7 @@ class Server:
         if self.demo_scans:
             self.demo_scans.start()
         self.done = threading.Event()
+        self.ports_view: str | None = None          # the adapter the Ports page shows (its LUID), or None
         # CPU, disk & network tab (CPU Graph's sampler), at its own rate
         self.perf = perfmon.PerfMonitor(self.hub, mode, self.settings)
         # Agents on the local networks, to offer on the Remote tab
@@ -1293,7 +1349,8 @@ class Server:
             self.httpd = ThreadingHTTPServer(
                 ("127.0.0.1", self.port),
                 make_handler(self.hub, info, self.port, self.rate, on_write, self.perf,
-                             self.details, self.scans, self.sysmon, self.settings, self.discovery))
+                             self.details, self.scans, self.sysmon, self.settings, self.discovery,
+                             self.set_ports_view))
         except BaseException:
             self.source.stop()
             self.scans.stop()
@@ -1305,9 +1362,30 @@ class Server:
         self.httpd.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.port}/"
         threading.Thread(target=run_ticker,
-                         args=(self.acc, self.hub, self.source.names, self.done, self.rate, self.seen),
+                         args=(self.acc, self.hub, self.source.names, self.done, self.rate, self.seen,
+                               lambda: self.ports_view),
                          name="ticker", daemon=True).start()
         self.sysmon.start()
+
+    def set_ports_view(self, key: str | None) -> None:
+        """The Ports page shows only this adapter's traffic (its key), or every adapter's."""
+        self.ports_view = key
+        self.acc.watch([key])
+        if key and not getattr(self, "_mapping", False) and isinstance(self.source, EtwCapture):
+            self._mapping = True
+            threading.Thread(target=self._map_adapters, name="adapters", daemon=True).start()
+
+    def _map_adapters(self) -> None:
+        """While an adapter is looked at: which local address is whose, now and then (addresses change)."""
+        while not self.done.is_set():
+            if self.ports_view:
+                try:
+                    self.source.adapter_of = latency.address_keys()
+                except OSError:
+                    pass
+            else:
+                self.source.adapter_of = {}
+            self.done.wait(5)
 
     def _count_own_stream(self, size: int, client_port: int) -> None:
         # What a capture would see: this server's socket sending, the window's receiving.

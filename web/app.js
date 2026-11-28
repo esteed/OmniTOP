@@ -51,7 +51,7 @@ const $ = id => document.getElementById(id);
 const stage = $('stage'), cv = $('cv'), ctx = cv.getContext('2d'), tip = $('tip');
 const sysListeners = [];              // memory.js: called with each memory/GPU sample
 const rmemListeners = [];             // memory.js: and with each remote machine's
-const perfListeners = { perf: [], perfmeta: [], lat: [], found: [] };   // perf.js; found: remote.js
+const perfListeners = { perf: [], perfmeta: [], lat: [], found: [], procio: [] };   // perf.js; found: remote.js; procio: disk.js
 const listListeners = [];             // watch.js: called after the busiest-ports list redraws
 const scanListeners = [];             // watch.js: called with each port scan update
 const tabListeners = [];              // watch.js: called with the tab's name when one is opened
@@ -1046,12 +1046,8 @@ function portsLook() {
   note.hidden = !say;
 }
 
-// Start the page afresh for another machine: nothing of the last one's traffic carries over.
-function portsShow(id) {
-  if (id === portsOf) { portsLook(); return; }
-  portsPins.set(portsOf, state.pins);
-  portsOf = id;
-  state.pins = portsPins.get(id) || [];
+// Nothing of what was showing carries over: another machine, or another adapter.
+function portsFresh() {
   ports.clear();
   dts.length = 0;
   dirHist.length = 0;
@@ -1060,13 +1056,74 @@ function portsShow(id) {
   jumpWarm = JUMP.warm;
   totalAvg = 0;
   state.hover = state.focus = null;
+}
+
+// Start the page afresh for another machine: nothing of the last one's traffic carries over.
+function portsShow(id) {
+  if (id === portsOf) { portsLook(); portsNetLook(); return; }
+  portsPins.set(portsOf, state.pins);
+  portsOf = id;
+  state.pins = portsPins.get(id) || [];
+  portsFresh();
   $('ctl-rate').closest('label').hidden = id !== 'local';   // remote machines send at a set pace
   portsLook();
+  portsNetLook();
   renderOwn();
   for (const f of portsListeners) f(id);
   refresh();
 }
-addEventListener('DOMContentLoaded', () => perfMetaListeners.push(() => { if (portsOf !== 'local') portsLook(); }));
+addEventListener('DOMContentLoaded', () => perfMetaListeners.push(() => { if (portsOf !== 'local') portsLook(); portsNetLook(); }));
+
+// ---------------------------------------------------------------------------
+// Which adapter's traffic the page shows: all of them, or one the person chose, remembered for
+// each machine (by its adapter's key). While the one chosen isn't connected, all of them, and it
+// again once it's back.
+// ---------------------------------------------------------------------------
+const portsNets = (() => { const v = loadPref('ports.adapter'); return v && typeof v === 'object' ? v : {}; })();
+const portsNetSent = new Map();       // machine -> the adapter the server was told to show ('' for all)
+
+function portsNetList(id = portsOf) {
+  const s = typeof pm !== 'undefined' ? pm.get(id) : null;
+  return s && s.info ? s.info.nets.filter(n => !n.lost) : [];
+}
+
+// Fill the list, show what's chosen, and tell the server if what it shows changes.
+function portsNetLook(force = false) {
+  const sel = $('ctl-net'), id = portsOf, list = portsNetList(id);
+  const s = typeof pm !== 'undefined' ? pm.get(id) : null;
+  const can = id === 'local' || !!(s && s.info && s.info.ports && s.info.ports.nets);
+  const want = portsNets[id] || '', here = list.some(n => n.key === want);
+  const options = [['', 'All adapters'], ...list.map(n => [n.key, n.name])];
+  if (want && !here) options.push([want, `${portsNetName(id, want)} (not connected)`]);
+  const html = options.map(([k, name]) => `<option value="${esc(k)}">${esc(name)}</option>`).join('');
+  if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
+  sel.value = want;
+  sel.disabled = !can;
+  $('ctl-net-box').title = can ? 'Show the traffic of one network adapter, or of them all. Remembered for each machine.'
+    : "Its agent shows every adapter's traffic together. Install this version's agent there to choose one.";
+  const show = can && here ? want : '';
+  if (force || portsNetSent.get(id) !== show) {
+    const changed = portsNetSent.has(id) && portsNetSent.get(id) !== show;
+    portsNetSent.set(id, show);
+    fetch('/api/ports', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ machine: id, adapter: show || null }) }).catch(() => { /* told again on reconnect */ });
+    if (changed) { portsFresh(); refresh(); }
+  }
+}
+
+// The name an adapter had, for one that isn't connected now: remembered with the choice.
+function portsNetName(id, key) {
+  const n = portsNetList(id).find(x => x.key === key);
+  if (n) (portsNets.names ||= {})[`${id}|${key}`] = n.name;
+  return n ? n.name : (portsNets.names && portsNets.names[`${id}|${key}`]) || key;
+}
+
+$('ctl-net').addEventListener('change', ev => {
+  const key = ev.target.value;
+  if (key) { portsNets[portsOf] = key; portsNetName(portsOf, key); } else delete portsNets[portsOf];
+  savePref('ports.adapter', portsNets);
+  portsNetLook();
+});
 
 // ---------------------------------------------------------------------------
 // Startup (shell.js connects to the server once everything is loaded)

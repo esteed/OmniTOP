@@ -53,6 +53,7 @@ omnitop-agent.py for Linux):
 and, when this PC lets the agent watch its network, ports:
 
     viewer -> agent:  ports <ms>|off       traffic per port this often (100..10000)
+                      portsnet <adapter>|all   only the traffic through that adapter (can=...,portsnet)
                       probes on|off        packets to ports here that may be part of a scan
                       port <n>             the processes and connections on a port
     agent -> viewer:  portsinfo {"dynamic": [first, last], "udp": true, "error": ""}   before the first ports
@@ -64,14 +65,27 @@ and, when this PC lets the agent watch its network, ports:
 Probes are the ones that aren't answers to this PC (netwatch.ProbeFilter): which of them make a
 scan is for the viewer to judge. "s" is the agent's own traffic, to its viewers.
 
-and latency (can=...,echo; omnitop-agent.py the same):
+and which processes do disk I/O (can=...,procio):
 
-    viewer -> agent:  echo <ms>|off        ping each adapter's default gateway this often (100..10000)
-    agent -> viewer:  echo {"t": <now>, "g": {adapter: gateway}, "r": [[adapter, time, ms or null]...],
-                            "e": ""}       each <ms>: the round trips that ended since the last one
+    viewer -> agent:  procio <ms>|off      this often (250..60000)
+    agent -> viewer:  procio {"t": <now>, "disks": {<disk>: [[name, pid, read B/s, written B/s, reads/s, writes/s]...]},
+                              "e": ""}     the busiest of each disk, the rest as "(other)" (diskio.py)
 
-Only the gateways, which the agent finds itself: a viewer can't have it ping anything else.
-Averages and jitter are for the viewer to work out (latency.Window).
+and latency (can=...,echo,sites; omnitop-agent.py the same):
+
+    viewer -> agent:  echo <ms> <name>=<host>...    time round trips to these sites (up to 4) from each
+                                                    adapter that has a default gateway, each this often
+                                                    (100..10000): ICMP echo, or TCP handshakes with port
+                                                    443 where pings go unanswered
+                      echo <ms>            the adapters' gateways instead (all 2.2's agents could)
+                      echo off
+    agent -> viewer:  echo {"t": <now>, "g": {adapter: gateway}, "e": "", "r": [[adapter, time, ms or null,
+                            site, "icmp" | "tcp"]...]}   each <ms>: the round trips that ended since the
+                                                         last one; of gateways, [adapter, time, ms or null]
+
+Only addresses on the internet (a site's name must look one up), and the gateways the agent
+finds itself: a viewer can't have it time anything on its own networks. Averages and jitter
+are for the viewer to work out (latency.Window).
 
 Names in the protocol are single words, so an adapter called "Realtek 2.5GbE"
 travels as Realtek_2.5GbE and drive C: as C; the labels carry the real names.
@@ -115,7 +129,8 @@ MIN_PORTS_MS, MAX_PORTS_MS = 100, 10000
 PORTS_IDLE = 10.0            # seconds the capture goes on after the last viewer stops wanting it
 PORTS_SESSION = "omniTop agent"                       # the ETW session: not the app's, so both can run
 PORTS_GUID = "A4855AF1-2863-4519-A126-2E4FFC65316D"
-CAN = "feed,counters,diskperf,drives,echo"   # what feeds can hold, and latency
+CAN = "feed,counters,diskperf,drives,echo,sites,procio"   # what feeds can hold, latency, and processes' disk I/O
+PROCIO_SESSION = ("omniTop agent disks", "6D2A9F41-3C7E-4B58-9E10-A4F2C8B5D193")   # not the app's, so both can run
 LOOK_EVERY = 1.5             # seconds between looks at which adapters there are
 DRIVES_EVERY = 3.0           # and drives
 USAGE_EVERY = 10.0           # and how full they are
@@ -125,6 +140,7 @@ NAME = "omniTop agent"       # the scheduled task and firewall rule
 LOCAL_SERVICE = "S-1-5-19"   # the account the installed agent runs as: few rights, no password
 
 _WORD = re.compile(r"[A-Za-z0-9_.@!+-]{1,64}")
+_SITE = re.compile(r"[a-z0-9_-]{1,16}=(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*")
 
 
 # ---------------------------------------------------------------------------
@@ -489,8 +505,14 @@ def parse_command(line: str) -> tuple[str, object] | None:
         return "ports", 0 if f[1] == "off" or not int(f[1]) else max(MIN_PORTS_MS, min(MAX_PORTS_MS, int(f[1])))
     if len(f) == 2 and f[0] == "probes" and f[1] in ("on", "off"):
         return "probes", f[1] == "on"
-    if len(f) == 2 and f[0] == "echo" and re.fullmatch(r"off|\d{1,6}", f[1]):
-        return "echo", 0 if f[1] == "off" or not int(f[1]) else max(latency.MIN_MS, min(latency.MAX_MS, int(f[1])))
+    if len(f) == 2 and f[0] == "procio" and re.fullmatch(r"off|\d{1,6}", f[1]):
+        return "procio", 0 if f[1] == "off" or not int(f[1]) else max(250, min(60000, int(f[1])))
+    if len(f) == 2 and f[0] == "portsnet" and (f[1] == "all" or _WORD.fullmatch(f[1])):
+        return "portsnet", None if f[1] == "all" else f[1]
+    if 2 <= len(f) <= 2 + latency.MAX_SITES and f[0] == "echo" and re.fullmatch(r"off|\d{1,6}", f[1]):
+        sites = [tuple(x.split("=", 1)) for x in f[2:] if _SITE.fullmatch(x)]
+        ms = 0 if f[1] == "off" or not int(f[1]) else max(latency.MIN_MS, min(latency.MAX_MS, int(f[1])))
+        return "echo", (ms, sites)
     if len(f) == 2 and f[0] == "port" and re.fullmatch(r"\d{1,5}", f[1]) and 0 < int(f[1]) < 65536:
         return "port " + f[1], int(f[1])
     if f and f[0] in ("net", "disk"):
@@ -654,6 +676,7 @@ class Viewer:
             self.gone = True
             self.server.ports.forget(self)
             self.server.echo.forget(self)
+            self.server.procio.want(self, 0)
             self.mem_wake.set()
             if sampler:
                 sampler.close()
@@ -690,10 +713,13 @@ class Viewer:
                 if "mem" in todo:
                     self.mem_ms, self.mem_due = todo["mem"], 0.0
                 self.mem_wake.set()
-                if "ports" in todo or "probes" in todo:
-                    self.server.ports.want(self, todo.get("ports"), todo.get("probes"))
+                if "ports" in todo or "probes" in todo or "portsnet" in todo:
+                    self.server.ports.want(self, todo.get("ports"), todo.get("probes"),
+                                           todo["portsnet"] if "portsnet" in todo else PortWatch.KEEP)
                 if "echo" in todo:
-                    self.server.echo.want(self, todo["echo"])
+                    self.server.echo.want(self, *todo["echo"])
+                if "procio" in todo:
+                    self.server.procio.want(self, todo["procio"])
                 for k, v in todo.items():
                     if k.startswith("port "):
                         self.server.ports.ask(self, v)
@@ -740,6 +766,7 @@ class AgentServer:
         self.port = self.sock.getsockname()[1]
         self.ports = PortWatch(self.port, log)
         self.echo = EchoWatch()
+        self.procio = ProcioWatch()
 
     @staticmethod
     def _open(family: int, address: tuple, dual: bool) -> socket.socket:
@@ -759,7 +786,7 @@ class AgentServer:
         host = word(socket.gethostname()) or "unknown"
         return (f"cpugraph-agent {PROTOCOL} host={host} cpus={cpus} "
                 f"kernel={perfmon.windows_version()} version={self.version} os=windows omni=2 "
-                f"can={CAN}{',ports' if self.ports.available() else ''}\n")
+                f"can={CAN}{',ports,portsnet' if self.ports.available() else ''}\n")
 
     def system_line(self) -> str:
         boot = int(time.time() - _tick() / 1000)
@@ -803,6 +830,62 @@ class AgentServer:
         self.stopping.set()
         self.ports.stop()
         self.echo.stop()
+        self.procio.stop()
+
+
+# ---------------------------------------------------------------------------
+# Which processes do disk I/O
+# ---------------------------------------------------------------------------
+
+class ProcioWatch:
+    """Processes' disk I/O for the viewers that ask, and only while one does: one trace for all of them."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.wants: dict[Viewer, int] = {}        # viewer -> ms
+        self.thread: threading.Thread | None = None
+        self.wake = threading.Event()
+        self.stopping = False
+
+    def want(self, viewer: Viewer, ms: int) -> None:
+        with self.lock:
+            if ms:
+                self.wants[viewer] = ms
+            else:
+                self.wants.pop(viewer, None)
+            if self.wants and self.thread is None and not self.stopping:
+                self.thread = threading.Thread(target=self._run, name="procio", daemon=True)
+                self.thread.start()
+        self.wake.set()
+
+    def stop(self) -> None:
+        self.stopping = True
+        self.wake.set()
+
+    def _run(self) -> None:
+        import diskio
+        import server
+        io = diskio.ProcIO((PROCIO_SESSION[0], server.GUID.parse(PROCIO_SESSION[1])),
+                           lambda: [d[0] for d in perfmon.fixed_drives(26)])
+        try:
+            while not self.stopping:
+                with self.lock:
+                    wants = dict(self.wants)
+                    ms = min(wants.values()) if wants else 0
+                    if not ms and io.trace is None:
+                        self.thread = None
+                        return
+                got = io.take(bool(ms))
+                if got is not None and wants:
+                    rows, error = got
+                    line = "procio " + json.dumps({"t": round(time.time(), 3), "disks": {word(k) or k: v for k, v in rows.items()},
+                                                   "e": error}, separators=(",", ":")) + "\n"
+                    for v in wants:
+                        v.post(line)
+                self.wake.wait(ms / 1000 if ms else 1.0)
+                self.wake.clear()
+        finally:
+            io.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -810,18 +893,19 @@ class AgentServer:
 # ---------------------------------------------------------------------------
 
 class EchoWatch:
-    """Pings the gateways of this PC's adapters for the viewers that ask, and only while one does:
-    one set of pings, as often as the most eager viewer wants, for all of them."""
+    """Times round trips for the viewers that ask, and only while one does: one set of them, as often as the
+    most eager viewer wants, to the sites any of them asked for (or the gateways), for all of them."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.wants: dict[Viewer, int] = {}        # viewer -> ms
+        self.wants: dict[Viewer, tuple[int, list]] = {}   # viewer -> (ms, [(site, host)])
+        self.sites: list[tuple[str, str]] = []
         self.echoes: latency.Echoes | None = None
 
-    def want(self, viewer: Viewer, ms: int) -> None:
+    def want(self, viewer: Viewer, ms: int, sites=()) -> None:
         with self.lock:
             if ms:
-                self.wants[viewer] = ms
+                self.wants[viewer] = (ms, list(sites))
             else:
                 self.wants.pop(viewer, None)
             self._adjust()
@@ -835,21 +919,24 @@ class EchoWatch:
             self._adjust()
 
     def _adjust(self) -> None:
-        ms = min(self.wants.values()) if self.wants else 0
-        if self.echoes is not None and self.echoes.ms != ms:
+        ms = min(w[0] for w in self.wants.values()) if self.wants else 0
+        sites = list(dict.fromkeys(s for w in self.wants.values() for s in w[1]))[:latency.MAX_SITES]
+        if self.echoes is not None and (self.echoes.ms != ms or sites != self.sites):
             self.echoes.stop()
             self.echoes = None
+        self.sites = sites
         if ms and self.echoes is None:
             self.echoes = latency.Echoes(self._find, self._report, ms).start()
 
-    @staticmethod
-    def _find() -> dict[str, tuple[str, str]]:
+    def _find(self):
         words = {a["luid"]: w for w, a in adapter_words(perfmon.adapters()).items() if a["up"]}
-        return {words[luid]: target for luid, target in latency.targets(words).items()}
+        return latency.plan(words, self.sites)
 
-    def _report(self, gateways: dict, done: list, error: str) -> None:
-        line = "echo " + json.dumps({"t": round(time.time(), 3), "g": gateways, "e": error,
-                                     "r": [[k, round(t, 3), None if r is None else round(r, 3)] for k, t, r in done]},
+    def _report(self, info: dict, done: list, error: str) -> None:
+        sites = bool(self.sites)                  # 2.2's rows, for 2.2's viewers, who asked for gateways
+        rows = [[k.rsplit("|", 1)[0], round(t, 3), None if r is None else round(r, 3)] + ([k.rsplit("|", 1)[1], m] if sites else [])
+                for k, t, r, m in done]
+        line = "echo " + json.dumps({"t": round(time.time(), 3), "g": info.get("g", {}), "e": error, "r": rows},
                                     separators=(",", ":")) + "\n"
         with self.lock:
             viewers = list(self.wants)
@@ -890,7 +977,7 @@ class PortWatch:
     def __init__(self, own_port: int, log) -> None:
         self.own_port, self.log = own_port, log
         self.lock = threading.Lock()
-        self.wants: dict[Viewer, list] = {}       # viewer -> [ms, probes]
+        self.wants: dict[Viewer, list] = {}       # viewer -> [ms, probes, adapter or None]
         self.told: set[Viewer] = set()            # have had portsinfo
         self.wake = threading.Event()
         self.stopping = False
@@ -936,16 +1023,20 @@ class PortWatch:
                         self.log(f"no ports: {self.error}")
             return not self.error or self.capture is not None
 
-    def want(self, viewer: Viewer, ms: int | None = None, probes: bool | None = None) -> None:
+    KEEP = object()
+
+    def want(self, viewer: Viewer, ms: int | None = None, probes: bool | None = None, net=KEEP) -> None:
         with self.lock:
-            w = self.wants.setdefault(viewer, [0, False])
+            w = self.wants.setdefault(viewer, [0, False, None])
+            if net is not self.KEEP:
+                w[2] = net
             if ms is not None:
                 if ms and not w[0]:
                     self.told.discard(viewer)
                 w[0] = ms
             if probes is not None:
                 w[1] = probes
-            if not any(w):
+            if not w[0] and not w[1]:
                 del self.wants[viewer]
             if self.thread is None and self.wants and not self.stopping:
                 self.thread = threading.Thread(target=self._run, name="ports", daemon=True)
@@ -999,12 +1090,26 @@ class PortWatch:
         scans = self.capture.scans_error if self.capture is not None else ""
         return "portsinfo " + json.dumps({"dynamic": self.dynamic, "udp": True, "error": self.error, "scans": scans}) + "\n"
 
+    def _adapters(self, nets: set) -> None:
+        """Keep the traffic of these adapters (by their words) apart too, knowing their addresses."""
+        self.acc.watch(nets)
+        if not nets:
+            self.capture.adapter_of = {}
+        elif time.monotonic() >= self.mapped_at:
+            self.mapped_at = time.monotonic() + 5     # addresses change now and then
+            words = {str(a["luid"]): w for w, a in adapter_words(perfmon.adapters()).items()}
+            try:
+                self.capture.adapter_of = {addr: words[luid] for addr, luid in latency.address_keys().items() if luid in words}
+            except OSError:
+                pass
+
     def _run(self) -> None:
         idle_since, last, retry = 0.0, time.perf_counter(), 0.0
+        self.mapped_at = 0.0
         while not self.stopping:
             with self.lock:
-                wants = [(v, w[0], w[1]) for v, w in self.wants.items()]
-            ms = [m for _, m, _ in wants if m]
+                wants = [(v, w[0], w[1], w[2]) for v, w in self.wants.items()]
+            ms = [m for _, m, _, _ in wants if m]
             if not wants:
                 idle_since = idle_since or time.monotonic()
                 if self.capture is not None and time.monotonic() - idle_since > PORTS_IDLE:
@@ -1026,11 +1131,12 @@ class PortWatch:
                 except OSError as exc:
                     self.error, retry = exc.strerror or str(exc), time.monotonic() + 30
                     self.log(f"ports: {self.error}")
-                    for v, m, _ in wants:
+                    for v, m, _, _ in wants:
                         if m:
                             v.post(self._info())
                     continue
                 last = time.perf_counter()
+                self.mapped_at = 0.0
             every = min(ms) / 1000 if ms else 0.5
             delay = last + every - time.perf_counter()
             if delay > 0:
@@ -1039,23 +1145,30 @@ class PortWatch:
                 continue
             now = time.perf_counter()
             dt, last = now - last, now
-            ports, own, (b_in, b_out, own_in, own_out, _) = self.acc.drain()
-            self.seen.note(ports, time.monotonic())
+            self._adapters({n for _, m, _, n in wants if m and n})
+            views = self.acc.drain_views()
+            self.seen.note(views[None][0], time.monotonic())
             found = self.filter.take()
-            line = probes = ""
-            if ms:
-                rows = [[p, e[0], e[1], e[2], e[3], self.names.get(e[4])] for p, e in ports.items()]
-                own_rows = [[p, e[0], e[1], e[2], e[3]] for p, e in own.items()]
-                line = "ports " + json.dumps({"dt": round(dt, 4), "t": every, "in": b_in, "out": b_out, "si": own_in,
-                                              "so": own_out, "p": rows, "s": own_rows}, separators=(",", ":")) + "\n"
+            lines, probes = {}, ""
+
+            def line(net):                            # the traffic through one adapter (by its word), or all
+                if net not in lines:
+                    ports, own, (b_in, b_out, own_in, own_out, _) = views.get(net, ({}, {}, (0, 0, 0, 0, 0)) if net else views[None])
+                    rows = [[p, e[0], e[1], e[2], e[3], self.names.get(e[4])] for p, e in ports.items()]
+                    own_rows = [[p, e[0], e[1], e[2], e[3]] for p, e in own.items()]
+                    d = {"dt": round(dt, 4), "t": every, "in": b_in, "out": b_out, "si": own_in, "so": own_out, "p": rows, "s": own_rows}
+                    if net:
+                        d["net"] = net
+                    lines[net] = "ports " + json.dumps(d, separators=(",", ":")) + "\n"
+                return lines[net]
             if found:
                 probes = "probes " + json.dumps({"t": round(time.time(), 3), "p": found}, separators=(",", ":")) + "\n"
-            for v, m, p in wants:
+            for v, m, p, n in wants:
                 if m:
                     if v not in self.told:
                         self.told.add(v)
                         v.post(self._info())
-                    v.post(line)
+                    v.post(line(n))
                 if p and probes:
                     v.post(probes)
         self._end()

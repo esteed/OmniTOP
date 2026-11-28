@@ -158,6 +158,8 @@ function connect() {
     state.connected = true;
     if (!state.mode) loadInfo();
     tellView();   // a server that has restarted doesn't know
+    portsNetSent.clear();
+    portsNetLook(true);
     renderStatus();
   };
   es.onmessage = ev => { if (portsOf === 'local') onTick(JSON.parse(ev.data)); };   // this PC's ports
@@ -169,7 +171,7 @@ function connect() {
   // scan: watch.js; sys and rmem: memory.js; perf, perfmeta and lat: perf.js
   for (const [kind, listeners] of [['scan', scanListeners], ['sys', sysListeners], ['rmem', rmemListeners],
                                    ['perf', perfListeners.perf], ['perfmeta', perfListeners.perfmeta],
-                                   ['lat', perfListeners.lat], ['found', perfListeners.found]]) {
+                                   ['lat', perfListeners.lat], ['found', perfListeners.found], ['procio', perfListeners.procio]]) {
     es.addEventListener(kind, ev => {
       const m = JSON.parse(ev.data);
       for (const f of listeners) f(m);

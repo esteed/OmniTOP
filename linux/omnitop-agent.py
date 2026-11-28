@@ -38,6 +38,7 @@ import json
 import mmap
 import os
 import re
+import select
 import shutil
 import socket
 import struct
@@ -52,7 +53,7 @@ try:
 except ImportError:          # the tests run on Windows
     pwd = None
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 PROTOCOL = 2
 DEFAULT_PORT = 7820
 DEFAULT_MS, MIN_MS, MAX_MS = 1000, 10, 10000
@@ -65,7 +66,7 @@ LOOK_EVERY = 1.5             # seconds between looks at which adapters and disks
 MAX_FEEDS, MAX_PATTERNS, MAX_FILES = 16, 64, 1024   # a viewer's feeds; patterns and files in one
 MAX_FILE, MAX_FEED = 256 << 10, 1 << 20             # bytes of one file, and of one feed's files
 MIN_FEED_MS = 250
-CAN = "feed,files,list,statvfs,nvidia,echo"         # what feeds can hold, and latency
+CAN = "feed,files,list,statvfs,nvidia,echo,sites"   # what feeds can hold, and latency
 TOP_PROGRAMS = 30
 
 NAME = "omnitop-agent"
@@ -449,6 +450,7 @@ TCP_STATES = {1: "Established", 2: "SYN sent", 3: "SYN received", 4: "FIN wait 1
               7: "Closed", 8: "Close wait", 9: "Last ACK", 10: "Listening", 11: "Closing"}
 LISTENING = 10
 SOL_PACKET = 263
+V4_MAPPED = b"\0" * 10 + b"\xff\xff"   # ::ffff:a.b.c.d: an IPv4 address on an IPv6 socket
 UDP_SENT_KEEP = 300.0        # seconds a port this machine sent UDP from is remembered: what comes to it is an answer
 MAX_PROBES = 2000            # sent per message
 RING_BLOCK, RING_BLOCKS, RING_FRAME = 1 << 16, 64, 256   # 4 MB of packet headers
@@ -542,6 +544,64 @@ class Diag(object):
         return out
 
 
+def proc_ip(text):
+    """An address as /proc/net shows it: 32-bit words, each in this machine's byte order."""
+    return b"".join(struct.pack("=I", int(text[i:i + 8], 16)) for i in range(0, len(text), 8))
+
+
+def proc_sockets(family, proto, states):
+    """A socket table from /proc/net, as Diag.dump gives it, but with made-up cookies and no byte counts."""
+    name = ("tcp" if proto == 6 else "udp") + ("6" if family == socket.AF_INET6 else "")
+    out = []
+    for line in (read("/proc/net/" + name, 1 << 24) or "").splitlines()[1:]:
+        f = line.split()
+        try:
+            here, lport = f[1].split(":")
+            there, rport = f[2].split(":")
+            state, uid, inode = int(f[3], 16), int(f[7]), int(f[9])
+            src, dst, lport, rport = proc_ip(here), proc_ip(there), int(lport, 16), int(rport, 16)
+        except (IndexError, ValueError):
+            continue
+        if states >> state & 1:
+            out.append((hash((family, src, lport, dst, rport)), family, state, src, lport, dst, rport, uid, inode, None, None))
+    return out
+
+
+class Sockets(object):
+    """The kernel's socket tables: sock_diag where it has inet_diag, /proc/net where it doesn't (some routers'
+    kernels). Then there are no byte counts of connections, and TCP traffic is counted from packet headers."""
+
+    MISSING = (errno.ENOENT, errno.EPROTONOSUPPORT, errno.EOPNOTSUPP, errno.EINVAL)
+
+    def __init__(self):
+        self.proc = set()                              # (family, protocol) read from /proc/net
+        try:
+            # OMNITOP_SOCKETS=proc: as if the kernel had no inet_diag (for trying that out)
+            self.diag = None if os.environ.get("OMNITOP_SOCKETS") == "proc" else Diag()
+        except OSError:
+            self.diag = None
+
+    @property
+    def counts(self):
+        """Whether the kernel counts the bytes of TCP connections (IPv4's, anyway)."""
+        return self.diag is not None and (socket.AF_INET, 6) not in self.proc
+
+    def dump(self, family, proto, states, info):
+        if self.diag is not None and (family, proto) not in self.proc:
+            try:
+                return self.diag.dump(family, proto, states, info)
+            except OSError as exc:
+                if exc.errno not in self.MISSING:
+                    raise
+                self.proc.add((family, proto))
+                log("ports: no sock_diag for %s%s here (%s): reading /proc/net instead" % (
+                    "TCP" if proto == 6 else "UDP", "v6" if family == socket.AF_INET6 else "", exc.strerror or exc))
+        return proc_sockets(family, proto, states)
+
+    def finished(self):
+        return self.diag.finished() if self.counts else []
+
+
 def own_addresses():
     """{interface index: its addresses, as bytes}, asked of the kernel (NETLINK_ROUTE)."""
     out = {}
@@ -573,26 +633,110 @@ def own_addresses():
         s.close()
 
 
+def packet_filter(own4, own6, all_tcp):
+    """A classic BPF program for the packet socket: IPv4 and IPv6 UDP, and TCP (only connections' first packets,
+    SYN without ACK, unless all_tcp), to or from this machine's own addresses; UDP to multicast and broadcast
+    addresses too. Not later fragments. own4 and own6: addresses as bytes; none known, any address."""
+    prog, labels, count = [], {}, [0]
+
+    def op(code, k=0, jt=None, jf=None):
+        prog.append([code, jt, jf, k])
+
+    def label(name):
+        labels[name] = len(prog)
+
+    def fresh():
+        count[0] += 1
+        return "L%d" % count[0]
+
+    own4, own6 = sorted(own4)[:48], sorted(own6)[:12]
+    op(0x28, 0xfffff000)                               # ldh the packet's protocol
+    op(0x15, 0x0800, None, "six")
+    # IPv4
+    op(0x28, 6)                                        # flags and fragment offset
+    op(0x45, 0x1fff, "drop4")                          # a later fragment: no ports in it
+    op(0x30, 9)                                        # the protocol
+    op(0x15, 17, "udp4")
+    op(0x15, 6, None, "drop4")
+    if not all_tcp:
+        op(0xb1, 0)                                    # x = the IP header's length
+        op(0x50, 13)                                   # TCP flags
+        op(0x54, 0x12)
+        op(0x15, 2, "own4", "drop4")                   # SYN, no ACK
+    op(0x05, 0, None, None)                            # ja own4 (fixed below)
+    prog[-1][3] = "own4"
+    label("udp4")
+    op(0x30, 16)
+    op(0x35, 224, "accept4")                           # to a multicast or broadcast address
+    label("own4")
+    if own4:
+        for side in (12, 16):
+            op(0x20, side)
+            for a in own4:
+                op(0x15, struct.unpack("!I", a)[0], "accept4")
+        label("drop4")
+        op(0x06, 0)
+    else:
+        op(0x05, 0, None, None)
+        prog[-1][3] = "accept4"
+        label("drop4")
+        op(0x06, 0)
+    label("accept4")
+    op(0x06, 128)
+    # IPv6
+    label("six")
+    op(0x15, 0x86dd, None, "drop6")
+    op(0x30, 6)                                        # the next header, right after: no extension headers
+    op(0x15, 17, "udp6")
+    op(0x15, 6, None, "drop6")
+    if not all_tcp:
+        op(0x30, 53)
+        op(0x54, 0x12)
+        op(0x15, 2, "own6", "drop6")
+    op(0x05, 0, None, None)
+    prog[-1][3] = "own6"
+    label("udp6")
+    op(0x30, 24)
+    op(0x15, 0xff, "accept6")                          # to a multicast address
+    label("own6")
+    if own6:
+        for side in (8, 24):
+            for a in own6:
+                words, nxt = struct.unpack("!IIII", a), fresh()
+                for j, w in enumerate(words):
+                    op(0x20, side + 4 * j)
+                    op(0x15, w, "accept6" if j == 3 else None, nxt)
+                label(nxt)
+        label("drop6")
+        op(0x06, 0)
+    else:
+        op(0x05, 0, None, None)
+        prog[-1][3] = "accept6"
+        label("drop6")
+        op(0x06, 0)
+    label("accept6")
+    op(0x06, 128)
+    out = []
+    for i, (code, jt, jf, k) in enumerate(prog):
+        if code == 0x05:                               # ja: k is the distance
+            k = labels[k] - i - 1
+        jt = labels[jt] - i - 1 if isinstance(jt, str) else 0
+        jf = labels[jf] - i - 1 if isinstance(jf, str) else 0
+        if not (0 <= jt < 256 and 0 <= jf < 256 and k >= 0):
+            raise ValueError("filter too long")
+        out.append((code, jt, jf, k))
+    return out
+
+
 class Headers(object):
-    """Headers of UDP packets and of the packets that start TCP connections, from a packet socket's ring."""
+    """Headers of UDP packets and of TCP ones (only those that start connections, unless all_tcp) to and from
+    this machine's addresses, from a packet socket's ring, with the adapter each went through."""
 
-    # On a packet without its link header: IPv4 UDP, or TCP with SYN and no ACK, and not a later fragment;
-    # or IPv6 with one of them right after its header.
-    FILTER = [(0x28, 0, 0, 0xfffff000),                # the packet's protocol
-              (0x15, 0, 11, 0x0800),
-              (0x30, 0, 0, 9), (0x15, 0, 2, 17), (0x28, 0, 0, 6), (0x45, 15, 14, 0x1fff),
-              (0x15, 0, 14, 6), (0x28, 0, 0, 6), (0x45, 12, 0, 0x1fff), (0xb1, 0, 0, 0), (0x50, 0, 0, 13),
-              (0x54, 0, 0, 0x12), (0x15, 7, 8, 2),
-              (0x15, 0, 7, 0x86dd), (0x30, 0, 0, 6), (0x15, 4, 0, 17), (0x15, 0, 4, 6), (0x30, 0, 0, 53),
-              (0x54, 0, 0, 0x12), (0x15, 0, 1, 2),
-              (0x06, 0, 0, 128), (0x06, 0, 0, 0)]
-
-    def __init__(self):
+    def __init__(self, all_tcp=False):
+        self.all_tcp = all_tcp
         self.s = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(3))   # every protocol and interface
-        code = b"".join(struct.pack("=HBBI", *i) for i in self.FILTER)
-        self.code = ctypes.create_string_buffer(code, len(code))
-        fprog = struct.pack("HP", len(self.FILTER), ctypes.addressof(self.code))
-        self.s.setsockopt(socket.SOL_SOCKET, 26, fprog)                  # SO_ATTACH_FILTER
+        self.code, self.own = None, None
+        self.refilter(set(), set())
         self.s.setsockopt(SOL_PACKET, 10, struct.pack("=i", 1))          # TPACKET_V2
         frames = RING_BLOCK * RING_BLOCKS // RING_FRAME
         # Setting the ring up also drops what came before the filter was in place.
@@ -600,13 +744,27 @@ class Headers(object):
         self.ring = mmap.mmap(self.s.fileno(), RING_BLOCK * RING_BLOCKS)
         self.frames, self.at = frames, 0
 
+    def refilter(self, own4, own6):
+        """Only what's to or from these addresses, from now on."""
+        if (own4, own6) == self.own:
+            return
+        try:
+            program = packet_filter(own4, own6, self.all_tcp)
+        except ValueError:                             # too many addresses to fit: any address
+            program = packet_filter(set(), set(), self.all_tcp)
+        code = b"".join(struct.pack("=HBBI", *i) for i in program)
+        buf = ctypes.create_string_buffer(code, len(code))
+        self.s.setsockopt(socket.SOL_SOCKET, 26, struct.pack("HP", len(program), ctypes.addressof(buf)))   # SO_ATTACH_FILTER
+        self.code, self.own = buf, (set(own4), set(own6))
+
     def close(self):
         self.ring.close()
         self.s.close()
 
     def read(self):
-        """([(interface, outgoing, v6, protocol, source, destination, source port, destination port, bytes)], factor).
+        """([(interface, outgoing, v6, protocol, source, destination, source port, destination port, bytes, syn)], factor).
 
+        bytes: of UDP or TCP payload. syn: a TCP packet that starts a connection (SYN without ACK).
         factor: what to multiply bytes by, to make up for packets that didn't fit the ring.
         """
         out, ring, unpack = [], self.ring, struct.unpack_from
@@ -620,14 +778,19 @@ class Headers(object):
                 v6 = socket.ntohs(proto) == 0x86dd
                 p = f + net
                 if v6:
-                    l4, at = ring[p + 6], p + 40
+                    l4, at, length = ring[p + 6], p + 40, unpack(">H", ring, p + 4)[0]
                     src, dst = ring[p + 8:p + 24], ring[p + 24:p + 40]
                 else:
-                    l4, at = ring[p + 9], p + (ring[p] & 15) * 4
+                    head = (ring[p] & 15) * 4
+                    l4, at, length = ring[p + 9], p + head, unpack(">H", ring, p + 2)[0] - head
                     src, dst = ring[p + 12:p + 16], ring[p + 16:p + 20]
-                if at + 8 <= p + snap:
+                if l4 == 17 and at + 8 <= p + snap:
                     sport, dport, size = unpack(">HHH", ring, at)
-                    out.append((index, kind == 4, v6, l4, src, dst, sport, dport, max(0, size - 8) if l4 == 17 else 0))
+                    out.append((index, kind == 4, v6, 17, src, dst, sport, dport, max(0, size - 8), False))
+                elif l4 == 6 and at + 14 <= p + snap:
+                    sport, dport = unpack(">HH", ring, at)
+                    flags, head = ring[at + 13], (ring[at + 12] >> 4) * 4
+                    out.append((index, kind == 4, v6, 6, src, dst, sport, dport, max(0, length - head), flags & 0x12 == 2))
             ring[f:f + 4] = b"\0\0\0\0"                  # the kernel's again
             self.at = (self.at + 1) % self.frames
         packets, drops = struct.unpack("=II", self.s.getsockopt(SOL_PACKET, 6, 8))
@@ -732,8 +895,9 @@ class Ports(object):
     def __init__(self, own_port=0):
         self.own_port = own_port
         self.lock = threading.Lock()
-        self.diag = Diag()
+        self.diag = Sockets()
         self.headers, self.headers_error = None, ""
+        self.addr_index, self.tcp_inodes = {}, {}       # address -> its interface; (local, remote port) -> inode
         self.owners = Owners()
         self.known = {}                                # cookie -> (sent, received) so far
         self.conns, self.listening, self.udp = {}, {}, {}
@@ -750,17 +914,25 @@ class Ports(object):
         self.diag.finished()
 
     def capture(self, on):
-        """Watch packets too: for UDP, and probes."""
+        """Watch packets too: for UDP, and probes (and TCP, where the kernel doesn't count it)."""
         with self.lock:
-            if on and self.headers is None:
-                try:
-                    self.headers = Headers()
-                    self.headers_error = ""
-                except OSError as exc:
-                    self.headers_error = exc.strerror or str(exc)
-            elif not on and self.headers is not None:
-                self.headers.close()
-                self.headers = None
+            self._capture(on)
+
+    def _capture(self, on):
+        if on and self.headers is None:
+            try:
+                self.headers = Headers(all_tcp=not self.diag.counts)
+                self._refilter()
+                self.headers_error = ""
+            except OSError as exc:
+                self.headers_error = exc.strerror or str(exc)
+        elif not on and self.headers is not None:
+            self.headers.close()
+            self.headers = None
+
+    def _refilter(self):
+        if self.headers is not None:
+            self.headers.refilter(set(a for a in self.all_addresses if len(a) == 4), set(a for a in self.all_addresses if len(a) == 16))
 
     def close(self):
         self.capture(False)
@@ -778,6 +950,8 @@ class Ports(object):
             try:
                 self.addresses = own_addresses()
                 self.all_addresses = set().union(*self.addresses.values()) if self.addresses else set()
+                self.addr_index = dict((a, index) for index, addrs in self.addresses.items() for a in addrs)
+                self._refilter()
             except OSError:
                 pass
         if mono >= self.listen_at:
@@ -793,48 +967,62 @@ class Ports(object):
             if len(self.sent_udp) > 1000:
                 self.sent_udp = {p: t for p, t in self.sent_udp.items() if t >= old}
 
-    def tick(self, traffic=True):
-        """What's happened since the last one: {"dt", "in", "out", "si", "so", "p", "s"}, as the app's own ticks."""
+    def tick(self, traffic=True, views=(None,)):
+        """What's happened since the last one, for each of views: None for every adapter, or an interface index.
+        {view: {"dt", "in", "out", "si", "so", "p", "s"}}, as the app's own ticks."""
         with self.lock:
             mono = time.monotonic()
             dt, self.last = (mono - self.last if self.last else 0.0), mono
             self.look(mono)
-            ports, own, totals = {}, {}, [0, 0, 0, 0]
+            if self.headers is not None and self.headers.all_tcp == self.diag.counts:   # how TCP is counted changed
+                self._capture(False)
+                self._capture(True)
+            tables = dict((v, ({}, {}, [0, 0, 0, 0])) for v in set(views) | {None})
 
-            def add(lport, rport, size, udp, out, inode):
+            def add(lport, rport, size, udp, out, inode, index):
                 if size <= 0:
                     return
                 mine = lport == self.own_port and self.own_port
-                table = own if mine else ports
                 pid = self.owners.pid(inode)
-                for port, k in ((lport, 0), (rport, 1)):
-                    if port:
-                        e = table.get(port)
-                        if e is None:
-                            e = table[port] = [0, 0, 0, 0, 0]
-                        e[2 * udp + k] += size
-                        e[4] = pid or e[4]
-                        if pid:
+                for v in ((None, index) if index is not None and index in tables else (None,)):
+                    ports, own, totals = tables[v]
+                    table = own if mine else ports
+                    for port, k in ((lport, 0), (rport, 1)):
+                        if port:
+                            e = table.get(port)
+                            if e is None:
+                                e = table[port] = [0, 0, 0, 0, 0]
+                            e[2 * udp + k] += size
+                            e[4] = pid or e[4]
+                    totals[1 if out else 0] += size
+                    if mine:
+                        totals[3 if out else 2] += size
+                if pid:
+                    for port in (lport, rport):
+                        if port:
                             self.seen.setdefault(port, {})[pid] = mono
-                totals[1 if out else 0] += size
-                if mine:
-                    totals[3 if out else 2] += size
 
-            if traffic:
+            if traffic and self.diag.counts:
                 now_here = {}
                 current = self.tcp()
                 for c in self.diag.finished() + current:
                     if c[9] is None:
                         continue
                     sent0, got0 = self.known.get(c[0]) or (1, 0)   # the SYN counts as a byte sent
-                    add(c[4], c[6], c[9] - sent0, 0, True, c[8])
-                    add(c[4], c[6], c[10] - got0, 0, False, c[8])
+                    here = c[3][:4] if c[1] == socket.AF_INET else c[3][12:] if c[3][:12] == V4_MAPPED else c[3]
+                    index = self.addr_index.get(here)
+                    add(c[4], c[6], c[9] - sent0, 0, True, c[8], index)
+                    add(c[4], c[6], c[10] - got0, 0, False, c[8], index)
                     now_here[c[0]] = (max(c[9], sent0), max(c[10], got0))
                 self.known = {c[0]: now_here[c[0]] for c in current if c[0] in now_here}
                 self.conns = {c[0]: c for c in current}
+            elif traffic:                              # who has which connection: TCP's bytes come from the headers
+                current = self.tcp()
+                self.conns = {c[0]: c for c in current}
+                self.tcp_inodes = dict(((c[4], c[6]), c[8]) for c in current)
             if self.headers is not None:
                 packets, factor = self.headers.read()
-                for index, outgoing, v6, l4, src, dst, sport, dport, size in packets:
+                for index, outgoing, v6, l4, src, dst, sport, dport, size, syn in packets:
                     here, lport, there, rport = (src, sport, dst, dport) if outgoing else (dst, dport, src, sport)
                     mine = here in self.addresses.get(index, ()) or (index == 1 and here in self.all_addresses)
                     if l4 == 17:
@@ -842,22 +1030,25 @@ class Ports(object):
                             if mine:
                                 self.sent_udp[lport] = mono
                                 if traffic:
-                                    add(lport, rport, int(size * factor), 1, True, self._udp_inode(lport))
+                                    add(lport, rport, int(size * factor), 1, True, self._udp_inode(lport), index)
                         elif mine or (not v6 and (here[0] >= 224)) or (v6 and here[0] == 255):
                             if traffic:
-                                add(lport, rport, int(size * factor), 1, False, self._udp_inode(lport))
+                                add(lport, rport, int(size * factor), 1, False, self._udp_inode(lport), index)
                             if mine and lport not in self.udp and mono - self.sent_udp.get(lport, -1e9) > UDP_SENT_KEEP:
                                 self._probe(there, v6, lport, 1, "closed", rport, here)
-                    elif not outgoing and mine and there not in self.all_addresses:
-                        self._probe(there, v6, lport, 0, "open" if lport in self.listening else "closed", rport, here)
+                    else:
+                        if traffic and not self.diag.counts and (mine or here in self.all_addresses):
+                            add(lport, rport, int(size * factor), 0, outgoing, self.tcp_inodes.get((lport, rport), 0), index)
+                        if syn and not outgoing and mine and there not in self.all_addresses:
+                            self._probe(there, v6, lport, 0, "open" if lport in self.listening else "closed", rport, here)
             self.owners.look()
             for port in [p for p, d in self.seen.items() if max(d.values()) < mono - 120]:
                 del self.seen[port]
 
             def rows(table, named):
                 return [[p, e[0], e[1], e[2], e[3]] + ([self.owners.name(e[4])] if named else []) for p, e in table.items()]
-            return {"dt": round(dt, 4), "in": totals[0], "out": totals[1], "si": totals[2], "so": totals[3],
-                    "p": rows(ports, True), "s": rows(own, False)}
+            return dict((v, {"dt": round(dt, 4), "in": t[0], "out": t[1], "si": t[2], "so": t[3],
+                             "p": rows(ports, True), "s": rows(own, False)}) for v, (ports, own, t) in tables.items())
 
     def _udp_inode(self, port):
         c = self.udp.get(port)
@@ -933,8 +1124,12 @@ def dynamic_range():
 class Helper(object):
     """The ports service: an engine shared by whoever is connected, while anyone wants something of it.
 
-    Lines in:   ticks <ms> (0: no more)   probes 0|1   port <n>   echo <ms> (0: no more)
-    Lines out:  info {...}   ports {...}   probes {"t": now, "p": [...]}   port {...}   echo {...}
+    Lines in:   ticks <ms> (0: no more)   probes 0|1   port <n>   echo <ms> (0: no more)   procio <ms> (0: no more)
+                nets <adapter>|all...    the traffic of these adapters (each a ports line of its own)
+    Lines out:  info {...}   ports {..., "net": adapter}   probes {"t": now, "p": [...]}   port {...}   echo {...}
+                procio {"t": now, "disks": {"*": [[name, pid, read B/s, written B/s, null, null]...]}, "e": ""}
+
+    info says what's wrong, if anything is, and says it again while it is.
 
     echo is for an agent whose account may not ping (see EchoWatch): this service can.
     """
@@ -946,6 +1141,8 @@ class Helper(object):
         self.stopping = threading.Event()
         self.engine = None
         self.echo = EchoWatch()
+        self.names, self.names_at = {}, 0.0            # adapters' words -> their interface indexes
+        self.procio_thread = None
         try:
             os.unlink(path)
         except OSError:
@@ -977,7 +1174,8 @@ class Helper(object):
                 conn.close()
                 continue
             conn.settimeout(5)
-            c = {"conn": conn, "ms": 0, "probes": False, "due": 0.0, "told": False, "lock": threading.Lock()}
+            c = {"conn": conn, "ms": 0, "probes": False, "due": 0.0, "told": False, "lock": threading.Lock(), "nets": [None],
+                 "procio": 0}
             with self.lock:
                 self.clients.append(c)
             t = threading.Thread(target=self.listen, args=(c,))
@@ -1017,7 +1215,18 @@ class Helper(object):
             if len(buf) > 256:
                 break
             for raw in lines:
-                f = raw.decode("ascii", "replace").split()
+                text = raw.decode("ascii", "replace")
+                f = text.split()
+                if f and f[0] == "echo":                   # for an agent that may not ping
+                    e = parse_command(text)
+                    if e:
+                        c.setdefault("out", Poster(self, c))
+                        self.echo.want(c["out"], *e[1])
+                    continue
+                if f and f[0] == "nets":
+                    c["nets"] = [None if n == "all" else n for n in f[1:9] if n == "all" or word(n) == n] or [None]
+                    self.wake.set()
+                    continue
                 if len(f) != 2 or not f[1].isdigit():
                     continue
                 n = int(f[1][:9])
@@ -1025,9 +1234,13 @@ class Helper(object):
                     c["ms"] = max(MIN_PORTS_MS, min(10000, n)) if n else 0
                 elif f[0] == "probes":
                     c["probes"] = bool(n)
-                elif f[0] == "echo":
-                    c.setdefault("out", Poster(self, c))
-                    self.echo.want(c["out"], max(MIN_ECHO_MS, min(MAX_ECHO_MS, n)) if n else 0)
+                elif f[0] == "procio":
+                    c["procio"] = max(250, min(60000, n)) if n else 0
+                    with self.lock:
+                        if c["procio"] and self.procio_thread is None:
+                            self.procio_thread = threading.Thread(target=self.procio, name="procio")
+                            self.procio_thread.daemon = True
+                            self.procio_thread.start()
                 elif f[0] == "port" and 0 < n < 65536:
                     try:
                         with self.lock:
@@ -1039,6 +1252,31 @@ class Helper(object):
                 self.wake.set()
         self.drop(c)
 
+    def procio(self):
+        """Processes' disk I/O for the clients that want it, while one does."""
+        io = ProcIO()
+        while not self.stopping.is_set():
+            with self.lock:
+                clients = [c for c in self.clients if c["procio"]]
+                if not clients:
+                    self.procio_thread = None
+                    return
+            line = "procio " + json.dumps({"t": round(time.time(), 3), "disks": io.take(), "e": ""}, separators=(",", ":")) + "\n"
+            for c in clients:
+                self.send(c, line)
+            self.stopping.wait(min(c["procio"] for c in clients) / 1000.0)
+
+    def index_of(self, net):
+        """An adapter's interface index, by its word: None for every adapter, -1 for one that isn't there."""
+        if net is None:
+            return None
+        if time.monotonic() > self.names_at:
+            self.names, self.names_at = {}, time.monotonic() + 5
+            for path in glob.glob(ROOT + "/sys/class/net/*/ifindex"):
+                name = os.path.basename(os.path.dirname(path))
+                self.names[word(name)] = read_int("/sys/class/net/%s/ifindex" % name, -1)
+        return self.names.get(net, -1)
+
     def work(self):
         idle_since = 0.0
         while not self.stopping.is_set():
@@ -1046,6 +1284,7 @@ class Helper(object):
                 clients = list(self.clients)
             ms = [c["ms"] for c in clients if c["ms"]]
             probes = any(c["probes"] for c in clients)
+            views = set(self.index_of(n) for c in clients if c["ms"] for n in c["nets"])
             if not ms and not probes:
                 if self.engine is not None:
                     idle_since = idle_since or time.monotonic()
@@ -1063,19 +1302,25 @@ class Helper(object):
                     with self.lock:
                         self.engine = engine
                 started = time.monotonic()
-                d = self.engine.tick(bool(ms))
+                ticks = self.engine.tick(bool(ms), views or (None,))
                 found = self.engine.take_probes()
             except Exception as exc:  # noqa: BLE001 - said once a while, and tried again
-                log("ports: %s: %s" % (type(exc).__name__, exc))
+                problem = "%s: %s" % (type(exc).__name__, exc)
+                log("ports: " + problem)
                 if self.engine is not None:
                     self.engine.close()
                     with self.lock:
                         self.engine = None
-                time.sleep(10)
+                info = "info " + json.dumps({"dynamic": dynamic_range(), "udp": False,
+                                             "error": "The omnitop-agent-ports service can't watch here: " + problem}) + "\n"
+                for c in clients:
+                    if c["ms"]:
+                        c["told"] = False              # a proper one once it works
+                        self.send(c, info)
+                self.wake.wait(10)
+                self.wake.clear()
                 continue
             every = min(ms + ([500] if probes and not ms else [])) / 1000.0
-            d["t"] = every
-            line = "ports " + json.dumps(d, separators=(",", ":")) + "\n"
             probes = "probes " + json.dumps({"t": round(time.time(), 3), "p": found}, separators=(",", ":")) + "\n"
             for c in clients:
                 if c["ms"]:
@@ -1083,7 +1328,11 @@ class Helper(object):
                         c["told"] = True
                         self.send(c, "info " + json.dumps({"dynamic": dynamic_range(), "udp": self.engine.headers is not None,
                                                            "error": self.engine.headers_error}) + "\n")
-                    self.send(c, line)
+                    for n in c["nets"]:
+                        d = dict(ticks.get(self.index_of(n)) or ticks[None], t=every)
+                        if n:
+                            d["net"] = n
+                        self.send(c, "ports " + json.dumps(d, separators=(",", ":")) + "\n")
                 else:
                     c["told"] = False
                 if c["probes"] and found:
@@ -1095,6 +1344,49 @@ class Helper(object):
     def stop(self):
         self.stopping.set()
         self.wake.set()
+
+
+class ProcIO(object):
+    """Every process's disk I/O, from /proc/<pid>/io (the bytes it had read from and written to storage),
+    which takes root to read of other accounts' processes. Linux doesn't count it per disk, nor count
+    operations: rows are for every disk together ("*"), with no reads or writes."""
+
+    TOP = 16
+
+    def __init__(self):
+        self.last, self.at = {}, None
+
+    def take(self):
+        mono = time.monotonic()
+        dt, self.at = (mono - self.at if self.at else None), mono
+        now_io = {}
+        try:
+            pids = [p for p in os.listdir(ROOT + "/proc") if p.isdigit()]
+        except OSError:
+            pids = []
+        for p in pids:
+            text = read("/proc/%s/io" % p, 1024)
+            if not text:
+                continue
+            got = dict(line.split(":", 1) for line in text.splitlines() if ":" in line)
+            try:
+                now_io[int(p)] = (int(got.get("read_bytes", 0)), int(got.get("write_bytes", 0)))
+            except ValueError:
+                continue
+        rows = []
+        if dt:
+            for pid, (rb, wb) in now_io.items():
+                old = self.last.get(pid)
+                if old and (rb > old[0] or wb > old[1]):
+                    rows.append((pid, max(0, rb - old[0]) / dt, max(0, wb - old[1]) / dt))
+        self.last = now_io
+        rows.sort(key=lambda r: -(r[1] + r[2]))
+        out = [[printable(read("/proc/%d/comm" % pid, 64) or "", 32) or "PID %d" % pid, pid, round(r, 1), round(w, 1), None, None]
+               for pid, r, w in rows[:self.TOP]]
+        rest = rows[self.TOP:]
+        if rest:
+            out.append(["(other)", 0, round(sum(r[1] for r in rest), 1), round(sum(r[2] for r in rest), 1), None, None])
+        return {"*": out}
 
 
 class Poster(object):
@@ -1128,10 +1420,11 @@ class PortsLink(object):
         self.own_port = own_port
         self.lock = threading.Lock()
         self.conn, self.path = None, PORTS_SOCKET
-        self.wants = {}                                # viewer -> [ms, probes]
+        self.wants = {}                                # viewer -> [ms, probes, adapter or None]
         self.asked = []                                # (viewer, port) whose details are on the way
         self.info = ""
-        self.echo_ms, self.on_echo = 0, None           # pings asked of the service, and where its answers go
+        self.echo_ms, self.echo_sites, self.on_echo = 0, [], None   # round trips asked of the service, and where they go
+        self.procio_wants = {}                         # viewer -> ms: processes' disk I/O
 
     def available(self):
         """Whether there's anything to ask. Run by root without being installed, the agent does it itself."""
@@ -1151,28 +1444,46 @@ class PortsLink(object):
             return True
         return False
 
-    def want(self, viewer, ms=None, probes=None):
+    KEEP = object()
+
+    def want(self, viewer, ms=None, probes=None, net=KEEP):
         with self.lock:
-            w = self.wants.setdefault(viewer, [0, False])
+            w = self.wants.setdefault(viewer, [0, False, None])
+            if net is not self.KEEP:
+                w[2] = net
             if ms is not None:
                 w[0] = ms
                 if ms and self.info:
                     viewer.post("portsinfo " + self.info + "\n")
             if probes is not None:
                 w[1] = probes
-            if not any(w):
+            if not w[0] and not w[1]:
                 del self.wants[viewer]
             self._tell()
+            if ms and self.conn is None:               # nobody to ask: say so, rather than send nothing
+                viewer.post("portsinfo " + json.dumps({"dynamic": dynamic_range(), "udp": False, "error":
+                            "The omnitop-agent-ports service isn't answering (sudo systemctl status omnitop-agent-ports says why)."}) + "\n")
 
     def forget(self, viewer):
         with self.lock:
             self.asked = [a for a in self.asked if a[0] is not viewer]
-            if self.wants.pop(viewer, None):
+            if self.wants.pop(viewer, None) or self.procio_wants.pop(viewer, None):
                 self._tell()
 
-    def echo(self, ms):
+    def procio(self, viewer, ms):
         with self.lock:
-            self.echo_ms = ms
+            if ms:
+                self.procio_wants[viewer] = ms
+            else:
+                self.procio_wants.pop(viewer, None)
+            self._tell()
+            if ms and self.conn is None:
+                viewer.post("procio " + json.dumps({"t": round(time.time(), 3), "disks": {}, "e":
+                            "Which processes do disk I/O takes the omnitop-agent-ports service, which isn't answering."}) + "\n")
+
+    def echo(self, ms, sites=()):
+        with self.lock:
+            self.echo_ms, self.echo_sites = ms, list(sites)
             self._tell()
 
     def ask(self, viewer, port):
@@ -1183,9 +1494,12 @@ class PortsLink(object):
 
     def _tell(self):
         ms = [w[0] for w in self.wants.values() if w[0]]
-        if (self.wants or self.echo_ms or self.conn) and self._connected():
-            self._send("ticks %d\nprobes %d\n" % (min(ms) if ms else 0, any(w[1] for w in self.wants.values())) +
-                       ("echo %d\n" % self.echo_ms if self.echo_ms or self.on_echo else ""))
+        if (self.wants or self.echo_ms or self.procio_wants or self.conn) and self._connected():
+            nets = sorted(set(w[2] or "all" for w in self.wants.values() if w[0])) or ["all"]
+            self._send("ticks %d\nprobes %d\nnets %s\n" % (min(ms) if ms else 0, any(w[1] for w in self.wants.values()), " ".join(nets)) +
+                       ("echo %s\n" % " ".join([str(self.echo_ms)] + ["%s=%s" % s for s in self.echo_sites])
+                        if self.echo_ms or self.on_echo else "") +
+                       "procio %d\n" % (min(self.procio_wants.values()) if self.procio_wants else 0))
 
     def _connected(self):
         if self.conn is None:
@@ -1220,8 +1534,10 @@ class PortsLink(object):
                         self.info = rest.strip()
                         line = "portsinfo " + rest
                         to = [v for v, w in wants if w[0]]
-                    elif kind == "ports":
-                        to = [v for v, w in wants if w[0]]
+                    elif kind == "ports":                  # to the viewers of its adapter
+                        m = re.search(r'"net":\s?"([^"]*)"', rest)
+                        net = m.group(1) if m else None
+                        to = [v for v, w in wants if w[0] and w[2] == net]
                     elif kind == "probes":
                         to = [v for v, w in wants if w[1]]
                     elif kind == "port":
@@ -1229,6 +1545,8 @@ class PortsLink(object):
                         port = int(m.group(1)) if m else 0
                         to = [v for v, p in self.asked if p == port]
                         self.asked = [a for a in self.asked if a[1] != port]
+                    if kind == "procio":
+                        to = list(self.procio_wants)
                     relay = self.on_echo if kind == "echo" else None
                 for v in to:
                     v.post(line)
@@ -1243,26 +1561,30 @@ class PortsLink(object):
         conn.close()
         time.sleep(3)                                  # the service was restarted, say
         with self.lock:
-            if (self.wants or self.echo_ms) and self.conn is None:
+            if (self.wants or self.echo_ms or self.procio_wants) and self.conn is None:
                 self._tell()
 
 
 # ---------------------------------------------------------------------------
-# Memory, programs and graphics cards
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Latency: round trips to each adapter's default gateway, while a viewer asks
-# (agent.py describes "echo"). Only the gateways, found here: a viewer can't have
-# it ping anything else. Ping sockets need no rights, where net.ipv4.ping_group_range
-# lets the account have them (systemd's default does); as root, a raw socket will do.
-# Where the agent's account may do neither, the ports service, which may, does the pinging.
+# Latency: round trips from each adapter that has a default gateway to the sites a
+# viewer names, or to the gateways (agent.py describes "echo"). Only addresses on the
+# internet, and the gateways found here: a viewer can't have it time anything on this
+# machine's own networks. Pings need no rights where net.ipv4.ping_group_range lets the
+# account have ping sockets (systemd's default does); as root, a raw socket will do.
+# Where the agent's account may do neither, the ports service, which may, does the
+# pinging; without that, sites are timed by TCP handshakes, which need no rights. A site
+# that doesn't answer pings is timed that way too.
 # ---------------------------------------------------------------------------
 MIN_ECHO_MS, MAX_ECHO_MS = 100, 10000
 ECHO_TIMEOUT = 1.0           # seconds: a reply that takes longer is lost
 ECHO_LOOK = 2.0              # between looks at which gateways there are
-ECHO_TARGETS = 16
+ECHO_TARGETS = 32
+ECHO_SITES = 4
 ECHO_PAYLOAD = b"OmniTOP latency." * 2
+ECHO_TCP_AFTER = 6           # pings unanswered in a row before a site is timed by TCP handshakes
+RESOLVE_EVERY = 300.0
+GATEWAY_SITE = "gateway"
+_SITE = re.compile(r"[a-z0-9_-]{1,16}=(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z")
 
 
 def gateways():
@@ -1297,6 +1619,57 @@ def ipv4_address(name):
         return ""
 
 
+_resolved = {}
+
+
+def resolve_site(host):
+    """A site's IPv4 address, looked up now and then. OSError if it has none, or none on the internet."""
+    import ipaddress
+    hit = _resolved.get(host)
+    if hit and time.monotonic() < hit[1]:
+        return hit[0]
+    try:
+        addrs = [i[4][0] for i in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)]
+    except (OSError, UnicodeError) as exc:
+        raise OSError("%s can't be looked up (%s)" % (host, getattr(exc, "strerror", None) or exc))
+    addrs = [a for a in addrs if ipaddress.IPv4Address(a).is_global]
+    if not addrs:
+        raise OSError("%s isn't on the internet" % host)
+    _resolved[host] = (addrs[0], time.monotonic() + RESOLVE_EVERY)
+    return addrs[0]
+
+
+def on_device(s, device):
+    """Send through that adapter, whatever the routes say. Unprivileged since Linux 5.7; elsewhere, the address it's from does."""
+    if device:
+        try:
+            s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), device.encode()[:15] + b"\0")
+        except OSError:
+            pass
+
+
+def tcp_rtt(source, dest, device="", port=443):
+    """The time a TCP handshake takes, in ms: one round trip. A refusal is an answer too."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))   # closed at once, nothing left over
+        on_device(s, device)
+        if source:
+            s.bind((source, 0))
+        s.setblocking(False)
+        start = time.perf_counter()
+        s.connect_ex((dest, port))
+        _, done, failed = select.select([], [s], [s], ECHO_TIMEOUT)
+        took = (time.perf_counter() - start) * 1000
+        if not done and not failed:
+            return None
+        return took if s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) in (0, errno.ECONNREFUSED) else None
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
 def icmp_checksum(data):
     if len(data) % 2:
         data += b"\0"
@@ -1309,7 +1682,7 @@ def icmp_checksum(data):
 class Pinger(object):
     """ICMP echo to one address."""
 
-    def __init__(self, source, dest):
+    def __init__(self, source, dest, device=""):
         self.dest, self.raw, self.seq = dest, False, 0
         try:
             self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
@@ -1322,6 +1695,7 @@ class Pinger(object):
                 raise OSError(exc.errno, "this account may not ping (net.ipv4.ping_group_range)")
             self.raw = True
         self.ident = (os.getpid() ^ id(self)) & 0xFFFF
+        on_device(self.s, device)
         if source:
             try:
                 self.s.bind((source, 0))
@@ -1358,6 +1732,35 @@ class Pinger(object):
         self.s.close()
 
 
+class Prober(object):
+    """Round trips from one adapter to one address: pings, or TCP handshakes once pings go unanswered,
+    or from the start if this process may not ping."""
+
+    def __init__(self, source, dest, device):
+        self.source, self.dest, self.device = source, dest, device
+        self.misses, self.method, self.pinger = 0, "icmp", None
+        try:
+            self.pinger = Pinger(source, dest, device)
+        except OSError:
+            self.method = "tcp"
+
+    def ping(self):
+        if self.method == "icmp":
+            rtt = self.pinger.ping()
+            if rtt is not None:
+                self.misses = 0
+            else:
+                self.misses += 1
+                if self.misses >= ECHO_TCP_AFTER and tcp_rtt(self.source, self.dest, self.device) is not None:
+                    self.method = "tcp"
+            return rtt, "icmp"
+        return tcp_rtt(self.source, self.dest, self.device), "tcp"
+
+    def close(self):
+        if self.pinger:
+            self.pinger.close()
+
+
 def can_ping():
     """Whether this process may send ICMP echo requests: a ping socket, or a raw one."""
     for kind in (socket.SOCK_DGRAM, socket.SOCK_RAW):
@@ -1370,26 +1773,29 @@ def can_ping():
 
 
 class EchoWatch(object):
-    """Pings each adapter's gateway for the viewers that ask, and only while one does: one set of
-    pings, as often as the most eager viewer wants, each gateway on a thread of its own. If this
-    process may not ping, the ports service (link) does, and its answers are passed on."""
+    """Times round trips for the viewers that ask, and only while one does: one set of them, as often as
+    the most eager viewer wants, to the sites any of them asked for (or the gateways), each on a thread
+    of its own. If this process may not ping, the ports service (link) does, and its answers are passed on."""
 
     def __init__(self, link=None):
         self.lock = threading.Lock()
-        self.wants = {}                                # viewer -> ms
-        self.ms = 0
+        self.wants = {}                                # viewer -> (ms, [(site, host)])
+        self.ms, self.sites = 0, []
         self.results, self.workers, self.error = [], {}, ""
-        self.thread = None
+        self.thread, self.relook = None, False
         self.wake = threading.Event()
         self.link, self.via = link, None               # via: whether it's the ports service that pings
 
-    def want(self, viewer, ms):
+    def want(self, viewer, ms, sites=()):
         with self.lock:
             if ms:
-                self.wants[viewer] = ms
+                self.wants[viewer] = (ms, list(sites))
             else:
                 self.wants.pop(viewer, None)
-            self.ms = min(self.wants.values()) if self.wants else 0
+            self.ms = min(w[0] for w in self.wants.values()) if self.wants else 0
+            sites = list(collections.OrderedDict.fromkeys(s for w in self.wants.values() for s in w[1]))[:ECHO_SITES]
+            if sites != self.sites:
+                self.sites, self.relook = sites, True
             if self.ms and self.via is None:
                 self.via = bool(self.link) and not can_ping() and self.link.available()
                 if self.via:
@@ -1398,9 +1804,9 @@ class EchoWatch(object):
                 self.thread = threading.Thread(target=self._run, name="latency")
                 self.thread.daemon = True
                 self.thread.start()
-            via, ms = self.via, self.ms
+            via, ms, sites = self.via, self.ms, list(self.sites)
         if via:
-            self.link.echo(ms)
+            self.link.echo(ms, sites)
         self.wake.set()
 
     def _relay(self, line):
@@ -1418,14 +1824,27 @@ class EchoWatch(object):
         self.wake.set()
 
     def _look(self):
-        found = {}
-        for name, gw in sorted(gateways().items()):
-            if word(name) and len(found) < ECHO_TARGETS:
-                found[word(name)] = (ipv4_address(name), gw)
         with self.lock:
-            for key, w in list(self.workers.items()):
-                if found.get(key) != w[0]:
-                    w[1].set()
+            sites = list(self.sites)
+        found, gws, problems = {}, {}, []
+        for name, gw in sorted(gateways().items()):
+            w = word(name)
+            if not w:
+                continue
+            gws[w], source = gw, ipv4_address(name)
+            for site, host in sites or [(GATEWAY_SITE, None)]:
+                try:
+                    dest = gw if host is None else resolve_site(host)
+                except OSError as exc:
+                    if str(exc) not in problems:
+                        problems.append(str(exc))
+                    continue
+                if len(found) < ECHO_TARGETS:
+                    found["%s|%s" % (w, site)] = (source, dest, name)
+        with self.lock:
+            for key, wk in list(self.workers.items()):
+                if found.get(key) != wk[0]:
+                    wk[1].set()
                     del self.workers[key]
             for key, target in found.items():
                 if key not in self.workers:
@@ -1434,27 +1853,25 @@ class EchoWatch(object):
                     t = threading.Thread(target=self._ping, args=(key, target, stop), name="ping " + target[1])
                     t.daemon = True
                     t.start()
-        return dict((key, target[1]) for key, target in found.items())
+        return gws, "; ".join(problems)
 
     def _ping(self, key, target, stop):
-        try:
-            p = Pinger(*target)
-        except OSError as exc:
-            self.error = "Can't ping: %s" % (exc.strerror or exc)
-            return
+        p = Prober(*target)
         try:
             due = time.perf_counter()
             while not stop.is_set():
                 sent = time.time()
                 try:
-                    rtt = p.ping()
+                    rtt, method = p.ping()
                 except OSError as exc:
-                    self.error, rtt = "Can't ping %s: %s" % (target[1], exc.strerror or exc), None
+                    self.error, rtt, method = "Can't ping %s: %s" % (target[1], exc.strerror or exc), None, "icmp"
                     stop.wait(1.0)
                 if stop.is_set():
                     return
                 with self.lock:
-                    self.results.append([key, round(sent, 3), None if rtt is None else round(rtt, 3)])
+                    adapter, site = key.rsplit("|", 1)
+                    row = [adapter, round(sent, 3), None if rtt is None else round(rtt, 3)]
+                    self.results.append(row + ([site, method] if self.sites else []))   # 2.2's rows, of gateways
                     ms = self.ms or 1000
                 due += ms / 1000.0
                 wait = due - time.perf_counter()
@@ -1465,7 +1882,7 @@ class EchoWatch(object):
             p.close()
 
     def _run(self):
-        gws, look_at = {}, 0.0
+        gws, problem, look_at = {}, "", 0.0
         while True:
             with self.lock:
                 ms = self.ms
@@ -1474,19 +1891,25 @@ class EchoWatch(object):
                         w[1].set()
                     self.workers, self.results, self.thread = {}, [], None
                     return
-            if time.monotonic() >= look_at:
-                gws, look_at = self._look(), time.monotonic() + ECHO_LOOK
+                relook, self.relook = self.relook, False
+            if relook or time.monotonic() >= look_at:
+                (gws, problem), look_at = self._look(), time.monotonic() + ECHO_LOOK
             self.wake.wait(ms / 1000.0)
             self.wake.clear()
             with self.lock:
                 done, self.results = self.results, []
                 viewers = list(self.wants)
             if viewers:
-                line = "echo " + json.dumps({"t": round(time.time(), 3), "g": gws, "r": done, "e": self.error},
+                error = "; ".join(x for x in (self.error, problem) if x)
+                line = "echo " + json.dumps({"t": round(time.time(), 3), "g": gws, "r": done, "e": error},
                                             separators=(",", ":")) + "\n"
                 for v in viewers:
                     v.post(line)
 
+
+# ---------------------------------------------------------------------------
+# Memory, programs and graphics cards
+# ---------------------------------------------------------------------------
 
 def meminfo():
     out = {}
@@ -1816,8 +2239,13 @@ def parse_command(line):
         return "ports", 0 if f[1] == "off" else max(MIN_PORTS_MS, min(10000, int(f[1]))) if int(f[1]) else 0
     if len(f) == 2 and f[0] == "probes" and f[1] in ("on", "off"):
         return "probes", f[1] == "on"
-    if len(f) == 2 and f[0] == "echo" and re.match(r"(off|[0-9]{1,6})$", f[1]):
-        return "echo", 0 if f[1] == "off" or not int(f[1]) else max(MIN_ECHO_MS, min(MAX_ECHO_MS, int(f[1])))
+    if len(f) == 2 and f[0] == "procio" and re.match(r"(off|[0-9]{1,6})$", f[1]):
+        return "procio", 0 if f[1] == "off" or not int(f[1]) else max(250, min(60000, int(f[1])))
+    if len(f) == 2 and f[0] == "portsnet" and (f[1] == "all" or word(f[1]) == f[1]):
+        return "portsnet", None if f[1] == "all" else f[1]
+    if 2 <= len(f) <= 2 + ECHO_SITES and f[0] == "echo" and re.match(r"(off|[0-9]{1,6})$", f[1]):
+        sites = [tuple(x.split("=", 1)) for x in f[2:] if _SITE.match(x)]
+        return "echo", (0 if f[1] == "off" or not int(f[1]) else max(MIN_ECHO_MS, min(MAX_ECHO_MS, int(f[1]))), sites)
     if len(f) == 2 and f[0] == "port" and re.match(r"[0-9]{1,5}$", f[1]) and 0 < int(f[1]) < 65536:
         return "port " + f[1], int(f[1])
     if f and f[0] in ("net", "disk"):
@@ -1987,10 +2415,12 @@ class Viewer(object):
                     self.mem_ms, self.mem_due = todo["mem"], 0.0
                 self.mem_wake.set()
                 link = self.server.link
-                if "ports" in todo or "probes" in todo:
-                    link.want(self, todo.get("ports"), todo.get("probes"))
+                if "ports" in todo or "probes" in todo or "portsnet" in todo:
+                    link.want(self, todo.get("ports"), todo.get("probes"), todo["portsnet"] if "portsnet" in todo else link.KEEP)
                 if "echo" in todo:
-                    self.server.echo.want(self, todo["echo"])
+                    self.server.echo.want(self, *todo["echo"])
+                if "procio" in todo:
+                    link.procio(self, todo["procio"])
                 for k in todo:
                     if k.startswith("port "):
                         link.ask(self, todo[k])
@@ -2048,7 +2478,7 @@ class Server(object):
         host = word(socket.gethostname()) or "unknown"
         kernel = (read("/proc/sys/kernel/osrelease", 128) or "unknown").strip().replace(" ", "_")
         return "cpugraph-agent %d host=%s cpus=%d kernel=%s version=%s os=linux omni=2 can=%s\n" % (
-            PROTOCOL, host, cpus, kernel, VERSION, CAN + (",ports" if self.link.available() else ""))
+            PROTOCOL, host, cpus, kernel, VERSION, CAN + (",ports,portsnet,procio" if self.link.available() else ""))
 
     @staticmethod
     def system_line():

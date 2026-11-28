@@ -43,9 +43,12 @@ from sysmon import PDH_FMT_COUNTERVALUE
 
 INTERVALS = (50, 100, 250, 500, 1000)    # ms between samples: 20, 10, 4, 2, 1 a second
 RETRY_SECONDS = 5
-ECHO_MS = 250                 # between pings of each gateway, while a Network page shows
-ECHO_IDLE = 5.0               # seconds the pinging goes on after the page closes: a quick look back costs nothing
-ECHO_SINCE = "2.2"            # the version whose agents measure latency
+ECHO_MS = latency.SITE_MS     # between round trips to each site, while a Network page shows
+ECHO_IDLE = 5.0               # seconds the timing goes on after the page closes: a quick look back costs nothing
+ECHO_SINCE = "2.3"            # the version whose agents time Google, Microsoft and AT&T
+PROCIO_MS = 1000              # how often processes' disk I/O comes, while a Disk page shows a measure by process
+PROCIO_HOLD = 30.0            # seconds a request for it lasts, unless it's made again
+PROCIO_TOP = 16               # processes sent per disk; the rest together as "(other)"
 
 _T0 = time.perf_counter()
 
@@ -585,6 +588,8 @@ class Machine:
         self.ports_note = ""                               # why not
         self.dynamic: list[int] | None = None              # its ephemeral port range
         self.ports_error = ""                              # what keeps it from capturing, now
+        self.ports_nets = False                            # whether its Ports page can show one adapter's traffic
+        self.procio = False                                # whether it tells which processes do disk I/O
         self.echo = True                                   # whether it measures its adapters' latency
         self.echo_note = ""                                # and why not
         self.ip = ""                                       # the address it's reached at
@@ -594,7 +599,9 @@ class Machine:
                 "note": self.note, "os": self.os, "system": self.system, "kernel": self.kernel,
                 "agent": self.version, "address": self.address, "ip": self.ip, "memory": self.memory, "io": self.io,
                 "threads": self.threads, "v": self.version_no, "silent": self.silent,
-                "ports": {"can": self.ports, "note": self.ports_note, "dynamic": self.dynamic, "error": self.ports_error},
+                "ports": {"can": self.ports, "note": self.ports_note, "dynamic": self.dynamic, "error": self.ports_error,
+                          "nets": self.ports_nets},
+                "procio": self.procio,
                 "lat": {"can": self.echo, "note": self.echo_note},
                 "nets": [i.meta() for i in self.nets], "disks": [i.meta() for i in self.disks]}
 
@@ -783,6 +790,7 @@ class RemoteAgent:
         self._told = ""
         self._connected = False
         self._waiters: dict[int, list] = {}                # port -> [[event, details]] asked of the agent
+        self.ports_net: str | None = None                  # the adapter its Ports page shows, or None for all
         self._forget()
 
     def _forget(self) -> None:
@@ -798,7 +806,7 @@ class RemoteAgent:
         self.rates: dict[str, DiskRates] = {}
         self.io: dict[str, list[float]] = {}               # disks' figures, for the sample that follows
         self.tracker = NetTracker()
-        self.echoes = latency.Window()                     # its adapters' round trips to their gateways
+        self.echoes = latency.Window()                     # its adapters' round trips to the sites
 
     @property
     def endpoint(self) -> str:
@@ -874,9 +882,14 @@ class RemoteAgent:
             want = {"diskperf": ["*"]} if "diskperf" in self.can else {"files": ["/proc/diskstats"]}
             out += "feed disks sample " + json.dumps(want) + "\n" if self.monitor.wants_io(self.machine.id) else "feed disks off\n"
         if "ports" in self.can:                            # probes always: a scan is news on any page
+            if "portsnet" in self.can:
+                out += f"portsnet {self.ports_net or 'all'}\n"
             out += (f"ports {REMOTE_PORTS_MS}\n" if self.monitor.wants_ports(self.machine.id) else "ports off\n") + "probes on\n"
-        if "echo" in self.can:
-            out += f"echo {ECHO_MS}\n" if self.monitor.wants_echo(self.machine.id) else "echo off\n"
+        if "procio" in self.can:
+            out += f"procio {PROCIO_MS}\n" if self.monitor.wants_procio(self.machine.id) else "procio off\n"
+        if "echo" in self.can:                             # the sites; 2.2's agents, their gateways
+            on = self.monitor.wants_echo(self.machine.id)
+            out += "echo off\n" if not on else latency.command(ECHO_MS) if "sites" in self.can else f"echo {ECHO_MS}\n"
         return out
 
     def port_details(self, port: int, seconds: float = 5.0) -> dict:
@@ -1003,6 +1016,8 @@ class RemoteAgent:
             self._port(rest)
         elif word == "echo":
             self._echo(rest)
+        elif word == "procio":
+            self._procio(rest)
         elif word == "portsinfo":
             try:
                 d = json.loads(rest)
@@ -1022,6 +1037,8 @@ class RemoteAgent:
             return                                         # from before it was told
         try:
             d = json.loads(text)
+            if d.get("net") != (self.ports_net if "portsnet" in self.can else None):
+                return                                     # another adapter's: from before it was told
             num = lambda x: max(0, int(x))
             rows = [[num(r[0]), num(r[1]), num(r[2]), num(r[3]), num(r[4]), str(r[5])[:64] if len(r) > 5 else ""]
                     for r in d["p"] if 0 < int(r[0]) < 65536]
@@ -1049,7 +1066,8 @@ class RemoteAgent:
             except (ValueError, TypeError):
                 continue
 
-    # 'echo {"t": now, "g": {adapter: gateway}, "r": [[adapter, time, ms or null]...], "e": ""}'
+    # 'echo {"t": now, "g": {adapter: gateway}, "r": [[adapter, time, ms or null, site, "icmp" | "tcp"]...], "e": ""}'
+    # (2.2's agents: [adapter, time, ms or null], of the gateway)
     def _echo(self, text: str) -> None:
         if not self.monitor.wants_echo(self.machine.id):
             return                                         # from before it was told
@@ -1057,12 +1075,30 @@ class RemoteAgent:
             d = json.loads(text)
             shift = time.time() - float(d["t"])            # its clock to this one's
             gws = {str(k)[:64]: str(v)[:64] for k, v in d.get("g", {}).items()}
-            for key, t, rtt in d.get("r", [])[:1000]:
-                self.echoes.add(str(key)[:64], float(t) + shift, None if rtt is None else max(0.0, min(60000.0, float(rtt))))
-            error = str(d.get("e") or "")[:200]
+            for r in d.get("r", [])[:1000]:
+                site, method = (str(r[3])[:16], str(r[4])[:8]) if len(r) >= 5 else (latency.GATEWAY, "icmp")
+                self.echoes.add(str(r[0])[:64], site, float(r[1]) + shift,
+                                None if r[2] is None else max(0.0, min(60000.0, float(r[2]))), method)
+            error = str(d.get("e") or "")[:300]
         except (ValueError, KeyError, TypeError, AttributeError):
             return
         self.monitor.publish_echo(self.machine.id, gws, self.echoes.summary(time.time()), error)
+
+    # 'procio {"t": now, "dt": seconds, "disks": {disk or "*": [[name, pid, read B/s, written B/s, reads/s, writes/s]]},
+    #          "e": ""}' - "*" when it's every disk's (Linux doesn't count processes' I/O per disk); null for what isn't counted
+    def _procio(self, text: str) -> None:
+        if not self.monitor.wants_procio(self.machine.id):
+            return
+        try:
+            d = json.loads(text)
+            disks = {}
+            for key, rows in d.get("disks", {}).items():
+                disks[str(key)[:64]] = [[str(r[0])[:64], int(r[1] or 0)] + [None if x is None else max(0.0, float(x)) for x in r[2:6]]
+                                        for r in rows[:64] if len(r) >= 6]
+            error = str(d.get("e") or "")[:300]
+        except (ValueError, TypeError, AttributeError, KeyError):
+            return
+        self.monitor.publish_procio(self.machine.id, disks, error)
 
     def _port(self, text: str) -> None:
         try:
@@ -1094,6 +1130,8 @@ class RemoteAgent:
         m.memory, m.io = self.omni, "feed" in self.can
         m.silent = []
         m.ports, m.dynamic, m.ports_error = "ports" in self.can, None, ""
+        m.ports_nets = "portsnet" in self.can
+        m.procio = "procio" in self.can
         if m.ports:
             m.ports_note = ""
         elif self.omni and version_at_least(m.version, (2, 1)):
@@ -1104,8 +1142,11 @@ class RemoteAgent:
             m.ports_note = (f"Its agent ({m.version or 'an older one'}) doesn't send port traffic. "
                             "Install OmniTOP 2.1's agent there to see it.")
         m.echo = "echo" in self.can
-        m.echo_note = "" if m.echo else (f"Its agent ({m.version or 'an older one'}) doesn't measure latency. "
-                                         f"Install OmniTOP {ECHO_SINCE}'s agent there to see it.")
+        m.echo_note = ("" if "sites" in self.can else
+                       f"Its agent ({m.version}) times only its gateway. Install OmniTOP {ECHO_SINCE}'s agent there "
+                       "for Google, Microsoft and AT&T." if m.echo else
+                       f"Its agent ({m.version or 'an older one'}) doesn't measure latency. "
+                       f"Install OmniTOP {ECHO_SINCE}'s agent there to see it.")
         self.echoes.clear()
         m.nets, m.disks = [], []
         if protocol == 1:
@@ -1430,7 +1471,7 @@ class LocalDisks:
 
 
 class LocalEcho:
-    """This PC's adapters' round trips to their gateways, while its Network page shows."""
+    """This PC's adapters' round trips to the sites, while its Network page shows."""
 
     def __init__(self, mon: "PerfMonitor") -> None:
         self.mon = mon
@@ -1450,18 +1491,19 @@ class LocalEcho:
                 self.echoes.stop()
                 self.echoes = None
 
-    def _find(self) -> dict[str, tuple[str, str]]:
+    def _find(self):
         keys = {}
         for i in self.mon.local.nets:                      # keyed by LUID
             if i.key.isdigit():
                 keys[int(i.key)] = i.key
-        return {keys[luid]: target for luid, target in latency.targets(keys).items()}
+        return latency.plan(keys, [(name, host) for name, _, host in latency.SITES])
 
-    def _report(self, gateways: dict, done: list, error: str) -> None:
-        for key, t, rtt in done:
-            self.window.add(key, t, rtt)
+    def _report(self, info: dict, done: list, error: str) -> None:
+        for key, t, rtt, method in done:
+            adapter, site = key.rsplit("|", 1)
+            self.window.add(adapter, site, t, rtt, method)
         if self.mon.wants_echo("local"):
-            self.mon.publish_echo("local", gateways, self.window.summary(time.time()), error)
+            self.mon.publish_echo("local", info.get("g", {}), self.window.summary(time.time()), error)
 
 
 class DemoEcho:
@@ -1469,6 +1511,7 @@ class DemoEcho:
 
     GATEWAYS = {"e": ("192.168.1.1", 0.42), "w": ("192.168.1.1", 2.8), "v": ("100.64.0.1", 21.0),
                 "eth0": ("10.0.0.1", 0.31), "vpn": ("10.8.0.1", 17.0)}   # "eth1", a storage network, has none
+    SITES = {"google": 14.0, "microsoft": 22.0, "att": 27.0}             # ms beyond the gateway
 
     def __init__(self, mon: "PerfMonitor", mid: str) -> None:
         self.mon, self.mid, self.at = mon, mid, 0.0
@@ -1484,10 +1527,79 @@ class DemoEcho:
                 continue
             gws[i.key], base = self.GATEWAYS[i.key]
             radio = i.key in ("w", "v", "vpn")
-            lost = random.random() < (0.02 if radio else 0.001)
-            spike = 8 * base if radio and random.random() < 0.06 else 0.0
-            self.window.add(i.key, wall, None if lost else base * random.lognormvariate(0, 0.3 if radio else 0.08) + spike)
+            for site, far in self.SITES.items():
+                lost = random.random() < (0.02 if radio else 0.002)
+                spike = 4 * base + 6 if radio and random.random() < 0.06 else 0.0
+                rtt = (base + far) * random.lognormvariate(0, 0.12 if radio else 0.04) + spike
+                self.window.add(i.key, site, wall, None if lost else rtt, "icmp")
         self.mon.publish_echo(self.mid, gws, self.window.summary(wall), "")
+
+
+class LocalProcio:
+    """This PC's processes' disk I/O, per drive letter, while its Disk page shows a measure by process (diskio.py)."""
+
+    SESSION = ("omniTop disks", "9B1E3C52-6F0A-4D7B-A8E2-5C9F1D3B7A46")
+
+    def __init__(self, mon: "PerfMonitor") -> None:
+        self.mon, self.io, self.at = mon, None, 0.0
+
+    def look(self, mono: float) -> None:
+        wanted = self.mon.wants_procio("local")
+        if self.io is None:
+            if not wanted:
+                return
+            import diskio
+            import server
+            self.io = diskio.ProcIO((self.SESSION[0], server.GUID.parse(self.SESSION[1])),
+                                    lambda: [i.key for i in self.mon.local.disks])
+        if wanted and mono < self.at:
+            return
+        self.at = mono + PROCIO_MS / 1000
+        got = self.io.take(wanted)
+        if got is not None:
+            rows, error = got
+            self.mon.publish_procio("local", {f"{letter}:": r for letter, r in rows.items()}, error)
+
+
+class DemoProcs:
+    """Made-up processes' disk I/O for a demo machine's disks, while its Disk page shows a measure by process."""
+
+    WINDOWS = [("MsMpEng", 3412, 5), ("SearchIndexer", 7240, 3), ("chrome", 11872, 4), ("OneDrive", 9120, 3),
+               ("System", 4, 2), ("svchost", 1504, 2), ("Code", 15220, 1), ("steam", 18044, 2), ("explorer", 6200, 0.5),
+               ("Teams", 21108, 0.5)]
+    LINUX = [("postgres", 1201, 5), ("rsync", 4410, 3), ("systemd-journald", 412, 1), ("jbd2/sda1-8", 280, 1),
+             ("containerd", 990, 1.5), ("restic", 6020, 2), ("kworker/u8:2", 77, 0.5)]
+
+    def __init__(self, mon: "PerfMonitor", mid: str, linux: bool) -> None:
+        self.mon, self.mid, self.linux, self.at = mon, mid, linux, 0.0
+        self.mix = {}                                      # disk -> {name: weight}, drifting
+
+    def step(self, t: float, machine: Machine, disks: list) -> None:
+        if not self.mon.wants_procio(self.mid) or t < self.at:
+            return
+        self.at = t + PROCIO_MS / 1000
+        procs = self.LINUX if self.linux else self.WINDOWS
+        out = {}
+        if self.linux:                                     # every disk's together, and no operations, as Linux counts it
+            rb = sum(d[1] for d in disks)
+            wb = sum(d[2] for d in disks)
+            out["*"] = self._rows("*", procs, rb, wb, None, None)
+        else:
+            for item, d in zip(machine.disks, disks):
+                out[item.key] = self._rows(item.key, procs, d[1], d[2], d[3], d[4])
+        self.mon.publish_procio(self.mid, out, "")
+
+    def _rows(self, key: str, procs, rb, wb, ro, wo) -> list:
+        mix = self.mix.setdefault(key, {name: w * random.uniform(0.5, 1.5) for name, _, w in procs})
+        for name in mix:
+            mix[name] = max(0.05, mix[name] * random.uniform(0.85, 1.18))
+        total = sum(mix.values())
+        rows = []
+        for name, pid, _ in procs:
+            share = mix[name] / total
+            rows.append([name, pid, rb * share, wb * share * random.uniform(0.6, 1.4),
+                         None if ro is None else ro * share, None if wo is None else wo * share])
+        return rows
 
 
 class LocalPerf:
@@ -1503,8 +1615,9 @@ class LocalPerf:
         m.threads = self.cpu.n
         m.detail = threads_text(self.cpu.n) if self.cpu.n else ""
         m.os, m.system, m.kernel = "windows", windows_name(), windows_version()
-        m.memory = True
-        self.nets, self.disks, self.echo = LocalNets(mon), LocalDisks(mon), LocalEcho(mon)
+        m.memory = m.ports_nets = True
+        self.nets, self.disks, self.echo, self.procio = LocalNets(mon), LocalDisks(mon), LocalEcho(mon), LocalProcio(mon)
+        m.procio = True
         self.utility = None
         self.utility_failed = False
 
@@ -1514,6 +1627,7 @@ class LocalPerf:
         self.nets.look(mono)
         self.disks.look(mono)
         self.echo.look(mono)
+        self.procio.look(mono)
 
     def _total(self, values: list[float]) -> list[float]:
         mon = self.mon
@@ -1558,6 +1672,7 @@ class PerfMonitor:
         self.focus: str | None = None                      # the remote machine being looked at closely
         self.page: str | None = None                       # and the page of it that's showing
         self.local_page: str | None = None                 # the page showing when it's this PC's, or the list
+        self.procio_for: tuple[str, float] | None = None   # (machine, when asked): whose processes' disk I/O to send
         self.numbers = False                               # the others are shown as numbers only
         self.remote_scans = RemoteScans(hub)
         self._stop = threading.Event()
@@ -1611,6 +1726,22 @@ class PerfMonitor:
         """Whether a machine should send its traffic per port: while its Ports page shows."""
         return mid == self.focus and self.page == "net"
 
+    def set_procio(self, mid: str | None) -> None:
+        """Send a machine's processes' disk I/O (its Disk page shows a measure by process), or nobody's."""
+        self.procio_for = (mid, time.monotonic()) if mid else None
+        for r in self.remotes:
+            r.tell()
+
+    def wants_procio(self, mid: str) -> bool:
+        p = self.procio_for
+        return bool(p) and p[0] == mid and time.monotonic() - p[1] < PROCIO_HOLD
+
+    def publish_procio(self, mid: str, disks: dict, error: str = "") -> None:
+        """Processes' disk I/O per disk ("*": over every disk), as rates: [[name, pid, read B/s, written B/s, reads/s, writes/s]]."""
+        per = "all" if "*" in disks else "disk"
+        self.hub.publish(json.dumps({"m": mid, "t": round(now(), 3), "disks": disks, "per": per, "e": error},
+                                    separators=(",", ":")), "procio")
+
     def wants_echo(self, mid: str) -> bool:
         """Whether a machine's adapters' gateways should be pinged: while its Network page shows."""
         if mid == "local":
@@ -1619,8 +1750,16 @@ class PerfMonitor:
 
     def publish_echo(self, mid: str, gateways: dict, summary: dict, error: str) -> None:
         """A machine's adapters' latency, jitter and losses over the last few seconds, to the view."""
-        self.hub.publish(json.dumps({"m": mid, "g": gateways, "n": summary, "e": error, "w": latency.WINDOW},
+        self.hub.publish(json.dumps({"m": mid, "g": gateways, "n": summary, "e": error, "w": latency.WINDOW,
+                                     "sites": [[name, label, host] for name, label, host in latency.SITES]},
                                     separators=(",", ":")), "lat")
+
+    def set_ports_net(self, mid: str, key: str | None) -> None:
+        """A remote machine's Ports page shows only this adapter's traffic (its key), or every adapter's."""
+        for r in self.remotes:
+            if r.machine.id == mid:
+                r.ports_net = key
+                r.tell()
 
     def remote_port(self, mid: str, port: int) -> dict:
         r = next((r for r in self.remotes if r.machine.id == mid), None)
@@ -1802,6 +1941,9 @@ class DemoAgent:
         m.system = "Ubuntu 24.04 LTS" if m.os == "linux" else "Windows Server 2025"
         m.kernel, m.version, m.memory = ("6.8.0" if m.os == "linux" else "10.0.26100"), "demo", True
         m.ports, m.dynamic = True, [32768, 60999] if m.os == "linux" else [49152, 65535]
+        m.ports_nets = m.procio = True
+        self.ports_net = None                              # the adapter its Ports page shows
+        self.procs = DemoProcs(mon, m.id, m.os == "linux")
         self.traffic = self.details = None                 # made-up port traffic, while its Ports page shows
         self.traffic_at = self.traffic_idle = 0.0
         if number == 0:                                    # and this one is scanned now and then
@@ -1848,7 +1990,7 @@ class DemoAgent:
         if self.traffic is None:
             import server                                  # the local demo's traffic, which needs no more
             acc = server.Accumulator()
-            source, seen = server.Demo(acc), netwatch.PortSeen()
+            source, seen = server.Demo(acc, (("eth0", 6), ("vpn", 2))), netwatch.PortSeen()
             source.start()
             self.traffic, self.details = (acc, source, seen), netwatch.DemoDetails(source, seen)
             if self.machine.os == "linux":                 # its programs, not Windows'
@@ -1870,7 +2012,8 @@ class DemoAgent:
             return
         acc, source, seen = self.traffic
         dt, self.traffic_at = t - self.traffic_at, t
-        ports, own, (b_in, b_out, own_in, own_out, _) = acc.drain()
+        acc.watch([self.ports_net])
+        ports, own, (b_in, b_out, own_in, own_out, _) = acc.drain(self.ports_net)
         seen.note(ports, time.monotonic())
         rows = [[p, e[0], e[1], e[2], e[3], source.names(e[4])] for p, e in ports.items()]
         own_rows = [[p, e[0], e[1], e[2], e[3]] for p, e in own.items()]
@@ -1918,6 +2061,7 @@ class DemoAgent:
         rates = {"eth0": [down, down * 0.05 + rng.uniform(1e4, 2e5), 1e9], "vpn": [vpn, vpn * 0.3, found[1]["link"]],
                  "eth1": [0.0, 0.0, -1.0] if unplugged else [max(0.0, rng.gauss(4e8, 1e8)) * burst, 2e7 * burst, 1e10]}
         disks = [demo_disk(rng, 0.2 + 0.8 * burst / (1 + i), 0.15 + 0.1 * i, i > 0) for i in range(len(m.disks))]
+        self.procs.step(t, m, disks)
         self.mon.add_remote(m.id, m.version_no, t - 0.004, [sum(self.load) / len(self.load)] + self.load,
                             [rates[i.key] for i in m.nets], disks)
         self.echo.step(t, m)
@@ -1937,7 +2081,8 @@ class DemoPerf:
         self.mon, self.rng = mon, random.Random()
         m = mon.local
         m.threads, m.detail, m.os, m.system = 16, threads_text(16), "windows", "Windows 11 Pro"
-        m.kernel, m.memory = "10.0.26200", True
+        m.kernel, m.memory, m.ports_nets, m.procio = "10.0.26200", True, True, True
+        self.procs = DemoProcs(mon, "local", False)
         m.disks = [Item("C:"), Item("D:")]
         for i, (detail, used, size) in zip(m.disks, (("Windows", 410e9, 1e12), ("Data", 2.6e12, 4e12))):
             i.detail, i.used, i.size = detail, int(used), int(size)
@@ -1985,6 +2130,7 @@ class DemoPerf:
                  "v": [vpn, vpn * 0.15, found[2]["link"]]}
         disks = [demo_disk(rng, 0.15 + 0.85 * max(0.0, math.sin(el / 17 + 1)) ** 4, 0.2 + 0.6 * max(0.0, math.sin(el / 8)) ** 2, False),
                  demo_disk(rng, 0.1 + 0.5 * max(0.0, math.sin(el / 23)) ** 4, 0.7, True)]
+        self.procs.step(t, m, disks)
         for a in self.mon.remotes:
             a.sample(t)
         self.echo.step(t, m)

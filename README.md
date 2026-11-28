@@ -23,15 +23,28 @@ not assumed.
   its labels.
 - **CPU**: a small graph per thread, or one of their average (C).
 - **Disk**: a panel per drive letter on Windows, and per whole disk on Linux.
-  - **The graph** has eight lines, each with a line to its label: throughput, IOPS,
-    latency and busy time, reads solid and writes dashed. Each measure has its own scale,
-    named along the top. The lines are smoothed over a second. Point at a label to make
-    its line stand out, and click it to hide the line, or show it again; the other lines
-    of that measure's scale fill the graph. Each disk remembers what's hidden.
-  - **Pointing at the graph** marks the moment with a dot on each line, and the tip has
-    what the lines show there: the second up to that moment, not the one sample under the
+  - **Two graphs**, one above the other, each with a scale of its own: read and write
+    throughput, then read and write IOPS; reads solid, writes dashed, each line with a line
+    to its label. The lines are smoothed over a second. Point at a label to make its line
+    stand out. A label's dot hides its line or shows it again (each disk remembers what's
+    hidden).
+  - **By process.** Click a measure's name to see which processes did it: its graph
+    becomes a stack of the four processes that did the most of it over the time shown,
+    each named inside its band, and the rest together as Other, with what each is doing now
+    along the top. Click the name again, or **All measures**, to go back. On Windows it's
+    per drive letter, from the disk events Windows logs (Kernel-Disk, through ETW), which
+    name the process that asked for each read and write. Linux counts each process's disk
+    I/O over every disk together (`/proc/<pid>/io`, which the omnitop-agent-ports service
+    reads), and counts no operations, so IOPS there are the disk's shared out by each
+    process's bytes, and say so. A process that starts and ends between two readings (once
+    a second) isn't seen on Linux.
+  - **Pointing at a graph** marks the moment with a dot on each line, and the tip has what
+    the lines show there: the second up to that moment, not the one sample under the
     pointer, which between bursts of I/O is mostly nothing.
-  - **The bars** are the average I/O size and queue depth over the last 5 seconds.
+  - **The bars**: the average I/O size and queue depth over the last 5 seconds, then two
+    stacked bars, latency (reads and writes) and busy time (reading and writing, with the
+    total on top), each part named beside it. They're two bars because milliseconds and
+    percent can't share a scale.
   - Latency is how long an operation took, waiting included. The queue depth is how many
     were waiting or under way. Reads and writes overlap, so the time the disk was busy is
     shared out between them by how long each took.
@@ -41,14 +54,18 @@ not assumed.
 - **Network**: a graph per adapter. Green is received (↓) and coral is sent (↑), in bits
   per second. The axis runs to the link's speed, or fits the traffic for adapters whose
   link speed means nothing, such as VPNs.
-  - **Latency and jitter**, the two bars at the end of each graph, are of the round trips
-    to the adapter's default gateway (IPv4), named by its name, over the last 3 seconds.
-    While the Network page shows, the gateway is pinged 4 times a second from the
-    adapter's own address. Latency is the average round trip; jitter is how much one
-    round trip differs from the next, on average; lost pings are counted under the bar.
-    It's the first hop, the part of the way the adapter's own link decides. An adapter
-    with no gateway, such as a storage network, says so. Point at the bars for the
-    details.
+  - **Latency and jitter**, the two bars at the end of each graph, are of round trips from
+    the adapter to Google, Microsoft and AT&T (`google.com`, `microsoft.com`, `att.com`,
+    each company's own network), over the last 3 seconds. The latency bar stacks the three
+    sites' average round trips, each named beside it, with the average of the three on
+    top. Jitter is how much one round trip to a site differs from the next to it, averaged
+    over the three. While the Network page shows, each site gets a ping twice a second from
+    the adapter's own address; a site that doesn't answer pings (some networks block them)
+    is timed by the TCP handshake with its HTTPS port instead, and its label says TCP. Lost
+    round trips are counted under the bars. Only adapters with a default gateway (IPv4),
+    the way to the internet, are measured; the gateway is named by the adapter's name. Point
+    at the bars for the details. Agents from 2.2 time only their gateway: one part, named
+    so.
   - Network cards are shown while they have a link.
   - Virtual adapters, such as a VPN's, are added once they carry real traffic: about 64
     kb/s for a second or more.
@@ -174,15 +191,23 @@ What it takes on each system:
   `CAP_DAC_READ_SEARCH`), a read-only system, and no network port: it listens on a unix
   socket, `/run/omnitop-agent/ports`, and answers only root and the omnitop-agent service.
   It captures only while the agent asks. TCP traffic comes from the kernel's socket
-  statistics (`sock_diag`), UDP and probes from a packet socket with a filter that keeps
-  only UDP headers and the first packet of each TCP connection. If it isn't running, the
-  rest of the agent works as before, and the Ports page says why.
+  statistics (`sock_diag`), UDP and probes from a packet socket whose filter keeps only UDP
+  headers and the first packet of each TCP connection, to and from the machine's own
+  addresses (so a router doesn't capture what it forwards). Some kernels, routers' among
+  them, have no `inet_diag`: then the sockets come from `/proc/net`, and TCP traffic from
+  the packet headers too. Whatever keeps it from watching, and if it isn't running, the
+  Ports page says why; the rest of the agent works as before.
 
 Latency takes ICMP echo (ping). The Windows agent uses Windows' own ping functions, which
 need no rights. The Linux agent uses a ping socket, which needs none either where
 `net.ipv4.ping_group_range` allows it, as systemd's default does; where it doesn't, the
-omnitop-agent-ports service, which may send ICMP, does the pinging for it. Either way only
-the gateways the agent finds itself are pinged: a viewer can't have it ping anything else.
+omnitop-agent-ports service, which may send ICMP, does the pinging for it, and without
+that, TCP handshakes, which need no rights, time it. OmniTOP tells the agents which sites
+to time, so the list can change without replacing them; they time only addresses on the
+internet (and their gateways), never anything on their own networks.
+
+Which processes do disk I/O takes, on Windows, an ETW session of the agent's own, as
+ports do; on Linux, the omnitop-agent-ports service.
 
 The agents only read and run no commands. The connection isn't encrypted or authenticated:
 anyone who can reach the port can read the machine's CPU, memory, network and disk activity,
@@ -198,6 +223,12 @@ writes, with whether to look for agents and the ones found that aren't to be off
 first time, it takes over the machines in CPU Graph's `settings.ini`.
 
 ## Ports
+
+**Adapter** shows the traffic of one network adapter, or of them all, for the machine
+shown; each machine remembers its choice. While the adapter chosen isn't connected, it's
+all of them, and that one again once it's back. Traffic belongs to the adapter whose
+address is this end of it. Port scans are watched on every adapter, whatever's chosen.
+Agents before 2.3 send every adapter's together.
 
 - Ports 1–1024 are a 32 × 32 block of 5 px bars in front.
 - Ports 1025–65535 are a 256 × 252 field of 2 px bars behind it, 256 ports per row.
@@ -492,7 +523,7 @@ clock using the fastest network trip seen so far, so all rows line up.
 
 `agent.py` is the Windows agent and `linux/omnitop-agent.py` the Linux one. They speak
 `cpugraph-agent`'s protocol (version 2), with additions that `agent.py` describes: every
-adapter and disk, memory, feeds of raw figures, ports, and latency. For a remote machine's scans,
+adapter and disk, memory, feeds of raw figures, ports (per adapter), latency, and processes' disk I/O. For a remote machine's scans,
 the agent leaves out what only it can tell isn't a probe (replies to connections it made,
 and to UDP it sent; `netwatch.ProbeFilter` on Windows), and the app runs a `ScanWatch` for
 each machine on what's left. The Windows agent uses the
@@ -504,11 +535,15 @@ CPU. The Windows agent keeps a short log in
 `%LOCALAPPDATA%\PortTrafficViz\agent.log` (installed, under LOCAL SERVICE's profile:
 `C:\Windows\ServiceProfiles\LocalService`).
 
-`latency.py` pings adapters' gateways: their gateways come from `GetIpForwardTable2`, their
-addresses from `GetUnicastIpAddressTable`, and the round trips, timed with the performance
-counter, from `IcmpSendEcho2Ex`. Its `Window` turns round trips, this PC's or an agent's
-(the `echo` lines), into the average, jitter and losses of the last 3 seconds. `discover.py`
-looks for agents on this PC's networks.
+`latency.py` times round trips from adapters to the sites: the adapters with gateways come
+from `GetIpForwardTable2`, their addresses from `GetUnicastIpAddressTable`, and the round
+trips, timed with the performance counter, from `IcmpSendEcho2Ex`, or TCP handshakes. Its
+`Window` turns round trips, this PC's or an agent's (the `echo` lines), into each site's
+average and jitter, their averages, and losses, over the last 3 seconds. `discover.py`
+looks for agents on this PC's networks. `diskio.py` reads Kernel-Disk's events: the
+process each read and write was for, and from its disk and offset, its drive letter. Port
+traffic is counted per adapter by the local address of each packet (the capture's events
+on Windows, sockets and packet headers on Linux).
 
 `settings.py` keeps the list of remote machines. The page is `web/`: `shell.js` has the
 tabs, `perf.js` the graphs, `disk.js` the disk panels, `views.js` the pages of one machine,

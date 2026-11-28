@@ -186,16 +186,17 @@ perfListeners.perf.push(onPerf);
 perfListeners.perfmeta.push(onPerfMeta);
 
 // Latency and jitter of a machine's adapters, while its Network page shows: { at, g: {key: gateway},
-// n: {key: [average ms, jitter ms, lost, pings]}, e: error, w: seconds }. Each adapter's last minute of
-// them is kept too, as [when, average, jitter], for the scale of its bars.
+// n: {key: { sites: {site: [average ms, jitter ms, lost, round trips, method]}, avg, jitter, lost, pings }},
+// sites: [[site, label, host]], e: error, w: seconds }. Each adapter's last minute of them is kept too, as
+// [when, average, jitter, the sites' averages added up], for the scales of its bars.
 const P_LAT_KEEP = 60000;
 function onLat(msg) {
   const s = pStore(msg.m), at = performance.now();
-  s.lat = { at, g: msg.g || {}, n: msg.n || {}, e: msg.e || '', w: msg.w || 3 };
+  s.lat = { at, g: msg.g || {}, n: msg.n || {}, e: msg.e || '', w: msg.w || 3, sites: msg.sites || [] };
   s.latHist = s.latHist || new Map();
-  for (const [key, [avg, jitter]] of Object.entries(s.lat.n)) {
+  for (const [key, a] of Object.entries(s.lat.n)) {
     const h = s.latHist.get(key) || [];
-    h.push([at, avg, jitter]);
+    h.push([at, a.avg, a.jitter, Object.values(a.sites || {}).reduce((t, x) => t + (x[0] || 0), 0)]);
     while (h.length && h[0][0] < at - P_LAT_KEEP) h.shift();
     s.latHist.set(key, h);
   }
@@ -594,7 +595,7 @@ function nearest(ring, t) {
 
 // The graph of a surface under a point on it, or null. Marks the moment there for the crosshair.
 // The moment pointed at, and the graph it's in (by machine and item key), are kept as S.hover.
-const P_NOT_GRAPHS = new Set(['disklabel', 'netbars']);   // things on the canvas that aren't graphs over time
+const P_NOT_GRAPHS = new Set(['disklabel', 'diskdot', 'diskback', 'netbars']);   // things on the canvas that aren't graphs over time
 function plotAt(S, mx, my) {
   const p = S.plots.find(q => mx >= q.x && mx <= q.x + q.w && my >= q.y && my <= q.y + q.h);
   if (p && P_NOT_GRAPHS.has(p.kind)) { S.hover = null; return p; }
@@ -605,6 +606,7 @@ function plotAt(S, mx, my) {
 
 function plotTip(p, t) {
   if (p.kind === 'disk' && p.ring && p.ring.ch >= 9) return dkTip(p, t);
+  if (p.kind === 'diskproc') return dkProcTip(p, t);
   const ring = p.kind === 'cpu' ? p.s.cpu : p.ring, k = nearest(ring, t);
   const name = p.s.info.name;
   if (k < 0) return `<div class="head">${esc(p.item ? p.item.name : name)}</div><div class="faint">No samples yet</div>`;
