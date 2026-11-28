@@ -19,7 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: The Mac
-        run: sw_vers; uname -a; /usr/bin/python3 --version
+        run: |
+          sw_vers; uname -a; /usr/bin/python3 --version
+          sudo /usr/bin/python3 -c "import sys; print('python as root:', sys.executable)"
       - name: Self-check
         run: /usr/bin/python3 -I linux/omnitop-agent.py --check
       - name: What it sends
@@ -31,6 +33,8 @@ jobs:
           /usr/bin/python3 -I tests/mac_smoke.py 127.0.0.1:7821
           sudo /usr/bin/python3 -I linux/omnitop-agent.py --uninstall
           ! test -e /Library/LaunchDaemons/org.omnitop.agent.plist
-      - name: The agent's log
+      - name: The agent's logs
         if: always()
-        run: sudo cat /var/log/omnitop-agent.log 2>/dev/null | tail -50 || true
+        run: |
+          sudo tail -30 /var/log/omnitop-agent.log 2>/dev/null || true
+          sudo tail -30 /var/log/omnitop-agent-ports.log 2>/dev/null || true

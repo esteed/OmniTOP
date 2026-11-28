@@ -1469,7 +1469,8 @@ class PortsLink(object):
             self._tell()
             if ms and self.conn is None:               # nobody to ask: say so, rather than send nothing
                 viewer.post("portsinfo " + json.dumps({"dynamic": dynamic_range(), "udp": False, "error":
-                            "The omnitop-agent-ports service isn't answering (sudo systemctl status omnitop-agent-ports says why)."}) + "\n")
+                            "The omnitop-agent-ports service isn't answering (%s says why)." % (
+                                "sudo launchctl print system/" + MAC_PORTS_LABEL if MAC else "sudo systemctl status omnitop-agent-ports")}) + "\n")
 
     def forget(self, viewer):
         with self.lock:
@@ -2724,7 +2725,7 @@ def check():
                     ports.clear()
                     about = ("Ports of Macs aren't shown yet." if MAC else
                              "It can't see ports: that takes root, or the installed omnitop-agent-ports service.")
-                if word == "portsinfo" and b'"udp": false' in line:
+                if word == "portsinfo" and b'"udp": false' in line and ports:
                     about = "It sees TCP, but not UDP or probes: " + line.decode("utf-8", "replace").split('"error": ')[-1].strip(' }\n')
     except OSError as exc:
         said.append(str(exc))
@@ -2903,7 +2904,8 @@ def uninstall():
 MAC_LABEL, MAC_PORTS_LABEL = "org.omnitop.agent", "org.omnitop.agent-ports"
 MAC_PLIST = "/Library/LaunchDaemons/%s.plist" % MAC_LABEL
 MAC_PORTS_PLIST = "/Library/LaunchDaemons/%s.plist" % MAC_PORTS_LABEL
-MAC_LOG = "/var/log/omnitop-agent.log"
+MAC_LOG = "/var/log/omnitop-agent.log"              # the agent's, which runs as nobody: it's made theirs
+MAC_PORTS_LOG = "/var/log/omnitop-agent-ports.log"
 MAC_USER = "nobody"
 MAC_FIREWALL = "/usr/libexec/ApplicationFirewall/socketfilterfw"
 
@@ -3176,7 +3178,7 @@ if MAC:
             return None
         up = bool(v[1] & 0x1) and bool(v[1] & 0x40)            # IFF_UP, IFF_RUNNING
         card = name.startswith("en") and not _MAC_VIRTUAL.match(name)
-        speed = v[2] // 1000000 if 0 < v[2] < 10 ** 13 else 0
+        speed = v[2] // 1000000 if 0 < v[2] < 10 ** 13 and v[2] != 0xFFFFFFFF else 0
         return {"card": card, "link": "down" if not up else str(speed)}
 
     _disks = {"at": 0.0, "map": {}}
@@ -3292,8 +3294,9 @@ if MAC:
 
 
 def mac_plist(label, arguments, user):
+    log = MAC_PORTS_LOG if user == "root" else MAC_LOG
     d = {"Label": label, "ProgramArguments": arguments, "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 5,
-         "StandardErrorPath": MAC_LOG, "StandardOutPath": MAC_LOG, "ProcessType": "Background"}
+         "StandardErrorPath": log, "StandardOutPath": log, "ProcessType": "Background"}
     if user != "root":
         d["UserName"] = user
     import plistlib as _pl
@@ -3354,6 +3357,13 @@ def mac_install(port, listen, replace):
 
     with open(me, "rb") as f:
         write_whole(INSTALLED, f.read(), 0o644)
+    try:                                               # its log, which launchd opens as the account it runs as
+        with open(MAC_LOG, "a"):
+            pass
+        who = pwd.getpwnam(MAC_USER)
+        os.chown(MAC_LOG, who.pw_uid, who.pw_gid)
+    except (OSError, KeyError, AttributeError):
+        pass
     write_whole(MAC_PORTS_PLIST, mac_plist(MAC_PORTS_LABEL, [python, "-I", INSTALLED, "--ports-helper", "--port", str(port)], "root"), 0o644)
     write_whole(MAC_PLIST, mac_plist(MAC_LABEL, args, MAC_USER), 0o644)
     for plist, label in ((MAC_PORTS_PLIST, MAC_PORTS_LABEL), (MAC_PLIST, MAC_LABEL)):
@@ -3365,7 +3375,11 @@ def mac_install(port, listen, replace):
         if port_free(port).startswith("cpugraph-agent") and "version=%s " % VERSION in port_free(port) + " ":
             break
     else:
-        undo("The new version was installed, but it isn't answering on TCP port %d." % port)
+        said = command("launchctl", "print", "system/" + MAC_LABEL, timeout=10)[1]
+        state = " ".join(re.findall(r"^\s*(?:state|last exit code|last exit reason|job state) = .*$", said, re.M)[:4])
+        tail = (read_whole(MAC_LOG) or b"").decode("utf-8", "replace").strip().splitlines()[-3:]
+        undo("The new version was installed, but it isn't answering on TCP port %d. launchd: %s %s" % (
+            port, " ".join(state.split()) or "-", " / ".join(tail)))
     done = mac_firewall(python)
     print("omnitop-agent %s is running on TCP port %d and starts with the Mac.%s" % (VERSION, port, " " + done if done else ""))
     return 0
