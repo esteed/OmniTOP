@@ -441,7 +441,7 @@ function ephemeralNote(g) {
   font(g, size, 600);
   const w = g.measureText(head).width;
   text(g, head, 0, dy, size, T.ink2, 'left', 600);
-  text(g, `  ·  ${state.os === 'linux' ? 'Linux' : 'Windows'} assigns them to outgoing connections`, w, dy, size, T.muted);
+  text(g, `  ·  ${{ linux: 'Linux', macos: 'macOS' }[state.os] || 'Windows'} assigns them to outgoing connections`, w, dy, size, T.muted);
   g.restore();
 }
 

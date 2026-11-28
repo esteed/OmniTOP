@@ -1,0 +1,36 @@
+# The Linux and macOS agent on real Macs: its self-check, what it sends, and installing it
+# with launchd and taking it out again. Run by hand from the Actions tab, or by pushing to
+# the macos-test branch.
+name: macOS agent
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [macos-test]
+
+jobs:
+  agent:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: The Mac
+        run: sw_vers; uname -a; /usr/bin/python3 --version
+      - name: Self-check
+        run: /usr/bin/python3 -I linux/omnitop-agent.py --check
+      - name: What it sends
+        run: /usr/bin/python3 -I tests/mac_smoke.py
+      - name: Install with launchd, ask the installed one, take it out
+        run: |
+          sudo /usr/bin/python3 -I linux/omnitop-agent.py --install --port 7821
+          sudo launchctl print system/org.omnitop.agent | head -20
+          /usr/bin/python3 -I tests/mac_smoke.py 127.0.0.1:7821
+          sudo /usr/bin/python3 -I linux/omnitop-agent.py --uninstall
+          ! test -e /Library/LaunchDaemons/org.omnitop.agent.plist
+      - name: The agent's log
+        if: always()
+        run: sudo cat /var/log/omnitop-agent.log 2>/dev/null | tail -50 || true

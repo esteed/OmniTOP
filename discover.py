@@ -66,7 +66,7 @@ def ask(address: str, port: int) -> dict | None:
     # OmniTOP's agents from 2.0 say omni=; 1.9's (Windows only) didn't; CPU Graph's says neither omni nor os
     kind = "omnitop" if fields.get("omni") else "old" if os_name == "windows" else "cpugraph"
     return {"address": address, "port": port, "host": fields.get("host", "")[:64],
-            "os": os_name if os_name in ("windows", "linux") else "linux", "agent": fields.get("version", "")[:32],
+            "os": os_name if os_name in ("windows", "linux", "macos") else "linux", "agent": fields.get("version", "")[:32],
             "kind": kind, "protocol": protocol}
 
 

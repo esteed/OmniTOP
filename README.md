@@ -1,6 +1,6 @@
 # OmniTOP
 
-A dashboard of what a Windows PC, and any number of other Windows and Linux machines,
+A dashboard of what a Windows PC, and any number of other Windows, Linux and macOS machines,
 are doing: CPU, memory, network, disks and graphics card, live, plus a map of this
 PC's network traffic port by port.
 
@@ -147,6 +147,23 @@ Each machine runs an agent that streams its numbers:
   sudo. As root (`su -`), `apt install python3` if `python3 --version` finds none, and
   run `python3 omnitop-agent.py --install` without sudo. Debian runs no firewall unless
   one was set up: with your own nftables rules, let TCP port 7820 in yourself.
+- **Macs**: the same file, [omnitop-agent.py](linux/omnitop-agent.py), with the Python that
+  Apple's Command Line Tools bring (if `python3 --version` offers to install them, let it).
+  Copy it to the Mac (Remote Login, in System Settings, General, Sharing, lets you use
+  `scp` and `ssh`) and run `sudo python3 omnitop-agent.py --install`. It:
+  - copies itself to `/usr/local/lib/omnitop-agent`
+  - adds a launchd daemon, **org.omnitop.agent**, that runs as `nobody`, an account with
+    no rights of its own
+  - adds a second one, **org.omnitop.agent-ports**, as root, for which processes do disk
+    I/O
+  - lets Python take connections, if the Mac's firewall is on
+
+  `--uninstall` removes all of it. On a Mac it reads what it shows from macOS itself:
+  each CPU's ticks from Mach, memory from its VM statistics (named as Activity Monitor
+  names them), adapters' 64-bit counters from sysctl, disks' figures from IOKit (which
+  counts no busy time, so busy time and queue depth there come from the time operations
+  took), and processes' disk I/O from their resource usage. A Mac's ports aren't shown
+  yet. Its log is `/var/log/omnitop-agent.log`.
 
 `--agent-port 7821` (Windows) or `--port 7821` (Linux) uses another port, and `--listen
 192.168.1.20` one address only.

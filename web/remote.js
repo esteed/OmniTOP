@@ -32,11 +32,14 @@ const R_LINUX = '<svg viewBox="0 0 64 64" aria-hidden="true">' +
 const R_UNKNOWN = '<svg viewBox="0 0 64 64" aria-hidden="true"><rect x="6" y="10" width="52" height="35" rx="4" fill="none" stroke="currentColor" stroke-width="3.5"/>' +
   '<path d="M24 55h16M32 45v10" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>' +
   '<text x="32" y="36" text-anchor="middle" font-size="24" font-weight="600" fill="currentColor">?</text></svg>';
+// A Mac: the Command key's sign on a key cap, not anyone's logo
+const R_MAC = '<svg viewBox="0 0 64 64" aria-hidden="true"><rect x="8" y="8" width="48" height="48" rx="11" fill="#e9ebef" stroke="#8a8f98" stroke-width="2"/>' +
+  '<path d="M26 26h12v12H26zM26 26a5 5 0 1 0-5 5h5M38 26a5 5 0 1 1 5 5h-5M26 38a5 5 0 1 1-5-5h5M38 38a5 5 0 1 0 5-5h-5" fill="none" stroke="#2b2f36" stroke-width="3" stroke-linejoin="round"/></svg>';
 const R_CROSS = '<svg class="os-x" viewBox="0 0 64 64" aria-hidden="true"><path d="M9 9 55 55M55 9 9 55"/></svg>';
 
 // The icon of a machine's operating system, crossed out if it can't be reached.
 function osIcon(os, down) {
-  return `<span class="os-icon${down ? ' down' : ''}">${os === 'windows' ? R_WINDOWS : os === 'linux' ? R_LINUX : R_UNKNOWN}${down ? R_CROSS : ''}</span>`;
+  return `<span class="os-icon${down ? ' down' : ''}">${os === 'windows' ? R_WINDOWS : os === 'linux' ? R_LINUX : os === 'macos' ? R_MAC : R_UNKNOWN}${down ? R_CROSS : ''}</span>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +471,7 @@ async function rTest() {
   rOldAgent = a.memory ? '' : a.os;
   if (a.os) rForm.elements.os.value = a.os;
   rHelp();
-  rResult('good', `Connected to ${a.host || 'it'}: ${[a.system || (a.os === 'windows' ? 'Windows' : 'Linux'), a.cpus && threadsText(Number(a.cpus)), `agent ${a.agent}`].filter(Boolean).join(', ')}.` +
+  rResult('good', `Connected to ${a.host || 'it'}: ${[a.system || ({ windows: 'Windows', macos: 'macOS' }[a.os] || 'Linux'), a.cpus && threadsText(Number(a.cpus)), `agent ${a.agent}`].filter(Boolean).join(', ')}.` +
     (a.memory ? '' : a.os === 'windows' ? ' That agent is too old to send memory: the steps here replace it.'
       : " It's CPU Graph's agent, which sends no memory: the steps here replace it."));
 }
@@ -517,7 +520,17 @@ function rHelp() {
   const code = text => `<span class="code"><code>${esc(text)}</code><button type="button" data-copy="${esc(text)}">Copy</button></span>`;
   const step = (...parts) => `<li>${parts.join('')}</li>`;
   let html;
-  if (os === 'linux') {
+  if (os === 'macos') {
+    html = '<h3>Installing the agent on a Mac</h3><ol>' +
+      step('Get the agent: the same Python file as for Linux. It needs the Python that Apple\'s Command Line Tools bring ' +
+        '(if <code>python3 --version</code> asks to install them, let it).<br><button type="button" data-get="linux">Save omnitop-agent.py</button> <span class="rsaved" id="rsaved"></span>') +
+      step('Copy it to the Mac, with an account you can sign in to there (turn on Remote Login in System Settings, General, Sharing, to sign in with ssh):',
+        code(`scp omnitop-agent.py you@${target}:`)) +
+      step('Sign in, and install it:', code(`ssh -t you@${shell} sudo python3 omnitop-agent.py --install${odd ? ` --port ${port}` : ''}`),
+        `It starts with the Mac (launchd), as an account with no rights of its own, and if the Mac's firewall is on, lets Python take connections on TCP port ${port}.`) +
+      step('Come back here and choose <b>Test connection</b>.') +
+      '</ol><p class="rnote">A Mac\'s ports aren\'t shown yet. To remove the agent: <code>sudo python3 omnitop-agent.py --uninstall</code></p>';
+  } else if (os === 'linux') {
     html = '<h3>Installing the agent on Linux</h3><ol>' +
       step('Get the agent: one Python file, for Python 3.6 or later.<br><button type="button" data-get="linux">Save omnitop-agent.py</button> <span class="rsaved" id="rsaved"></span>') +
       step("Copy it to the machine, with an account you can sign in to there:", code(`scp omnitop-agent.py you@${target}:`)) +

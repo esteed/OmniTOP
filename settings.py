@@ -8,7 +8,7 @@ by hand. It's JSON, in %LOCALAPPDATA%\\PortTrafficViz\\settings.json:
      "discover": true, "ignored": ["192.168.1.44:7820"]}
 
 name may be empty (the machine's own host name is shown) and os is what the
-person said it runs: "windows", "linux" or "" (the agent says what it really is).
+person said it runs: "windows", "linux", "macos" or "" (the agent says what it really is).
 discover says whether to look for agents on the local networks (discover.py), and
 ignored lists the ones found that aren't to be offered again.
 
@@ -27,7 +27,7 @@ AGENT_PORT = 7820
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "PortTrafficViz")
 PATH = os.path.join(APP_DIR, "settings.json")
 CPU_GRAPH = os.path.join(os.environ.get("LOCALAPPDATA") or "", "CpuGraph", "settings.ini")
-SYSTEMS = ("", "windows", "linux")
+SYSTEMS = ("", "windows", "linux", "macos")
 MAX_NAME = 64
 MAX_IGNORED = 500
 
@@ -81,7 +81,7 @@ def clean(fields: dict) -> dict:
         raise Invalid("port", "Use a port from 1 to 65535.")
     system = str(fields.get("os") or "").lower()
     if system not in SYSTEMS:
-        raise Invalid("os", "Choose Windows or Linux.")
+        raise Invalid("os", "Choose Windows, Linux or macOS.")
     return {"name": name, "address": address, "port": port, "os": system}
 
 
